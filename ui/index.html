@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<title>TNT — TEC Network Tool</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="css/tnt.css">
+<script>
+  // Apply the remembered theme before first paint so there is no flash.
+  try {
+    var t = localStorage.getItem('tnt.theme');
+    if (t === 'dark' || t === 'light') document.documentElement.setAttribute('data-theme', t);
+  } catch (e) { /* storage may be unavailable */ }
+</script>
+</head>
+<body>
+<a class="skip-link" href="#view">Skip to content</a>
+
+<header class="topbar" id="topbar">
+  <a class="brand" href="#ipinfo" title="TNT — TEC Network Tool">
+    <span class="brand-logo" id="brand-logo" aria-hidden="true"></span>
+    <span class="brand-text">
+      <span class="brand-name">TNT</span>
+      <span class="brand-caption">TEC Network Tool</span>
+    </span>
+  </a>
+  <div class="topbar-right">
+    <div class="status-pill grey" id="status-pill" role="status" aria-live="polite">
+      <span class="light grey" id="status-light"></span>
+      <span class="status-text" id="status-text">Connecting…</span>
+    </div>
+    <div class="live-badge connecting" id="live-badge" title="Live event stream">
+      <span class="live-spark" id="live-spark" aria-hidden="true"></span>
+      <span class="live-text" id="live-text">CONNECTING</span>
+    </div>
+    <button class="btn btn-icon" id="btn-settings" type="button" aria-label="Settings" title="Settings"></button>
+  </div>
+</header>
+
+<main class="page" id="page">
+  <nav class="tiles" id="tiles" aria-label="Sections">
+    <a class="tile" data-view="ipinfo" href="#ipinfo" style="--accent: var(--blue)">
+      <div class="tile-head"><span class="tile-icon" data-icon="network"></span><span class="tile-title">Network info</span></div>
+      <div class="tile-body" id="tile-ipinfo"><div class="tile-line muted">Loading…</div></div>
+    </a>
+    <a class="tile" data-view="ping" href="#ping" style="--accent: var(--green)">
+      <div class="tile-head"><span class="tile-icon" data-icon="ping"></span><span class="tile-title">Ping</span></div>
+      <div class="tile-body" id="tile-ping"><div class="tile-line muted">Loading…</div></div>
+    </a>
+    <a class="tile" data-view="outages" href="#outages" style="--accent: var(--yellow)">
+      <div class="tile-head"><span class="tile-icon" data-icon="outage"></span><span class="tile-title">Outages</span></div>
+      <div class="tile-body" id="tile-outages"><div class="tile-line muted">Loading…</div></div>
+    </a>
+    <a class="tile" data-view="speed" href="#speed" style="--accent: var(--purple)">
+      <div class="tile-head"><span class="tile-icon" data-icon="speed"></span><span class="tile-title">Speed</span></div>
+      <div class="tile-body" id="tile-speed"><div class="tile-line muted">Loading…</div></div>
+    </a>
+    <a class="tile" data-view="discovery" href="#discovery" style="--accent: var(--orange)">
+      <div class="tile-head"><span class="tile-icon" data-icon="discovery"></span><span class="tile-title">Discovery</span></div>
+      <div class="tile-body" id="tile-discovery"><div class="tile-line muted">Loading…</div></div>
+    </a>
+    <a class="tile" data-view="tools" href="#tools" style="--accent: var(--red)">
+      <div class="tile-head"><span class="tile-icon" data-icon="tools"></span><span class="tile-title">Tools</span></div>
+      <div class="tile-body" id="tile-tools"><div class="tile-line muted">Loading…</div></div>
+    </a>
+  </nav>
+
+  <section class="view" id="view" aria-live="off"></section>
+
+  <section class="diagnostics" id="diagnostics" hidden>
+    <div class="section-head">
+      <h2><span class="section-accent" style="--accent: var(--ink-soft)"></span>Diagnostics</h2>
+      <div class="actions">
+        <button class="btn btn-sm" id="diag-refresh" type="button"><span data-icon="refresh"></span>Refresh</button>
+        <button class="btn btn-sm" id="diag-copy" type="button"><span data-icon="copy"></span>Copy all</button>
+        <button class="btn btn-sm" id="diag-back" type="button"><span data-icon="back"></span>Back</button>
+      </div>
+    </div>
+    <div class="diag-body" id="diag-body"><div class="empty">Loading diagnostics…</div></div>
+  </section>
+</main>
+
+<div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>
+<div id="modal-root"></div>
+
+<script src="js/api.js"></script>
+<script src="js/charts.js"></script>
+<script src="js/hosttable.js"></script>
+<script src="js/tools/subnet.js"></script>
+<script src="js/tools/traceroute.js"></script>
+<script src="js/tools/lan.js"></script>
+<script src="js/tools/subnetcalc.js"></script>
+<script src="js/tools/wifi.js"></script>
+<script src="js/views/ipinfo.js"></script>
+<script src="js/views/ping.js"></script>
+<script src="js/views/outages.js"></script>
+<script src="js/views/speed.js"></script>
+<script src="js/views/discovery.js"></script>
+<script src="js/views/tools.js"></script>
+<script src="js/egg.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

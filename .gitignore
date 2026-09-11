@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec.bak
+.pytest_cache/
+installer/output/
+*.log
+.claude/settings.local.json
+.tmpdata/
+.tmpdata-dhcp/
+.publish-denylist.txt
+
+# >>> public export: files that stay private (never commit them here) >>>
+# Added by the export from the private source repository; these names stay there.
+*.md
+PORTS.json
+.claude/
+.publish-denylist.txt
+# <<< public export <<<
