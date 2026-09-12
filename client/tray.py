@@ -28,7 +28,21 @@ What it does
   (``TNT — 3 targets · all green``) follow ``overall_light``.
 * JS bridge (``window.pywebview.api``): ``save_file(suggested_name, b64)``,
   ``open_path(path)``, ``client_info()``, ``set_theme(theme)`` and the small extra
-  ``retry()`` used by the error page.
+  ``retry()`` used by the error page. The public :class:`JsBridge` methods are registered one by
+  one with ``window.expose`` (:func:`bridge_functions`), never as ``js_api``: pywebview resolves a
+  ``js_api`` call name as a dotted attribute path, so a page could have reached
+  ``_app.wifi.survey`` or ``_app.quit`` past every method's own check. The window is also a
+  single-origin shell: a ``NavigationStarting`` hook cancels every navigation that is not the
+  service origin or TNT's own inline page (:func:`navigation_allowed`); a user's click on a link
+  to another http(s) site opens the default browser instead.
+* Wi-Fi survey (the WiFi tile, :mod:`client.wifi_survey`): runs here, as the signed-in user,
+  because Windows 11 24H2 gives BSSID lists only to a user who granted location access, and
+  reaches the UI only through the bridge: ``wifi_survey(options)``, ``wifi_scan_now()``,
+  ``wifi_clear()``, ``wifi_set_enabled(on)`` (``wifi_survey_enabled`` in client.json, default
+  on) and ``open_location_settings()``. They answer only while the window shows the TNT service
+  origin (:meth:`ClientApp.showing_service_page`). The session starts the first time the window
+  is actually shown (not while TNT.exe waits minimised in the tray), or on a ``wifi_survey``
+  call while the window is visible or the WiFi page is active; the scanner thread stops on quit.
 * Everything is wrapped in try/except and logged to ``%LOCALAPPDATA%\TNT\client.log``.
 * Self-healing window. When Windows signs out, restarts or shuts down, closing the window
   quits the client instead of hiding it (``SM_SHUTTINGDOWN`` in the close handler, plus a
@@ -91,6 +105,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple
@@ -102,6 +117,7 @@ if not getattr(sys, "frozen", False) and (_ROOT / "client").is_dir() and str(_RO
     sys.path.insert(0, str(_ROOT))
 
 from client import icons  # noqa: E402
+from client import wifi_survey  # noqa: E402
 
 try:  # the client bundles tnt/__init__.py only for the version string
     from tnt import __version__ as CLIENT_VERSION  # noqa: E402
@@ -122,6 +138,13 @@ THEME_BG = {"light": "#FFF7E8", "dark": "#1E1B2E"}
 TRAY_ICON_PX = 64
 #: Windows truncates balloon text at 255 characters (NOTIFYICONDATAW.szInfo).
 NOTIFY_MAX = 255
+#: client.json key of the Wi-Fi survey switch (default on).
+WIFI_ENABLED_KEY = "wifi_survey_enabled"
+#: The Settings page where location access (which the Wi-Fi survey needs) is granted.
+LOCATION_SETTINGS_URI = "ms-settings:privacy-location"
+#: What the Wi-Fi bridge methods answer to any page that is not the TNT service's own.
+WIFI_BRIDGE_REFUSED = "The Wi-Fi survey only answers the TNT dashboard."
+WIFI_BRIDGE_FAILED = "The Wi-Fi survey failed; details are in the TNT client log."
 
 # Process exit codes
 EXIT_OK = 0
@@ -226,6 +249,47 @@ def service_url(args: argparse.Namespace) -> str:
     if args.url:
         return str(args.url).strip().rstrip("/")
     return f"http://127.0.0.1:{args.port}"
+
+
+def same_origin(url: Any, base: Any) -> bool:
+    """True when *url* is an http(s) URL with the scheme, host and port of *base* (the service URL).
+    None, the inline pages (pywebview reports no URL for them), other ports and user-info tricks such
+    as ``http://127.0.0.1:7130@example.com/`` are all False. Never raises."""
+    if not isinstance(url, str) or not isinstance(base, str) or not url or not base:
+        return False
+    try:
+        u, b = urllib.parse.urlsplit(url.strip()), urllib.parse.urlsplit(base.strip())
+        scheme = u.scheme.lower()
+        if scheme not in ("http", "https") or scheme != b.scheme.lower():
+            return False
+        if not u.hostname or u.hostname.lower() != (b.hostname or "").lower():
+            return False
+        default = 443 if scheme == "https" else 80
+        return (u.port or default) == (b.port or default)
+    except ValueError:              # an out-of-range or malformed port
+        return False
+
+
+def navigation_allowed(uri: Any, base: Any) -> bool:
+    """May the TNT window navigate its top frame to *uri*? Pages of the service origin (*base*), a blob: URL
+    of that origin, ``about:blank`` and ``data:`` (what WebView2 reports for ``NavigateToString``, the inline
+    starting and error pages; Chromium never lets a page itself navigate its top frame to a data: URL).
+    Every other page would run with the bridge (this user's files, the Wi-Fi survey) injected. Never raises."""
+    if not isinstance(uri, str):
+        return False
+    text = uri.strip()
+    low = text.lower()
+    if low == "about:blank" or low.startswith("data:"):
+        return True
+    if low.startswith("blob:"):
+        text = text[5:]
+    return same_origin(text, base)
+
+
+def wifi_enabled_setting(state: Dict[str, Any]) -> bool:
+    """The Wi-Fi survey switch from client.json: a JSON boolean, anything else means on (the default)."""
+    value = state.get(WIFI_ENABLED_KEY, True) if isinstance(state, dict) else True
+    return value if isinstance(value, bool) else True
 
 
 # --------------------------------------------------------------------------- HTTP client
@@ -1182,8 +1246,18 @@ def _downloads_dir() -> str:
     return ""
 
 
+def bridge_functions(bridge: Any) -> list:
+    """The bound public methods of *bridge*, for ``window.expose``. pywebview looks an exposed function up
+    by its exact name, whereas a ``js_api`` object is searched as a dotted attribute path (``_app.quit``
+    included), so only these functions are ever callable from a page."""
+    cls = type(bridge)
+    return [getattr(bridge, name) for name in sorted(vars(cls))
+            if not name.startswith("_") and callable(getattr(cls, name))]
+
+
 class JsBridge:
-    """Exposed to the page as ``window.pywebview.api``. Every method is exception-safe."""
+    """Exposed to the page as ``window.pywebview.api`` (each public method through ``window.expose``, see
+    :func:`bridge_functions`). Every method is exception-safe."""
 
     def __init__(self, app: "ClientApp") -> None:
         self._app = app
@@ -1295,6 +1369,77 @@ class JsBridge:
         except Exception:  # noqa: BLE001
             log.exception("retry failed")
             return False
+
+    # -- Wi-Fi survey (client/wifi_survey.py) --------------------------------------------------
+    # The BSSID list is location data, so these answer only the TNT dashboard itself: any other page
+    # the window might end up on gets a refusal. None of them blocks: the WLAN calls run on the
+    # survey's own thread and these only copy its store.
+    def _wifi_on_service_page(self) -> bool:
+        try:
+            return bool(self._app.showing_service_page())
+        except Exception:  # noqa: BLE001
+            log.exception("could not tell which page the window shows")
+            return False
+
+    def _wifi_enabled(self) -> bool:
+        try:
+            return bool(self._app.wifi.enabled)
+        except Exception:  # noqa: BLE001
+            return False
+
+    def wifi_survey(self, options: Any = None) -> Dict[str, Any]:
+        """The survey dict; ``options`` = ``{"active": bool, "history_s": number|null}`` (``active`` = the
+        WiFi page is on screen, renewing the 30 s active-scan lease)."""
+        try:
+            if not self._wifi_on_service_page():
+                return wifi_survey.blank_view("error", WIFI_BRIDGE_REFUSED)
+            return self._app.wifi.survey(options, visible=self._app.window_visible)
+        except Exception:  # noqa: BLE001
+            log.exception("wifi_survey failed")
+            return wifi_survey.blank_view("error", WIFI_BRIDGE_FAILED, enabled=self._wifi_enabled())
+
+    def wifi_scan_now(self) -> Dict[str, Any]:
+        """Request an immediate active scan (one per 5 s); ``{"ok": bool, "error": str|null}``."""
+        try:
+            if not self._wifi_on_service_page():
+                return {"ok": False, "error": WIFI_BRIDGE_REFUSED}
+            return self._app.wifi.scan_now()
+        except Exception:  # noqa: BLE001
+            log.exception("wifi_scan_now failed")
+            return {"ok": False, "error": WIFI_BRIDGE_FAILED}
+
+    def wifi_clear(self) -> Dict[str, Any]:
+        """Forget every access point and all history; the survey session restarts now."""
+        try:
+            if not self._wifi_on_service_page():
+                return {"ok": False, "error": WIFI_BRIDGE_REFUSED}
+            return self._app.wifi.clear()
+        except Exception:  # noqa: BLE001
+            log.exception("wifi_clear failed")
+            return {"ok": False, "error": WIFI_BRIDGE_FAILED}
+
+    def wifi_set_enabled(self, on: Any) -> Dict[str, Any]:
+        """Switch the survey on/off (a JSON boolean only), remembered in client.json."""
+        try:
+            if not self._wifi_on_service_page():
+                return {"ok": False, "enabled": self._wifi_enabled(), "error": WIFI_BRIDGE_REFUSED}
+            if not isinstance(on, bool):
+                return {"ok": False, "enabled": self._wifi_enabled(), "error": "on must be true or false"}
+            return self._app.wifi.set_enabled(on)
+        except Exception:  # noqa: BLE001
+            log.exception("wifi_set_enabled failed")
+            return {"ok": False, "enabled": self._wifi_enabled(), "error": WIFI_BRIDGE_FAILED}
+
+    def open_location_settings(self) -> Dict[str, Any]:
+        """Open Settings > Privacy & security > Location (where the survey's location access is granted)."""
+        try:
+            if not self._wifi_on_service_page():
+                return {"ok": False, "error": WIFI_BRIDGE_REFUSED}
+            os.startfile(LOCATION_SETTINGS_URI)  # noqa: S606 - a fixed ms-settings: URI
+            return {"ok": True}
+        except Exception:  # noqa: BLE001
+            log.exception("open_location_settings failed")
+            return {"ok": False, "error": "Windows could not open the location settings."}
 
 
 # --------------------------------------------------------------------------- tray icon
@@ -1434,6 +1579,9 @@ class ClientApp:
         self._hard_exit: Callable[[int], Any] = os._exit   # replaced in tests
         state = load_state()
         self.theme = state.get("theme") if state.get("theme") in THEME_BG else "light"
+        # no WLAN call and no thread until the session starts (first time the window is shown)
+        self.wifi = wifi_survey.WifiSurvey(enabled=wifi_enabled_setting(state),
+                                           persist=lambda on: save_state({WIFI_ENABLED_KEY: bool(on)}))
 
     # -- main entry --------------------------------------------------------
     def run(self) -> int:
@@ -1460,8 +1608,9 @@ class ClientApp:
         log.info("service %s reachable=%s", self.url, reachable)
         geometry = window_geometry(primary_work_area())
         log.info("window geometry: %s", geometry)
+        # no js_api: the bridge methods are exposed by name only (bridge_functions)
         kwargs: Dict[str, Any] = dict(
-            title=TITLE, js_api=self.bridge, background_color=THEME_BG[self.theme],
+            title=TITLE, background_color=THEME_BG[self.theme],
             hidden=bool(self.args.minimized), text_select=True, **geometry,
         )
         if reachable:
@@ -1469,6 +1618,7 @@ class ClientApp:
             self._on_service_page = True
         else:
             self.window = webview.create_window(html=starting_html(self.url, self.theme), **kwargs)
+        self.window.expose(*bridge_functions(self.bridge))
         self.window.events.closing += self._on_closing
         self.window.events.shown += self._on_shown
         self.window.events.loaded += self._on_loaded
@@ -1515,12 +1665,22 @@ class ClientApp:
             log.info("background threads started")
         except Exception:  # noqa: BLE001
             log.exception("background start failed")
+        if not self.args.minimized:
+            self.wifi.window_shown()        # the window opened visible: the Wi-Fi survey session starts now
+
+    def stop_wifi_survey(self) -> None:
+        """Stop the Wi-Fi survey's scanner thread (idempotent; waits at most a second)."""
+        try:
+            self.wifi.stop(timeout=1.0)
+        except Exception:  # noqa: BLE001
+            log.exception("Wi-Fi survey stop failed")
 
     def _shutdown(self) -> None:
         with self._lock:
             self._quitting = True
         self._stop.set()
         self._wake.set()
+        self.stop_wifi_survey()
         try:
             self.tray.stop()
         except Exception:  # noqa: BLE001
@@ -1801,6 +1961,11 @@ class ClientApp:
                 pass
             core.ProcessFailed += self._on_process_failed
             self._hooks.append(self._on_process_failed)
+            try:
+                core.NavigationStarting += self._on_navigation_starting
+                self._hooks.append(self._on_navigation_starting)
+            except Exception:  # noqa: BLE001 - the bridge methods still check the page themselves
+                log.exception("could not attach the navigation guard")
             pid = int(core.BrowserProcessId)
             with self._lock:
                 self._hooked_core = core
@@ -1825,6 +1990,33 @@ class ClientApp:
         self._hooks.append(on_ready)
         if wv.CoreWebView2 is not None:
             hook_core(wv.CoreWebView2)
+
+    def _on_navigation_starting(self, sender: Any, args: Any) -> None:
+        """CoreWebView2.NavigationStarting (raised on the UI thread): keep the window on the TNT service origin
+        and TNT's own inline pages (:func:`navigation_allowed`). Any other page would get the bridge, which
+        reaches this user's files and the Wi-Fi survey's location data. A link to another http(s) site the
+        user clicked opens in the default browser instead; anything else is just cancelled."""
+        try:
+            uri = str(args.Uri or "")
+            if navigation_allowed(uri, self.url):
+                return
+            args.Cancel = True
+            try:
+                parts = urllib.parse.urlsplit(uri[:2048])
+                where = f"{parts.scheme}://{parts.hostname or ''}"      # the origin only, never the path
+                web = parts.scheme.lower() in ("http", "https") and bool(parts.hostname)
+            except ValueError:
+                where, web = "a malformed URL", False
+            if web and bool(getattr(args, "IsUserInitiated", False)) and re.match(r"^https?://[^\s\"'<>]+$", uri, re.I):
+                log.info("a link to %s opens in the default browser, not in the TNT window", where)
+                import webbrowser
+
+                threading.Thread(target=webbrowser.open, args=(uri,), kwargs={"new": 2}, name="open-link",
+                                 daemon=True).start()
+            else:
+                log.warning("blocked the TNT window from navigating to %s", where)
+        except Exception:  # noqa: BLE001
+            log.exception("NavigationStarting handler failed")
 
     def _on_process_failed(self, sender: Any, args: Any) -> None:
         """CoreWebView2.ProcessFailed (raised on the UI thread)."""
@@ -1908,10 +2100,39 @@ class ClientApp:
         return True
 
     def _on_shown(self) -> None:
+        # WinForms raises Shown for a window created hidden too (pywebview shows it at opacity 0 and
+        # hides it again), so this is not where the Wi-Fi survey starts: see _after_gui_started and
+        # show_window
         log.debug("window shown")
 
     def _on_loaded(self) -> None:
         log.debug("page loaded")
+
+    def page_url(self) -> Optional[str]:
+        """The URL the window shows now; None for the inline starting/error pages, before the first
+        navigation, or when it cannot be read. Reads pywebview's record of the last navigation
+        (``gui.get_current_url``, a plain attribute in the WinForms backend) instead of
+        ``window.get_current_url()``, which waits up to 20 s for the page's loaded event."""
+        window = self.window
+        if window is None:
+            return None
+        try:
+            getter = getattr(getattr(window, "gui", None), "get_current_url", None)
+            if getter is None:
+                return None
+            url = getter(getattr(window, "uid", None))
+            return str(url) if url else None
+        except Exception:  # noqa: BLE001
+            log.debug("could not read the window's URL", exc_info=True)
+            return None
+
+    def showing_service_page(self) -> bool:
+        """True while the window shows a page of the TNT service origin (the Wi-Fi bridge guard)."""
+        return same_origin(self.page_url(), self.url)
+
+    def window_visible(self) -> bool:
+        """True while the TNT window is on screen (not hidden to the tray). Plain Win32, never blocks."""
+        return _window_visible()
 
     # -- navigation --------------------------------------------------------
     def wake_navigator(self) -> None:
@@ -2002,6 +2223,7 @@ class ClientApp:
                 return
             self.keep_window_on_screen()
             self.window.show()
+            self.wifi.window_shown()                 # first time on screen: the Wi-Fi survey session starts
             hwnd = find_window()
             if hwnd:
                 u = _user32()
@@ -2131,6 +2353,7 @@ class ClientApp:
             self._quitting = True
         self._stop.set()
         self._wake.set()
+        self.stop_wifi_survey()
         try:
             self.tray.stop()
         except Exception:  # noqa: BLE001
@@ -2180,12 +2403,20 @@ def client_selfcheck() -> int:
 
     for mod in ("ctypes", "ssl", "json", "PIL.Image", "PIL.ImageDraw", "pystray", "pystray._win32",
                 "clr_loader", "clr", "webview", "webview.platforms.winforms", "webview.platforms.edgechromium",
-                "client.icons"):
+                "client.icons", "client.wifi_ies", "client.wifi_survey"):
         try:
             importlib.import_module(mod)
             report(f"import {mod}", True)
         except Exception as exc:  # noqa: BLE001
             report(f"import {mod}", False, f"{type(exc).__name__}: {exc}")
+    try:  # no WLAN call: the structure layout and the element parser on a synthetic entry
+        from client import wifi_ies
+
+        parsed, detail = wifi_ies.self_test()
+        report("Wi-Fi survey structures + parser", wifi_survey.layout_ok() and parsed,
+               f"{detail}; WLAN_BSS_ENTRY {ctypes.sizeof(wifi_survey.WLAN_BSS_ENTRY)} bytes")
+    except Exception as exc:  # noqa: BLE001
+        report("Wi-Fi survey structures + parser", False, f"{type(exc).__name__}: {exc}")
     try:
         img = icons.make_icon(TRAY_ICON_PX, "green")
         report("tray icon render", img.size == (TRAY_ICON_PX, TRAY_ICON_PX), f"{img.size} {img.mode}")

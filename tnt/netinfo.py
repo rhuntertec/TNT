@@ -40,6 +40,21 @@ Contract gaps filled here (documented as required):
   a preferred address exists.
 * The deprecated site-local placeholders ``fec0:0:0:ffff::1-3`` that Windows reports as DNS
   servers on unconfigured adapters are dropped from ``dns`` (``ipconfig`` hides them too).
+* Identity and origin fields for :mod:`tnt.netwatch` (not part of ``to_dict()``, so the API
+  shape is unchanged): ``Adapter.guid`` (``AdapterName``, e.g. ``"{4D36E972-...}"``) and
+  ``Adapter.luid`` stay the same when a USB NIC is re-plugged into another port (``IfIndex``
+  may not); ``IpAddr.prefix_origin`` / ``suffix_origin`` are the raw ``IP_PREFIX_ORIGIN`` /
+  ``IP_SUFFIX_ORIGIN`` values, which tell a manual or DHCPv6 IPv6 address from the RFC 4941
+  temporary ones Windows rotates.
+* ``DadState`` values follow ``NL_DAD_STATE``: 1 tentative, 2 duplicate, 3 deprecated (every
+  expired IPv6 temporary address), 4 preferred.
+* ``get_default_gateway(adapters)`` and :func:`default_gateway_for` compute the gateway from
+  one enumeration, so a caller that already holds the adapter list (``netinfo_snapshot``, the
+  network watcher) never mixes two enumerations that straddle a change.
+* :func:`adapter_warnings` flags what is visibly wrong with an adapter's live state (a
+  self-assigned 169.254 address, a duplicate address, a gateway outside the subnet, no DNS
+  servers, two default gateways); ``to_dict()`` carries them as ``"warnings"`` and
+  ``netinfo_snapshot()`` adds the one that needs the other adapters.
 """
 from __future__ import annotations
 
@@ -56,8 +71,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 log = logging.getLogger(__name__)
 
 __all__ = [
-    "IpAddr", "Adapter", "get_adapters", "get_internet_nic", "get_default_gateway",
-    "local_networks", "classify_ip", "subnet_groups", "netinfo_snapshot",
+    "IpAddr", "Adapter", "get_adapters", "get_internet_nic", "get_default_gateway", "default_gateway_for",
+    "local_networks", "classify_ip", "subnet_groups", "adapter_warnings", "netinfo_snapshot",
     "IF_TYPE_NAMES", "OPER_STATUS_NAMES",
 ]
 
@@ -77,7 +92,12 @@ ERROR_NO_DATA = 232
 ERROR_ADDRESS_NOT_ASSOCIATED = 1228
 
 IP_ADAPTER_DHCP_ENABLED = 0x0004          # Flags bit: Dhcpv4Enabled
+IP_DAD_STATE_TENTATIVE = 1                # NL_DAD_STATE
+IP_DAD_STATE_DUPLICATE = 2
+IP_DAD_STATE_DEPRECATED = 3
 IP_DAD_STATE_PREFERRED = 4
+IP_SUFFIX_ORIGIN_MANUAL = 1               # IP_SUFFIX_ORIGIN: a fixed address somebody typed in ...
+IP_SUFFIX_ORIGIN_DHCP = 3                 # ... or one a DHCP(v6) server assigned
 SPEED_UNKNOWN = 0xFFFFFFFFFFFFFFFF
 MTU_UNKNOWN = 0xFFFFFFFF
 MAX_ADAPTER_ADDRESS_LENGTH = 8
@@ -115,6 +135,10 @@ _CACHE_TTL_S = 1.0
 # Windows lists these deprecated site-local addresses as DNS servers on every adapter that
 # has none configured; ipconfig hides them and so do we.
 _PLACEHOLDER_DNS = ipaddress.IPv6Network("fec0:0:0:ffff::/64")
+_APIPA = ipaddress.IPv4Network("169.254.0.0/16")
+#: Fields that exist for tnt.netwatch only and stay out of the API dicts.
+_INTERNAL_ADAPTER_FIELDS = ("guid", "luid")
+_INTERNAL_ADDR_FIELDS = ("prefix_origin", "suffix_origin")
 
 IPNetwork = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
 
@@ -130,9 +154,14 @@ class IpAddr:
     dad_state: int = IP_DAD_STATE_PREFERRED
     preferred: bool = True
     scope_id: int = 0
+    prefix_origin: int = 0           # raw IP_PREFIX_ORIGIN (internal, not in to_dict)
+    suffix_origin: int = 0           # raw IP_SUFFIX_ORIGIN (internal, not in to_dict)
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        for k in _INTERNAL_ADDR_FIELDS:
+            d.pop(k, None)
+        return d
 
 
 @dataclass
@@ -156,6 +185,8 @@ class Adapter:
     metric_v4: int = 0
     is_physical: bool = False
     is_loopback: bool = False
+    guid: str = ""                   # AdapterName (internal, not in to_dict)
+    luid: int = 0                    # interface LUID (internal, not in to_dict)
 
     @property
     def is_up(self) -> bool:
@@ -178,8 +209,15 @@ class Adapter:
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
+        for k in _INTERNAL_ADAPTER_FIELDS:
+            d.pop(k, None)
+        for family in ("ipv4", "ipv6"):
+            for entry in d.get(family) or []:
+                for k in _INTERNAL_ADDR_FIELDS:
+                    entry.pop(k, None)
         d["primary_ipv4"] = self.primary_ipv4
         d["subnets"] = subnet_groups(self)
+        d["warnings"] = adapter_warnings(self)
         return d
 
 
@@ -331,7 +369,8 @@ def _version(ip: str) -> Optional[int]:
         return None
 
 
-def _make_ipaddr(address: str, version: int, prefix: int, dad_state: int, scope_id: int) -> IpAddr:
+def _make_ipaddr(address: str, version: int, prefix: int, dad_state: int, scope_id: int,
+                 prefix_origin: int = 0, suffix_origin: int = 0) -> IpAddr:
     max_prefix = 32 if version == 4 else 128
     prefix = max(0, min(max_prefix, int(prefix)))
     try:
@@ -350,6 +389,8 @@ def _make_ipaddr(address: str, version: int, prefix: int, dad_state: int, scope_
         dad_state=int(dad_state),
         preferred=int(dad_state) == IP_DAD_STATE_PREFERRED,
         scope_id=int(scope_id),
+        prefix_origin=int(prefix_origin),
+        suffix_origin=int(suffix_origin),
     )
 
 
@@ -382,7 +423,8 @@ def _parse_adapter(a: IP_ADAPTER_ADDRESSES) -> Adapter:
         if sa is None:
             continue
         address, version, scope = sa
-        entry = _make_ipaddr(address, version, int(u.OnLinkPrefixLength), int(u.DadState), scope)
+        entry = _make_ipaddr(address, version, int(u.OnLinkPrefixLength), int(u.DadState), scope,
+                             int(u.PrefixOrigin), int(u.SuffixOrigin))
         (ipv4 if version == 4 else ipv6).append(entry)
     ipv4 = _preferred_first(ipv4)
 
@@ -420,6 +462,12 @@ def _parse_adapter(a: IP_ADAPTER_ADDRESSES) -> Adapter:
 
     speed = int(a.TransmitLinkSpeed)
     mtu = int(a.Mtu)
+    guid = ""
+    if a.AdapterName:
+        try:
+            guid = ctypes.string_at(a.AdapterName).decode("ascii", "replace").strip()
+        except Exception:  # noqa: BLE001
+            guid = ""
     return Adapter(
         index=index,
         name=name,
@@ -440,6 +488,8 @@ def _parse_adapter(a: IP_ADAPTER_ADDRESSES) -> Adapter:
         metric_v4=int(a.Ipv4Metric),
         is_physical=_is_physical(if_type, description),
         is_loopback=if_type == 24,
+        guid=guid,
+        luid=int(a.Luid),
     )
 
 
@@ -550,18 +600,27 @@ def get_internet_nic(adapters: Optional[Sequence[Adapter]] = None) -> Optional[A
         return None
 
 
-def get_default_gateway() -> Optional[str]:
-    """IPv4 (preferably) gateway of :func:`get_internet_nic`; ``None`` if unknown."""
+def default_gateway_for(adapters: Sequence[Adapter], nic: Optional[Adapter]) -> Optional[str]:
+    """The default gateway given an adapter list and its internet NIC (no native call).
+
+    The NIC's IPv4 gateway, else its first (IPv6) gateway, else the lowest-metric up adapter
+    that has an IPv4 gateway (a VPN tunnel that won the route lookup usually has none)."""
+    if nic is not None:
+        gw = nic.ipv4_gateway or (nic.gateways[0] if nic.gateways else None)
+        if gw:
+            return gw
+    fallback = [a for a in adapters if a.is_up and not a.is_loopback and a.ipv4_gateway]
+    fallback.sort(key=lambda a: (a.metric_v4, a.index))
+    return fallback[0].ipv4_gateway if fallback else None
+
+
+def get_default_gateway(adapters: Optional[Sequence[Adapter]] = None) -> Optional[str]:
+    """IPv4 (preferably) gateway of :func:`get_internet_nic`; ``None`` if unknown.
+
+    *adapters* reuses an enumeration the caller already holds (one consistent view)."""
     try:
-        pool = get_adapters(include_down=True, include_loopback=False)
-        nic = get_internet_nic(pool)
-        if nic is not None:
-            gw = nic.ipv4_gateway or (nic.gateways[0] if nic.gateways else None)
-            if gw:
-                return gw
-        fallback = [a for a in pool if a.is_up and a.ipv4_gateway]
-        fallback.sort(key=lambda a: (a.metric_v4, a.index))
-        return fallback[0].ipv4_gateway if fallback else None
+        pool = list(adapters) if adapters is not None else get_adapters(include_down=True, include_loopback=False)
+        return default_gateway_for(pool, get_internet_nic(pool))
     except Exception:  # noqa: BLE001
         log.exception("get_default_gateway failed")
         return None
@@ -693,6 +752,94 @@ def subnet_groups(adapter: Adapter) -> List[Dict[str, Any]]:
     return groups
 
 
+def _is_apipa(address: str) -> bool:
+    try:
+        return ipaddress.IPv4Address(address) in _APIPA
+    except ValueError:
+        return False
+
+
+def _has_ipv6_route(adapter: Adapter) -> bool:
+    """A preferred global (or unique-local) IPv6 address and an IPv6 gateway on *adapter*."""
+    if not any(_version(g) == 6 for g in adapter.gateways):
+        return False
+    for x in adapter.ipv6:
+        try:
+            addr = ipaddress.IPv6Address(str(x.address).split("%", 1)[0])
+        except ValueError:
+            continue
+        if x.preferred and not (addr.is_link_local or addr.is_loopback or addr.is_multicast or addr.is_unspecified):
+            return True
+    return False
+
+
+def adapter_warnings(adapter: Adapter, adapters: Optional[Sequence[Adapter]] = None,
+                     internet_index: Optional[int] = None) -> List[Dict[str, str]]:
+    """Plain-language problems visible in an adapter's live state; ``[]`` when there are none.
+
+    ``[{"code", "message"}]``, only for an adapter that is up:
+
+    * ``apipa`` - every usable IPv4 address is self-assigned (169.254.x.x): no DHCP server answered.
+      Only on a DHCP adapter without a duplicate IPv4 address: a static or duplicate address that
+      Windows replaced with 169.254.x.x is the ``duplicate_address`` problem, not a DHCP one.  When
+      the adapter has a global IPv6 address and an IPv6 gateway the message says that the network
+      may be IPv6-only
+    * ``duplicate_address`` - duplicate-address detection found another device on an address
+    * ``gateway_outside_subnet`` - an IPv4 gateway lies in none of the adapter's IPv4 subnets
+      (typical of a mistyped static address or mask; Windows accepts it)
+    * ``no_dns`` - a usable IPv4 address and a gateway but no DNS server
+    * ``multiple_default_gateways`` - informational, needs *adapters* and only on the internet
+      NIC (*internet_index*): another up adapter has an IPv4 default gateway as well
+
+    Pure (no native call); never raises.
+    """
+    out: List[Dict[str, str]] = []
+    try:
+        if not adapter.is_up or adapter.is_loopback:
+            return out
+        usable = [x for x in adapter.ipv4 if x.preferred]
+        duplicate_v4 = any(int(x.dad_state) == IP_DAD_STATE_DUPLICATE for x in adapter.ipv4)
+        if usable and all(_is_apipa(x.address) for x in usable) and adapter.dhcp_enabled and not duplicate_v4:
+            message = f"Self-assigned address {usable[0].address}: no DHCP server answered"
+            if _has_ipv6_route(adapter):
+                message += " (IPv6 works: this network may be IPv6-only)"
+            out.append({"code": "apipa", "message": message})
+        seen: set = set()
+        for x in list(adapter.ipv4) + list(adapter.ipv6):
+            if int(x.dad_state) == IP_DAD_STATE_DUPLICATE and x.address not in seen:
+                seen.add(x.address)
+                out.append({"code": "duplicate_address",
+                            "message": f"{x.address} is already used by another device on this network"})
+        nets: List[ipaddress.IPv4Network] = []
+        for x in adapter.ipv4:
+            try:
+                nets.append(ipaddress.IPv4Network(x.network, strict=False))
+            except ValueError:
+                continue
+        if nets:
+            for gw in adapter.gateways:
+                if _version(gw) != 4:
+                    continue
+                if not any(ipaddress.IPv4Address(gw) in net for net in nets):
+                    out.append({"code": "gateway_outside_subnet",
+                                "message": f"Gateway {gw} is outside this adapter's subnet {nets[0]}: "
+                                           "check the IP address and subnet mask"})
+        if usable and adapter.ipv4_gateway and not adapter.dns:
+            out.append({"code": "no_dns", "message": "No DNS servers: host names will not resolve"})
+        if adapters is not None and internet_index is not None and adapter.index == internet_index \
+                and adapter.ipv4_gateway:
+            others = [a for a in adapters if a is not adapter and a.index != adapter.index and a.is_up
+                      and not a.is_loopback and a.ipv4_gateway]
+            if others:
+                other = others[0]
+                out.append({"code": "multiple_default_gateways",
+                            "message": f"{other.name} also has a default gateway ({other.ipv4_gateway}); "
+                                       "Windows sends traffic through the one with the lowest metric"})
+    except Exception:  # noqa: BLE001
+        log.exception("adapter warnings for %s failed", getattr(adapter, "name", "?"))
+    return out
+
+
 def _snapshot_rank(a: Adapter, internet_index: Optional[int]) -> Tuple[int, int, int]:
     if internet_index is not None and a.index == internet_index:
         rank = 0
@@ -712,15 +859,18 @@ def netinfo_snapshot() -> Dict[str, Any]:
         adapters = get_adapters(include_down=True, include_loopback=False)
         nic = get_internet_nic(adapters)
         internet_index = nic.index if nic is not None else None
-        gateway: Optional[str] = None
-        if nic is not None:
-            gateway = nic.ipv4_gateway or (nic.gateways[0] if nic.gateways else None)
-        if gateway is None:
-            gateway = get_default_gateway()
+        # the gateway comes from the same enumeration: a second one could straddle a network
+        # change and pair the new gateway with the old adapter list
+        gateway = default_gateway_for(adapters, nic)
         ordered = sorted(adapters, key=lambda a: _snapshot_rank(a, internet_index))
+        rows: List[Dict[str, Any]] = []
+        for a in ordered:
+            row = a.to_dict()
+            row["warnings"] = adapter_warnings(a, adapters, internet_index)
+            rows.append(row)
         return {
             "ts": ts,
-            "adapters": [a.to_dict() for a in ordered],
+            "adapters": rows,
             "internet_nic_index": internet_index,
             "default_gateway": gateway,
             "public_hint": None,

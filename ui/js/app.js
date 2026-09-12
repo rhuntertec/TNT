@@ -1,6 +1,7 @@
 /* TNT — app.js
-   Owns application state, hash routing, the six top tiles, the header status pill,
-   the Settings modal, the Diagnostics panel, toasts, the confirm modal and the SSE wiring.
+   Owns application state, hash routing, the top tiles, the header status pill,
+   the Settings modal, the Diagnostics panel, toasts, the confirm modal and the SSE wiring,
+   including following this PC onto another network (net.changed / status.net.generation).
    Also provides the shared helpers views use at runtime: TNT.util, TNT.ui, TNT.icons. */
 (function () {
   'use strict';
@@ -43,14 +44,20 @@
     warning: '<svg ' + S + '><path d="M12 3.6 21.2 19.4H2.8z" stroke-linejoin="round"/><path d="M12 9.4v4.6M12 16.8v.4"/></svg>',
     // a small switch with three cables hanging off it: LAN peers and private traceroute hops
     lan: '<svg ' + S + '><rect x="3" y="3.6" width="18" height="6.6" rx="2.2"/><path d="M7 6.9h.01M10.4 6.9h.01"/><path d="M6.5 10.2v4.6M12 10.2v4.6M17.5 10.2v4.6"/><circle cx="6.5" cy="17.4" r="2.1"/><circle cx="12" cy="17.4" r="2.1"/><circle cx="17.5" cy="17.4" r="2.1"/></svg>',
-    // three broadcast arcs over a dot: the saved Wi-Fi networks card
+    // three broadcast arcs over a dot: the WiFi tile and the saved Wi-Fi networks card
     wifi: '<svg ' + S + '><path d="M2.4 8.4a14 14 0 0 1 19.2 0"/><path d="M5.6 11.9a9.4 9.4 0 0 1 12.8 0"/><path d="M8.8 15.4a4.8 4.8 0 0 1 6.4 0"/><circle cx="12" cy="19.1" r="1.3" fill="currentColor" stroke="none"/></svg>',
+    // two overlapping channel shapes standing on a baseline: the WiFi page's spectrum charts
+    spectrum: '<svg ' + S + '><path d="M2.6 20.2h18.8"/><path d="M4 20.2 6.6 7.4h4.6l2.6 12.8"/><path d="M11.2 20.2 13.6 12.6h4.2l2.4 7.6"/></svg>',
     // crosshair target: the last hop of a traceroute
     target: '<svg ' + S + '><circle cx="12" cy="12" r="8.4"/><circle cx="12" cy="12" r="3.8"/><circle cx="12" cy="12" r="1.1" fill="currentColor" stroke="none"/><path d="M12 2.4v2.6M12 19v2.6M2.4 12H5M19 12h2.6"/></svg>',
     // question mark in a ring: a hop that never answered
     question: '<svg ' + S + '><circle cx="12" cy="12" r="9"/><path d="M9.2 9.5a2.8 2.8 0 1 1 4 2.5c-.9.5-1.2 1.1-1.2 2"/><path d="M12 17v.4"/></svg>',
     // a winding route between two dots: the Traceroute card / Run button
     route: '<svg ' + S + '><circle cx="5" cy="18" r="2.2"/><circle cx="19" cy="5" r="2.2"/><path d="M7.2 18H13.5a3.5 3.5 0 0 0 0-7h-3a3 3 0 0 1 0-6h6.3"/></svg>',
+    // a clipboard with three bars: the Reports tile and the Full Scan button
+    report: '<svg ' + S + '><path d="M9 3.6h6v2.8H9z" stroke-linejoin="round"/><path d="M9 5H6.6A1.6 1.6 0 0 0 5 6.6v12.8A1.6 1.6 0 0 0 6.6 21h10.8a1.6 1.6 0 0 0 1.6-1.6V6.6A1.6 1.6 0 0 0 17.4 5H15"/><path d="M8.6 16.6v-2.4M12 16.6v-5M15.4 16.6v-3.4"/></svg>',
+    // two opposite arrows: swap the two reports of a comparison
+    swap: '<svg ' + S + '><path d="M4 8.2h14.6M15 4.6l3.6 3.6-3.6 3.6"/><path d="M20 15.8H5.4M9 12.2l-3.6 3.6L9 19.4"/></svg>',
     // the same cylinder stick the easter egg throws: curved far end, elliptical cap with the
     // wick hole, curved seams and label band, fuse out of the cap, spark at the tip
     dynamite: '<svg viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">' +
@@ -202,7 +209,15 @@
     const foot = opts.foot ? h('div', { class: 'modal-foot' }, opts.foot) : null;
     const card = h('div', { class: 'modal' + (opts.narrow ? ' narrow' : ''), role: 'dialog', 'aria-modal': 'true', 'aria-label': opts.title || 'Dialog' }, head, body, foot);
     const backdrop = h('div', { class: 'modal-backdrop' }, card);
-    const onKey = (e) => { if (e.key === 'Escape') { e.stopPropagation(); close(undefined); } };
+    // Escape closes the modal on top only (a confirm over another modal closes alone: the one under it registered its
+    // listener first and sees it is not on top). opts.onEscape() returning true leaves it open and lets the key through
+    // to the focused control, such as a site name field closing its list of suggestions.
+    const onKey = (e) => {
+      if (e.key !== 'Escape' || modalStack[modalStack.length - 1] !== ctl) return;
+      if (opts.onEscape && opts.onEscape(e)) return;
+      e.stopPropagation();
+      close(undefined);
+    };
     function close(result) {
       if (closed) return;
       closed = true;
@@ -218,7 +233,8 @@
     $('#modal-root').appendChild(backdrop);
     const ctl = { close, el: card, body };
     modalStack.push(ctl);
-    const first = card.querySelector('input:not([type=hidden]), select, button.btn-primary, button.btn-danger');
+    // a control marked data-autofocus wins: a danger confirm starts on its safe button, so one stray Enter destroys nothing
+    const first = card.querySelector('[data-autofocus]') || card.querySelector('input:not([type=hidden]), select, button.btn-primary, button.btn-danger');
     setTimeout(() => { try { (first || closeBtn).focus(); } catch (e) { /* ignore */ } }, 0);
     return ctl;
   }
@@ -228,7 +244,7 @@
     return new Promise((resolve) => {
       let done = false;
       const finish = (v) => { if (!done) { done = true; resolve(!!v); } };
-      const cancel = h('button', { class: 'btn', type: 'button', on: { click: () => m.close(false) } }, opts.cancel || 'Cancel');
+      const cancel = h('button', { class: 'btn', type: 'button', 'data-autofocus': opts.danger ? '' : null, on: { click: () => m.close(false) } }, opts.cancel || 'Cancel');
       const ok = h('button', { class: 'btn ' + (opts.danger ? 'btn-danger' : 'btn-primary'), type: 'button', on: { click: () => m.close(true) } }, opts.ok || 'OK');
       const m = modal({ title: opts.title || 'Are you sure?', body: opts.message || '', narrow: true, foot: [cancel, ok], onClose: finish });
     });
@@ -331,7 +347,21 @@
     return h('span', { class: 'light ' + (color || 'grey') + (large ? ' lg' : ''), title: color || 'unknown' });
   }
 
-  TNT.ui = { toast, modal, confirm: confirmDialog, copy: copyText, busy, toggle, fuse, segmented, emptyState, light: lightEl, icon: iconEl };
+  /** An external link opened outside the app like every external link (a plain left click goes to TNT.openExternal). */
+  function geoLink(url, text) {
+    const a = h('a', { class: 'geo-attrib', href: url, target: '_blank', rel: 'noopener', title: 'Open ' + url }, text);
+    a.addEventListener('click', (e) => {
+      if (e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
+      TNT.openExternal(url, e);
+    });
+    return a;
+  }
+  /** The CC BY 4.0 attribution for DB-IP's IP location data. */
+  function geoAttribution() { return geoLink('https://db-ip.com', 'IP Geolocation by DB-IP'); }
+  /** The licence of that data (CC BY 4.0), shown in Settings. */
+  function geoLicence() { return geoLink('https://creativecommons.org/licenses/by/4.0/', 'CC BY 4.0'); }
+
+  TNT.ui = { toast, modal, confirm: confirmDialog, copy: copyText, busy, toggle, fuse, segmented, emptyState, light: lightEl, icon: iconEl, geoAttribution, geoLicence };
 
   /** Open an http(s) URL outside the app. Inside the TNT client the pywebview bridge
    *  (`open_url`) hands it to the default browser and true is returned — when the click event of
@@ -362,8 +392,8 @@
     live: 'connecting', apiOk: true, now: nowS(), view: null,
   };
   TNT.state = state;
-  const ACCENT = { ipinfo: 'var(--blue)', ping: 'var(--green)', outages: 'var(--yellow)', speed: 'var(--purple)', discovery: 'var(--orange)', tools: 'var(--red)' };
-  const VIEW_NAMES = ['ipinfo', 'ping', 'outages', 'speed', 'discovery', 'tools'];
+  const ACCENT = { ipinfo: 'var(--blue)', ping: 'var(--green)', outages: 'var(--yellow)', speed: 'var(--purple)', discovery: 'var(--orange)', tools: 'var(--red)', wifi: 'var(--teal)', reports: 'var(--grey)' };
+  const VIEW_NAMES = ['ipinfo', 'ping', 'outages', 'speed', 'discovery', 'wifi', 'tools', 'reports'];   // the tile order of index.html
 
   /* ================================================================ theme */
   function setTheme(theme, opts) {
@@ -386,9 +416,11 @@
 
   /* ============================================================== status */
   let lastStatusTs = 0;
-  let refreshing = false;
+  let refreshing = false, refreshAgain = false, statusRetryTimer = null;
   async function refreshStatus() {
-    if (refreshing) return;
+    // asked for while a request is in flight: run once more when it lands, so a network change (or an
+    // outage event) is never answered with the snapshot requested before it
+    if (refreshing) { refreshAgain = true; return; }
     refreshing = true;
     try {
       const st = await api.status();
@@ -396,14 +428,26 @@
     } catch (err) {
       state.apiOk = false;
       renderHeader();
-    } finally { refreshing = false; }
+    } finally {
+      refreshing = false;
+      if (refreshAgain) { refreshAgain = false; refreshStatus(); }
+    }
   }
   function applyStatus(st) {
     if (!st) return;
+    lastStatusTs = Date.now();
+    const net = api.net.compare(lastNet, st, Date.now());
+    if (net.stale) {
+      // a snapshot from before the net.changed event this page already applied: ask again shortly
+      state.apiOk = true;
+      if (!statusRetryTimer) statusRetryTimer = setTimeout(() => { statusRetryTimer = null; refreshStatus(); }, 1000);
+      return;
+    }
+    lastNet = net.next;
     state.status = st;
     state.targets = Array.isArray(st.targets) ? st.targets : [];
     state.apiOk = true;
-    lastStatusTs = Date.now();
+    adoptStatusJob(st.reports && st.reports.job);
     if (st.settings && st.settings.theme && !state._themeSynced) {
       state._themeSynced = true;
       let local = null;
@@ -412,6 +456,108 @@
     }
     renderAll();
     notifyView();
+    renderSettingsGateway();
+    renderSettingsGeoip();
+    // a newer network generation than this page has seen (the event was missed: stream down, PC asleep,
+    // window hidden) or a restarted service: the same refresh as the event, the toast only for a change
+    if (net.changed) {
+      networkChanged({ source: 'status', generation: st.net.generation, default_gateway: st.net.default_gateway || null,
+        internet_nic: st.net.internet_nic || null, summary: api.net.summaryFromStatus(st) }, !net.restarted);
+    }
+  }
+  /** Replace the target list (a ping.targets event, or the answer of Load Default Tiles). */
+  function setTargets(list) {
+    state.targets = list;
+    if (state.status) state.status.targets = list;
+    renderAll();
+    notifyView();
+  }
+
+  /* ===================================================== network changes */
+  // net.changed, or a status snapshot with a newer status.net.generation, means this PC is on another
+  // network (or an adapter's configuration changed): one coalesced toast, the tiles repainted, a fresh
+  // status, and the open view's netChanged(info, state) hook once a burst of changes has settled.
+  const NET_SETTLE_MS = 500;       // views reload once changes stop arriving for this long
+  const NET_RECHECK_MS = 3000;     // then one more status read: what the service re-resolves a moment later
+  const NET_TOAST_MS = 7000;
+  let lastNet = null;              // { started, generation, eventMs } (api.net.compare)
+  let netInfo = null, netSettleTimer = null, netRecheckTimer = null;
+  let netToast = null, netToastTimer = null, netToastDeferTimer = null, netToastInfo = null;
+
+  function networkChanged(info, withToast) {
+    const showIpv6 = !!(state.settings && state.settings.ui && state.settings.ui.show_ipv6);
+    if (withToast && info.summary && api.net.toastWanted(info, showIpv6)) showNetToast(info);
+    renderAll();
+    renderSettingsGateway();
+    renderSettingsGeoip();
+    refreshStatus();
+    netInfo = api.net.merge(netInfo, info);
+    if (netSettleTimer) clearTimeout(netSettleTimer);
+    netSettleTimer = setTimeout(() => {
+      netSettleTimer = null;
+      const merged = netInfo;
+      netInfo = null;
+      if (current.view && current.view.netChanged) {
+        try { current.view.netChanged(merged, state); } catch (e) { console.error('view netChanged failed', e); }
+      }
+    }, NET_SETTLE_MS);
+    if (netRecheckTimer) clearTimeout(netRecheckTimer);
+    netRecheckTimer = setTimeout(() => { netRecheckTimer = null; refreshStatus(); }, NET_RECHECK_MS);
+  }
+
+  /** The one network toast: a change while it is still up rewrites it and restarts its timer; once it
+   *  has gone, the next one waits out api.net.TOAST_GAP_MS since the last and carries the latest summary. */
+  function showNetToast(info) {
+    netToastInfo = info;
+    const visible = !!(netToast && netToast.el.isConnected && !netToast.el.classList.contains('leaving'));
+    const plan = api.net.toastPlan(netToast ? { shownMs: netToast.shownMs, visible } : null, Date.now());
+    if (plan.action === 'defer') {
+      if (!netToastDeferTimer) netToastDeferTimer = setTimeout(() => { netToastDeferTimer = null; showNetToast(netToastInfo); }, plan.waitMs);
+      return;
+    }
+    const { text, kind } = api.net.toastText(info);
+    let el;
+    if (plan.action === 'update') {
+      el = netToast.el;
+      el.className = 'toast ' + kind;
+      el.textContent = text;
+      pop(el);
+    } else {
+      el = h('div', { class: 'toast ' + kind, role: 'status' }, text);
+      toastsEl.appendChild(el);
+      while (toastsEl.children.length > 5) toastsEl.firstElementChild.remove();
+      netToast = { el, shownMs: Date.now() };
+    }
+    if (netToastTimer) clearTimeout(netToastTimer);
+    netToastTimer = setTimeout(() => { netToastTimer = null; el.classList.add('leaving'); setTimeout(() => el.remove(), 220); }, NET_TOAST_MS);
+  }
+
+  /** "default gateway · 10.0.0.251" in Settings > Default targets, kept current while the modal is open. */
+  function gatewayChipText() {
+    const net = state.status && state.status.net;
+    return net ? 'default gateway · ' + (net.default_gateway || 'none right now') : 'default gateway';
+  }
+  function renderSettingsGateway() {
+    const chip = $('#settings-gateway');
+    const text = gatewayChipText();
+    if (chip && chip.textContent !== text) chip.textContent = text;
+  }
+  /** Settings › IP location: the live status line (views/ipinfo.js geoStatusText) and whether Retry now shows. */
+  function geoipStatusText() {
+    const v = TNT.views && TNT.views.ipinfo;
+    return v && v.geoStatusText ? v.geoStatusText(state.status && state.status.geoip, state.now) : '';
+  }
+  function geoipRetryVisible() {
+    const g = state.status && state.status.geoip;
+    return !!(g && g.enabled && g.error && g.state !== 'downloading');
+  }
+  function renderSettingsGeoip() {
+    const el = $('#settings-geoip');
+    const text = geoipStatusText();
+    if (el && el.textContent !== text) el.textContent = text;
+    const btn = $('#settings-geoip-retry');
+    const show = geoipRetryVisible();
+    if (btn && btn.hidden === show) btn.hidden = !show;
   }
   async function loadSettings() {
     try {
@@ -474,7 +620,18 @@
   const tileEls = {};
   const PING_TILE_MAX = 6;   // lights shown on the Ping tile (3 columns x 2 rows)
   const SLUGGISH_MS = 100;   // header says "looking sluggish" only from this 1-minute average up
-  function line(html, cls) { return '<div class="tile-line ' + (cls || '') + '">' + html + '</div>'; }
+  // the Tools tile names the tools under the DHCP server, in the order of their cards on the Tools page
+  const TOOLS_TILE_ITEMS = ['LAN throughput', 'Traceroute', 'Subnet calc', 'WiFi passwords'];
+  function line(html, cls, title) { return '<div class="tile-line ' + (cls || '') + '"' + (title ? ' title="' + esc(title) + '"' : '') + '>' + html + '</div>'; }
+  /** The most serious problem of a status.netinfo adapter (its `warnings` codes, labelled like the Network info
+   *  page) as a badge for the Network info tile; '' without one. The informational grey ones stay on the page. */
+  function warningBadge(nic) {
+    const view = TNT.views.ipinfo && TNT.views.ipinfo.warningView;
+    const shown = (nic && Array.isArray(nic.warnings) && view ? nic.warnings : []).map((code) => view({ code })).filter((w) => w && w.cls !== 'grey');
+    if (!shown.length) return '';
+    const w = shown.find((x) => x.cls === 'red') || shown[0];
+    return '<span class="badge ' + w.cls + '" title="Details on the Network info page">' + esc(w.label) + '</span>';
+  }
 
   function renderTiles() {
     const st = state.status;
@@ -483,13 +640,19 @@
     {
       const el = tileEls.ipinfo;
       const nic = st && st.netinfo && st.netinfo.internet_nic;
+      const local = st && st.netinfo && st.netinfo.local_nic;
       let html;
       if (!st) html = line('Loading…', 'muted');
       else if (nic) {
         // adapter, its IPv4 and the gateway; the live gateway/internet state is on the link map
-        html = line('<span class="strong">' + esc(nic.name) + '</span><span class="badge blue" style="--accent:var(--blue)">internet</span>') +
-          line('<span class="muted">IPv4</span> <code>' + esc(nic.ipv4 || '—') + '</code>') +
+        html = line('<span class="strong">' + esc(nic.name) + '</span><span class="badge blue" style="--accent:var(--blue)">internet</span>' + warningBadge(nic)) +
+          line('<span class="muted">IPv4</span> <code>' + esc(api.net.nicCidr(nic) || nic.ipv4 || '—') + '</code>') +
           line('<span class="muted">Gateway</span> <code>' + esc(nic.gateway || '—') + '</code>');
+      } else if (local) {
+        // no adapter faces the internet: the one that is connected anyway (a bench cable, the DHCP server tool, no DHCP server)
+        html = line('<span class="strong">' + esc(local.name) + '</span><span class="badge grey">no internet</span>' + warningBadge(local)) +
+          line('<span class="muted">IPv4</span> <code>' + esc(api.net.nicCidr(local) || local.ipv4 || '—') + '</code>') +
+          line('<span class="muted">Gateway</span> <code>' + esc(local.gateway || '—') + '</code>');
       } else {
         html = line('<span class="strong">No internet adapter</span>') + line((st.netinfo && st.netinfo.adapter_count || 0) + ' adapters found', 'muted');
       }
@@ -585,27 +748,80 @@
           line((p.found || 0) + ' found so far', 'muted');
       } else if (d.last_run) {
         const r = d.last_run;
+        // the last scan is history: one of a network this PC is not on any more says so
+        const other = api.net.runElsewhere(r.cidr, st.netinfo && st.netinfo.internet_nic, st.net && st.net.networks);
         html = line('<span class="num">' + (r.found || 0) + '</span><span class="muted">devices found</span>') +
-          line('<code>' + esc(r.cidr) + '</code>') +
+          line('<code>' + esc(r.cidr) + '</code>' + (other ? '<span class="badge grey" title="This PC is on another network now">other network</span>' : '')) +
           line(esc(relTime(r.ts, now)) + ' · ' + esc(fmtDuration(r.duration_s)), 'muted');
       } else html = line('Nothing found yet — hit Scan', 'muted');
       if (el.dataset.html !== html) { el.innerHTML = html; el.dataset.html = html; }
     }
-    // Tools (DHCP server)
+    // Tools: the DHCP server's state, then the other tools by name
     {
       const el = tileEls.tools;
       const d = st && st.dhcp;
       let html;
       if (!st) html = line('Loading…', 'muted');
-      else if (!d || d.available === false) html = line('<span class="strong">DHCP server</span> <span class="muted">unavailable</span>') + line('Tools for the field', 'muted');
-      else if (d.error) html = line('<span class="strong">DHCP server</span> <span class="badge red">error</span>') + line(esc(d.error), 'muted');
-      else if (d.running) {
-        const p = d.pool || {};
-        const n = d.bound || 0;
-        html = line('<span class="num">' + n + '</span><span class="muted">DHCP client' + (n === 1 ? '' : 's') + '</span>' + (d.offered ? ' <span class="badge yellow">' + d.offered + ' offered</span>' : '')) +
-          line('<code>' + esc(p.start || '?') + '–' + esc(p.end || '?') + '</code>') +
-          line('on ' + esc(d.adapter || 'adapter') + ' · since ' + esc(relTime(d.since_ts, now)), 'muted');
-      } else html = line('<span class="strong">DHCP server</span> <span class="muted">off</span>') + line('Tools for the field', 'muted');
+      else {
+        if (!d || d.available === false) html = line('<span class="strong">DHCP server</span> <span class="muted">unavailable</span>');
+        else if (d.error) html = line('<span class="strong">DHCP server</span> <span class="badge red">error</span>') + line(esc(d.error), 'muted');
+        else if (d.running) {
+          const p = d.pool || {};
+          const n = d.bound || 0;
+          // two lines while it runs (the pool is the hover title), then the tool names below
+          html = line('<span class="num">' + n + '</span><span class="muted">DHCP client' + (n === 1 ? '' : 's') + '</span>' + (d.offered ? ' <span class="badge yellow">' + d.offered + ' offered</span>' : ''),
+            '', 'Pool ' + (p.start || '?') + '–' + (p.end || '?')) +
+            line('on ' + esc(d.adapter || 'adapter') + ' · since ' + esc(relTime(d.since_ts, now)), 'muted');
+        } else html = line('<span class="strong">DHCP server</span> <span class="muted">off</span>');
+        // two columns where the tile is wide enough (rows of four or fewer), one where it is not: the list stays as
+        // tall as the other tiles' three lines instead of stretching its row (5 lines were 192 px next to 155 px)
+        html += '<div class="tile-tools">' + TOOLS_TILE_ITEMS.map((name) => line(esc(name), 'tile-tool')).join('') + '</div>';
+      }
+      if (el.dataset.html !== html) { el.innerHTML = html; el.dataset.html = html; }
+    }
+    // WiFi: the survey runs inside the TNT window and arrives through the pywebview bridge
+    // (TNT.wifiSurvey in views/wifi.js), never through the service status
+    {
+      const el = tileEls.wifi;
+      const ws = TNT.wifiSurvey, wv = TNT.views.wifi, wc = TNT.wifichart;
+      const sum = ws && wv && wc ? wv.tileSummary(ws.last, ws.bridgeState(), ws.error) : { kind: 'nobridge', headline: 'Open in the TNT window', detail: '' };
+      let html;
+      if (sum.kind === 'ok') {
+        const t = sum.top;
+        // two spans so a narrow tile wraps "30 APs" onto its own line instead of the whole phrase
+        html = line('<span class="num">' + sum.networks + '</span><span class="muted">' + (sum.networks === 1 ? 'network' : 'networks') + ' ·</span><span class="muted">' + sum.aps + (sum.aps === 1 ? ' AP' : ' APs') + '</span>');
+        if (t) {
+          let bars = '<span class="survey-bars ' + t.cls + '" aria-hidden="true">';
+          for (let i = 1; i <= 4; i++) bars += '<span' + (i <= t.bars ? ' class="on"' : '') + '></span>';
+          bars += '</span>';
+          html += line('<span class="strong tile-ellipsis" title="' + esc(t.name) + '">' + esc(t.name) + '</span>');
+          html += line(bars + '<span class="strong">' + esc(wc.dbmText(t.rssi)) + '</span><span class="muted">' + (t.connected ? 'connected' : 'strongest') + '</span>');
+        } else html += line('Nothing in range right now', 'muted');
+      } else if (sum.kind === 'waiting' || sum.kind === 'starting') {
+        html = line(esc(sum.headline), 'muted');
+      } else {
+        html = line('<span class="strong">' + esc(sum.headline) + '</span>') + (sum.detail ? line(esc(sum.detail), 'muted') : '');
+      }
+      if (el.dataset.html !== html) { el.innerHTML = html; el.dataset.html = html; }
+    }
+    // Reports: the saved site reports (counts cached by loadReportsInfo, never fetched here) and, while one runs, the
+    // full scan's phase and percentage in place of the last report's age
+    {
+      const el = tileEls.reports;
+      const info = reportsInfo;
+      const job = fullScan.job;
+      let html;
+      if (!info.loaded) html = line('Loading…', 'muted');
+      else if (info.error && !info.total) html = line('<span class="strong">Reports</span> <span class="muted">unavailable</span>') + line(esc(info.error), 'muted');
+      else if (!info.total) html = line('<span class="strong">No reports yet</span>') + line('Full Scan saves the first one', 'muted');
+      else {
+        html = line('<span class="num">' + info.total + '</span><span class="muted">' + (info.total === 1 ? 'report' : 'reports') + ' ·</span><span class="muted">' +
+          info.sites + (info.sites === 1 ? ' site' : ' sites') + '</span>');
+        if (info.last) html += line('<span class="strong tile-ellipsis" title="' + esc(info.last.site) + '">' + esc(info.last.site) + '</span>');
+      }
+      if (job && job.status === 'running') {
+        html += line('<span class="spark-icon">' + ICONS.spark + '</span> <span class="strong">Full scan</span> ' + esc(RU.jobButton(job).label));
+      } else if (info.loaded && info.last) html += line(esc(relTime(info.last.created_ts, now)), 'muted');
       if (el.dataset.html !== html) { el.innerHTML = html; el.dataset.html = html; }
     }
   }
@@ -617,7 +833,7 @@
   }
   /** Scroll position for a freshly shown view: the top of the page, except after a tile click on
    *  a short window (1366x768 at 125 % is 1093x614 CSS px, 1280x720 at 150 % is 853x480) where the
-   *  six tiles fill most of the screen and the click would change nothing visible. Then the
+   *  tiles fill most of the screen and the click would change nothing visible. Then the
    *  section heading comes up under the sticky header; the view gets a min-height so the page is
    *  tall enough to scroll there before its data arrives. The first route on load, the brand
    *  link and Diagnostics' Back keep the top of the page. */
@@ -803,6 +1019,22 @@
       settingRow('IPv6 addresses', 'Show IPv6 addresses and subnets on the Network info page.', ipv6T),
     ]));
 
+    // IP location (DB-IP Lite): on by default; the service downloads the data
+    const geoOn = !(s.geoip && s.geoip.enabled === false);
+    const geoT = toggle({ checked: geoOn, on: 'On', off: 'Off', accent: 'var(--blue)',
+      onChange: (v, input) => saveSettings({ geoip: { enabled: v } }, v ? 'IP location on' : 'IP location off').then((ok) => { if (!ok) input.checked = !v; }) });
+    geoT.input.setAttribute('aria-label', 'Show IP location and ISP');
+    const geoRetry = h('button', { class: 'btn', id: 'settings-geoip-retry', type: 'button', hidden: !geoipRetryVisible() }, 'Retry now');
+    geoRetry.addEventListener('click', () => {
+      geoRetry.disabled = true;
+      api.geoipCheck().then(() => renderSettingsGeoip(), () => toast('Could not start the IP location check', 'error'))
+        .then(() => { geoRetry.disabled = false; });
+    });
+    body.appendChild(group('IP location', [
+      settingRow('Location and ISP', 'Shows the internet provider and city of the public address on Network info and a Location column in Traceroute. The service downloads DB-IP’s free IP location data (CC BY 4.0): about 65 MB a month, about 140 MB on disk. Addresses are looked up on this PC only.', geoT),
+      h('div', { class: 'geo-status' }, h('span', { id: 'settings-geoip', role: 'status' }, geoipStatusText()), geoRetry, geoAttribution(), geoLicence()),
+    ]));
+
     // Speed tests
     const sp = s.speedtest || {};
     const enabledT = toggle({ checked: sp.enabled !== false, on: 'On', off: 'Off', accent: 'var(--purple)',
@@ -823,7 +1055,9 @@
     ]));
 
     // Default targets
-    const chips = h('div', { class: 'chips' }, h('span', { class: 'badge blue', style: { '--accent': 'var(--blue)' } }, 'default gateway'), copyCode('1.1.1.1'), copyCode('totalelectronics.com'));
+    // the gateway chip names the address the gateway tile pings right now (renderSettingsGateway keeps it current)
+    const chips = h('div', { class: 'chips' }, h('span', { class: 'badge blue', id: 'settings-gateway', style: { '--accent': 'var(--blue)' } }, gatewayChipText()),
+      copyCode('1.1.1.1'), copyCode('totalelectronics.com'));
     body.appendChild(group('Default targets', [
       settingRow('Load Default Tiles resets the tiles to these', 'Other tiles are removed (after a confirmation); their history stays in the database.', null),
       chips,
@@ -893,6 +1127,212 @@
     toast('Downloaded ' + name, 'ok');
   }
 
+  /* =========================================================== full scan */
+  // The page's one full-scan controller (its logic is TNT.reportsui.createFullScan in js/reportsui.js). It lives here
+  // and not in the Reports view, so moving between pages never breaks a scan: it follows the service's job, runs the
+  // Wi-Fi part through the TNT window's bridge and posts the one snapshot. The top bar's Full Scan button shows its
+  // progress; the Reports tile shows the saved reports' counts, cached here from /api/reports and refreshed on the
+  // report.* events (renderTiles never fetches).
+  const RU = TNT.reportsui;
+  const fullScan = RU.createFullScan({ api, survey: TNT.wifiSurvey || null, live: () => api.events.state === 'live' });
+  const reportsInfo = { loaded: false, error: null, total: 0, sites: 0, last: null };
+  let reportsInfoTimer = null, siteModal = null, fullScanStarting = false;
+
+  async function loadReportsInfo() {
+    try {
+      // one row of each is enough: both answers carry a total that counts every report and every site
+      const [list, sites] = await Promise.all([api.reports({ limit: 1 }), api.reportSites('', 1)]);
+      reportsInfo.total = Number(list && list.total) || 0;
+      reportsInfo.last = (list && Array.isArray(list.reports) && list.reports[0]) || null;
+      reportsInfo.sites = Number(sites && sites.total) || 0;
+      reportsInfo.error = null;
+    } catch (err) {
+      reportsInfo.error = err && err.status === 404 ? 'Not in this TNT version' : (err && err.message) || 'Could not load';
+    }
+    reportsInfo.loaded = true;
+    renderTiles();
+  }
+  function scheduleReportsInfo() {
+    if (reportsInfoTimer) clearTimeout(reportsInfoTimer);
+    reportsInfoTimer = setTimeout(() => { reportsInfoTimer = null; loadReportsInfo(); }, 300);
+  }
+
+  function renderFullScanButton() {
+    const btn = $('#btn-full-scan');
+    if (!btn) return;
+    const b = RU.jobButton(fullScan.job);
+    const label = $('#full-scan-label');
+    if (label.textContent !== b.label) label.textContent = b.label;
+    btn.classList.toggle('running', b.running);
+    btn.style.setProperty('--pct', b.pct + '%');
+    if (btn.title !== b.title) btn.title = b.title;
+    const aria = b.running ? 'Full scan running: ' + b.phase + '. Open Reports' : null;
+    if (!aria) btn.removeAttribute('aria-label');
+    else if (btn.getAttribute('aria-label') !== aria) btn.setAttribute('aria-label', aria);
+  }
+
+  /** The job a status snapshot carries (status.reports.job): without the event stream it is how this page hears of a scan started
+   *  from another window, in time to run its Wi-Fi part. Only a job the controller does not follow yet, or the end of the one it
+   *  follows, is taken: a snapshot can be older than the progress events already applied. */
+  function adoptStatusJob(job) {
+    if (!job || job.id == null) return;
+    const mine = fullScan.job;
+    if (!mine || mine.id !== job.id || (mine.status === 'running' && job.status !== 'running')) fullScan.apply(job);
+  }
+
+  function onFullScanJob(job, prev) {
+    renderFullScanButton();
+    renderTiles();
+    // the name modal's pre-filled site follows a suggestion that arrives late or changes, until the user types
+    if (siteModal && job) siteModal.sync(job);
+    // a scan that ended while the event stream was down reaches the page through a poll: the counts change too
+    if (prev && prev.status === 'running' && (!job || job.id !== prev.id || job.status !== 'running')) scheduleReportsInfo();
+  }
+
+  /** Reports on screen: the hash change (like a tile click, so a short window scrolls to the view), or the progress
+   *  card brought into view when the page is open already. */
+  function goReports() {
+    if (current.name === 'reports') { if (current.view && current.view.reveal) current.view.reveal(); return; }
+    tileNav = true;
+    location.hash = '#reports';
+  }
+
+  /** The Full Scan buttons (top bar and Reports page): while a scan runs they only open Reports; otherwise they open
+   *  Reports, start a full scan and ask for the site name. A scan another window started (409 busy) is followed. */
+  async function fullScanClick() {
+    goReports();
+    if (fullScan.running() || fullScanStarting) return;
+    fullScanStarting = true;
+    try {
+      const r = await fullScan.start();
+      if (!r.started) toast('A full scan is already running', 'warn');
+      if (r.job && r.job.status === 'running' && !r.job.site) openSiteModal();
+    } catch (err) {
+      toast('Could not start the full scan: ' + err.message, 'error');
+    } finally { fullScanStarting = false; }
+  }
+
+  /** Name the running scan's site; a scan that saved its report meanwhile gets that report renamed instead. */
+  async function nameFullScan(site) {
+    const job = fullScan.job;
+    if (job && job.status === 'saved' && job.report_id != null) {
+      await api.renameReport(job.report_id, site);
+      toast('Report renamed to ' + site, 'ok');
+      return;
+    }
+    try {
+      await fullScan.setSite(site);
+    } catch (err) {
+      await fullScan.refresh();
+      const j = fullScan.job;
+      if (err.status === 409 && j && j.status === 'saved' && j.report_id != null) {
+        await api.renameReport(j.report_id, site);
+        toast('Report renamed to ' + site, 'ok');
+        return;
+      }
+      throw err;
+    }
+  }
+
+  /** The site name modal of a running full scan: the name field with earlier sites as suggestions, "Save name" and
+   *  "Cancel scan" (after a confirm). On a network an earlier report was made on, the field starts with that report's site,
+   *  selected. Closing it any other way keeps the scan running: the progress card on the Reports page offers the same field,
+   *  and a report saved without a name goes under the suggested site, else "Unnamed site" until renamed. */
+  function siteModalChanged() {
+    if (current.name === 'reports' && current.view && current.view.siteModalChanged) {
+      try { current.view.siteModalChanged(); } catch (e) { console.error(e); }
+    }
+  }
+
+  function openSiteModal() {
+    if (siteModal) { siteModal.combo.focus(); return; }
+    const job = fullScan.job;
+    // a network an earlier report was made on: its site fills the field (Save name confirms it, typing replaces it)
+    let suggested = RU.suggestedSite(job);
+    const combo = RU.siteCombo({ label: 'Site name', placeholder: 'e.g. Acme Dental', value: (job && job.site) || (suggested ? suggested.site : ''),
+      describedBy: 'site-modal-hint', fetchSites: (q) => api.reportSites(q, 50).then((r) => (r && r.sites) || []), onEnter: () => save() });
+    const saveBtn = h('button', { class: 'btn btn-primary', type: 'button' }, iconEl('check'), 'Save name');
+    const cancelBtn = h('button', { class: 'btn btn-danger', type: 'button' }, iconEl('stop'), 'Cancel scan');
+    // what the report adds (its window's rule), and the window itself, so a wrong one (this PC not noticed moving) can be spotted
+    const intro = h('p', { class: 'muted site-modal-intro' });
+    const windowLine = h('p', { class: 'muted small site-modal-window' });
+    const hint = h('p', { class: 'muted small site-modal-hint', id: 'site-modal-hint' });
+    // a phone hotspot or travel router carried from site to site: nothing is suggested for it and only this connection counts
+    const portable = h('input', { type: 'checkbox', id: 'site-modal-portable' });
+    const portableRow = h('label', { class: 'site-modal-portable', for: 'site-modal-portable' }, portable,
+      h('span', null, 'This network is my own hotspot or travel router, carried from site to site'));
+    let hintText = null;
+    const renderJob = (j) => {
+      intro.textContent = RU.modalIntro(j);
+      const since = RU.jobWindowText(j, (ts) => fmtDateTime(ts));
+      windowLine.textContent = since ? 'Pings and outages ' + since + '.' : '';
+      windowLine.hidden = !since;
+      const net = j && j.network_id != null && j.network && typeof j.network === 'object' ? j.network : null;
+      portableRow.hidden = !net;
+      if (!portable.disabled) portable.checked = !!(net && net.portable);
+      const parts = RU.suggestionHint(j, (ts) => fmtDate(ts) + ' (' + relTime(ts) + ')');
+      const text = parts ? parts.join('') : 'Earlier sites are suggested as you type: pick one to add this scan to its reports.';
+      if (text === hintText) return;
+      hintText = text;
+      hint.innerHTML = '';
+      if (parts) hint.append(parts[0], h('strong', null, parts[1]), parts[2]);
+      else hint.textContent = text;
+    };
+    renderJob(job);
+    portable.addEventListener('change', async () => {
+      const j = fullScan.job;
+      if (!j || j.network_id == null) return;
+      const want = portable.checked;
+      portable.disabled = true;
+      try {
+        await api.setNetworkPortable(j.network_id, want);        // the service suggests again and publishes the job
+        toast(want ? 'No site is suggested for this network any more' : 'This network is treated as a site\'s network again', 'ok');
+      } catch (err) { portable.checked = !want; toast('Could not change the network: ' + err.message, 'error'); }
+      finally { portable.disabled = false; }
+    });
+    const body = h('div', { class: 'site-modal-body' }, intro, windowLine,
+      h('div', { class: 'field' }, h('label', { for: combo.input.id }, 'Site name'), combo.el),
+      hint, portableRow);
+    const m = modal({ title: 'Name this site', body, narrow: true, foot: [cancelBtn, saveBtn],
+      onEscape: () => combo.isOpen(), onClose: () => { combo.destroy(); siteModal = null; siteModalChanged(); } });
+    m.el.classList.add('site-modal');
+    // the modal focuses the field first (a zero timer too): select a pre-filled site after it, so typing replaces it
+    if (combo.value()) setTimeout(() => { try { combo.input.focus(); combo.input.select(); } catch (e) { /* closed already */ } }, 0);
+    /** A later job: a suggestion that arrived late (the router's MAC read after the scan started) or changed (its report renamed
+     *  or deleted) replaces the pre-filled site, never text the user typed. */
+    function sync(j) {
+      const was = suggested ? suggested.site : '';
+      suggested = RU.suggestedSite(j);
+      renderJob(j);
+      const next = suggested ? suggested.site : '';
+      if (next === was || j.site || combo.touched() || (combo.value() && combo.value() !== was)) return;
+      const focused = document.activeElement === combo.input;
+      combo.setValue(next);
+      if (focused && next) { try { combo.input.select(); } catch (e) { /* ignore */ } }
+    }
+    siteModal = { m, combo, sync };
+    siteModalChanged();
+    async function save() {
+      const site = combo.value();
+      if (!site) { toast('Type the site name, or close this to name it later', 'warn'); combo.focus(); return; }
+      busy(saveBtn, true, 'Saving…');
+      try {
+        await nameFullScan(site);
+        m.close('saved');
+      } catch (err) { toast('Could not save the name: ' + err.message, 'error'); }
+      finally { busy(saveBtn, false); }
+    }
+    saveBtn.addEventListener('click', save);
+    cancelBtn.addEventListener('click', async () => {
+      const ok = await confirmDialog({ title: 'Cancel the full scan?', message: 'The scan stops and no report is saved.', ok: 'Cancel scan', cancel: 'Keep scanning', danger: true });
+      if (!ok) return;
+      busy(cancelBtn, true, 'Cancelling…');
+      try { await fullScan.cancel(); toast('Full scan cancelled', 'warn'); m.close('cancelled'); }
+      catch (err) { toast('Could not cancel the scan: ' + err.message, 'error'); }
+      finally { busy(cancelBtn, false); }
+    });
+  }
+
   /* ================================================================ SSE */
   let lightsDirty = false;
   function wireEvents() {
@@ -908,7 +1348,22 @@
       t.last = { ts: d.ts, ok: d.ok, rtt_ms: d.rtt_ms };
       if (!lightsDirty) { lightsDirty = true; requestAnimationFrame(() => { lightsDirty = false; renderHeader(); renderTiles(); }); }
     });
-    ev.on('ping.targets', (d) => { if (d && Array.isArray(d.targets)) { state.targets = d.targets; if (state.status) state.status.targets = d.targets; renderAll(); notifyView(); } });
+    ev.on('ping.targets', (d) => { if (d && Array.isArray(d.targets)) setTargets(d.targets); });
+    // this PC moved to another network, or an adapter's configuration changed: patch the dashboard from the
+    // payload at once, then the shared refresh (toast, status, the open view's netChanged)
+    ev.on('net.changed', (d) => {
+      if (!d || typeof d !== 'object') return;
+      const r = api.net.fromEvent(lastNet, d, Date.now());
+      lastNet = r.next;
+      if (!r.fresh) return;                  // a status snapshot brought this generation already
+      if (state.status) {
+        // the adapter shown without an internet one is the old network's too: the status read below brings the new one
+        state.status.netinfo = Object.assign({}, state.status.netinfo || {}, { internet_nic: api.net.nicFromEvent(d), local_nic: null });
+        state.status.net = Object.assign({}, state.status.net || {}, { generation: d.generation, changed_ts: d.ts,
+          default_gateway: d.default_gateway || null, internet_nic: d.internet_nic ? d.internet_nic.name : null });
+      }
+      networkChanged(Object.assign({ source: 'event' }, d), true);
+    });
     const outageWho = (d) => {
       const o = (d && d.outage) || d || {};
       const kind = o.kind || 'target';
@@ -921,19 +1376,41 @@
     ev.on('outage.end', (d) => { const w = outageWho(d); toast(w.name + (w.kind.startsWith('total') ? ' is back' : ' recovered'), 'ok'); refreshStatus(); });
     ev.on('speedtest.start', () => { if (state.status && state.status.speed) { state.status.speed.running = true; state.status.speed.progress = { phase: 'starting', pct: 0 }; renderTiles(); } });
     ev.on('speedtest.progress', (d) => { if (state.status && state.status.speed && d) { state.status.speed.running = true; state.status.speed.progress = d; renderTiles(); } });
+    // a full scan's own speed test and Discovery scan are on its progress card: no toasts over it
     ev.on('speedtest.done', (d) => {
       const r = d && d.result;
-      if (r) toast(r.ok ? 'Speed test: ↓ ' + fmtMbps(r.download_mbps) + ' ↑ ' + fmtMbps(r.upload_mbps) + ' Mbps' : 'Speed test failed: ' + (r.error || 'unknown error'), r.ok ? 'ok' : 'warn');
+      if (r && !fullScan.running()) toast(r.ok ? 'Speed test: ↓ ' + fmtMbps(r.download_mbps) + ' ↑ ' + fmtMbps(r.upload_mbps) + ' Mbps' : 'Speed test failed: ' + (r.error || 'unknown error'), r.ok ? 'ok' : 'warn');
       if (state.status && state.status.speed) state.status.speed.running = false;
       refreshStatus();
     });
     ev.on('discovery.progress', (d) => { if (state.status && state.status.discovery && d) { state.status.discovery.progress = d; state.status.discovery.running = d.phase !== 'done'; renderTiles(); } });
-    ev.on('discovery.done', (d) => { if (d && !d.cancelled) toast('Scan finished' + (d.found != null ? ': ' + d.found + ' devices' : ''), 'ok'); else if (d) toast('Scan cancelled', 'warn'); refreshStatus(); });
+    // network_changed: this PC changed networks while the scan ran, so it swept (part of) the network it left
+    ev.on('discovery.done', (d) => {
+      const moved = d && d.network_changed ? ' · this PC changed networks during the scan' : '';
+      if (fullScan.running()) { /* on the full scan's progress card */ }
+      else if (d && !d.cancelled) toast('Scan finished' + (d.found != null ? ': ' + d.found + ' devices' : '') + moved, moved ? 'warn' : 'ok');
+      else if (d) toast('Scan cancelled' + moved, 'warn');
+      refreshStatus();
+    });
     ev.on('settings.changed', () => { loadSettings(); refreshStatus(); });
     // DHCP server (Tools tile): dhcp.state carries the /status summary fields, leases bump the counts
     ev.on('dhcp.state', (d) => { if (state.status && d) { state.status.dhcp = Object.assign({}, state.status.dhcp || {}, d); renderTiles(); } });
+    // IP location: geoip.state is STATUS (the service adds its bus ts to every SSE payload; the development server does not)
+    ev.on('geoip.state', (d) => { if (state.status && d) { const { ts, ...st } = d; state.status.geoip = Object.assign({}, state.status.geoip || {}, st); renderSettingsGeoip(); notifyView(); } });
     ev.on('dhcp.lease', () => { if (state.status && state.status.dhcp && state.status.dhcp.running) refreshStatus(); });
     ev.on('monitoring.paused', (d) => { refreshStatus(); if (d) toast(d.paused ? 'Monitoring paused' : 'Monitoring resumed', d.paused ? 'warn' : 'ok'); });
+    // Reports: the full scan's progress drives the controller (which runs the Wi-Fi part); saves, renames and deletions
+    // refresh the tile's counts. The stream has no replay: a (re)connect reads the job again.
+    ev.on('report.progress', (d) => { if (d && d.job) fullScan.apply(d.job); });
+    ev.on('report.saved', (d) => {
+      if (d) toast('Report saved: ' + (d.site || 'site') + (d.status === 'partial' ? ' (partial)' : ''), d.status === 'partial' ? 'warn' : 'ok');
+      scheduleReportsInfo();
+      fullScan.refresh();
+    });
+    ev.on('report.deleted', scheduleReportsInfo);
+    // renaming the report the last scan saved renames that job too (the progress card shows its site): read it again
+    ev.on('report.updated', (d) => { scheduleReportsInfo(); if (d && fullScan.job && fullScan.job.report_id === d.id) fullScan.refresh(); });
+    ev.on('hello', () => { fullScan.refresh(); scheduleReportsInfo(); });
     ev.connect();
   }
 
@@ -947,6 +1424,9 @@
     for (const name of VIEW_NAMES) tileEls[name] = $('#tile-' + name);
 
     $('#btn-settings').addEventListener('click', openSettings);
+    $('#btn-full-scan').addEventListener('click', fullScanClick);
+    fullScan.subscribe(onFullScanJob);
+    renderFullScanButton();
     $('#diag-refresh').addEventListener('click', loadDiagnostics);
     $('#diag-copy').addEventListener('click', () => copyText(diagText || 'No diagnostics loaded'));
     $('#diag-back').addEventListener('click', () => { location.hash = '#ipinfo'; });
@@ -970,7 +1450,11 @@
     wireEvents();
     refreshStatus();
     loadSettings();
+    loadReportsInfo();
+    fullScan.refresh();
     route();
+    // the WiFi tile's summary: a cheap bridge read every 15 s while the WiFi page is not open
+    if (TNT.wifiSurvey) TNT.wifiSurvey.startTilePolling(() => renderTiles());
 
     setInterval(() => {
       state.now = nowS();
@@ -981,6 +1465,7 @@
     document.addEventListener('visibilitychange', () => { if (!document.hidden) { refreshStatus(); if (TNT.charts) TNT.charts.rerenderAll(); } });
   }
 
-  TNT.app = { state, refreshStatus, loadSettings, showView, openSettings, showDiagnostics, setTheme, saveBlob, overallText };
+  TNT.app = { state, refreshStatus, loadSettings, showView, openSettings, showDiagnostics, setTheme, saveBlob, overallText, setTargets,
+    fullScan, fullScanClick, openSiteModal, nameFullScan, loadReportsInfo: scheduleReportsInfo, siteModalOpen: () => !!siteModal };
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot); else boot();
 })();

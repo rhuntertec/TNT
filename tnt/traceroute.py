@@ -36,7 +36,14 @@ HOP dict::
 
     {"ttl": int, "ip": str|None, "alt_ips": [str], "hostname": str|None,
      "rtts": [float|None per probe], "avg_ms", "min_ms", "max_ms" (None when nothing
-     answered), "loss": int, "responder_status": int|None, "kind", "label"}
+     answered), "loss": int, "responder_status": int|None, "kind", "label",
+     "location": LOCATION|None}
+
+``location`` (``tnt.geoip`` LOCATION: ``{"text", "source", "hint", "db_text", "asn", "as_org"}``) comes from
+the ``geo`` provider (the engine's IP location manager, asked once per trace).  It is filled at hop completion
+from the database, plus the router name if the reverse lookup had already come back, and refined for every
+named hop after the final hostname fill, before ``last`` is set and ``trace.done`` is published.  It is None
+for unanswered and LAN/CGNAT/link-local/loopback hops, and when IP location is off or unavailable.
 """
 from __future__ import annotations
 
@@ -195,7 +202,8 @@ class Tracer:
                  resolver: Optional[Callable[[str], Optional[str]]] = None,
                  reverse: Optional[Callable[[str], Optional[str]]] = None,
                  gateway_fn: Optional[Callable[[], Optional[str]]] = None,
-                 local_fn: Optional[Callable[[], Optional[str]]] = None) -> None:
+                 local_fn: Optional[Callable[[], Optional[str]]] = None,
+                 geo: Optional[Callable[[], Any]] = None) -> None:
         self.pinger = pinger
         self._bus = bus
         self._clock = clock
@@ -203,6 +211,7 @@ class Tracer:
         self._reverse = reverse
         self._gateway_fn = gateway_fn
         self._local_fn = local_fn
+        self._geo_provider = geo     # called once per trace: an object with locate_hop() and origin(), or None
         self._lock = threading.Lock()
         self._running = False
         self._last: Optional[Dict[str, Any]] = None
@@ -277,6 +286,24 @@ class Tracer:
         except Exception:  # noqa: BLE001
             pass
         return {"ip": self._local_ip(), "hostname": hostname}
+
+    def _geo(self) -> Any:
+        try:
+            return self._geo_provider() if self._geo_provider is not None else None
+        except Exception:  # noqa: BLE001
+            log.debug("geo provider failed", exc_info=True)
+            return None
+
+    @staticmethod
+    def _locate(geo: Any, hop: Dict[str, Any], origin: Any) -> Optional[Dict[str, Any]]:
+        if geo is None or not hop.get("ip") or is_lan_address(hop["ip"]):
+            return None
+        try:
+            loc = geo.locate_hop(hop["ip"], hop.get("hostname"), hop.get("min_ms"), origin, kind=hop.get("kind"))
+        except Exception:  # noqa: BLE001
+            log.debug("hop location failed", exc_info=True)
+            return None
+        return dict(loc) if isinstance(loc, dict) else None
 
     def _publish(self, event_type: str, data: Dict[str, Any]) -> None:
         if self._bus is None:
@@ -365,6 +392,13 @@ class Tracer:
         }
         with job.lock:
             job.partial = result
+        geo = self._geo()
+        origin = None
+        if geo is not None:
+            try:
+                origin = geo.origin()
+            except Exception:  # noqa: BLE001
+                origin = None
         self._publish("trace.start", {"host": job.host, "target_ip": job.target_ip,
                                       "max_hops": job.max_hops, "probes": job.probes})
         lookups: Dict[str, _Lookup] = {}
@@ -391,6 +425,7 @@ class Tracer:
                 lk = lookups.get(hop["ip"]) if hop["ip"] else None
                 if lk is not None and lk.done.is_set():
                     hop["hostname"] = lk.name
+                hop["location"] = self._locate(geo, hop, origin)
                 with job.lock:
                     hops.append(hop)
                 self._publish("trace.hop", {"hop": dict(hop)})
@@ -429,6 +464,12 @@ class Tracer:
                     lk = lookups.get(hop["ip"]) if hop["ip"] else None
                     if lk is not None and lk.done.is_set():
                         hop["hostname"] = lk.name
+        # router names are in now: locate the named hops again (a new dict: published hops are shallow copies)
+        if geo is not None:
+            refined = [(hop, self._locate(geo, hop, origin)) for hop in hops if hop["ip"] and hop["hostname"]]
+            with job.lock:
+                for hop, loc in refined:
+                    hop["location"] = loc
 
         finished = float(self._clock())
         result["complete"] = complete
@@ -506,5 +547,6 @@ class Tracer:
             "responder_status": first_status,
             "kind": "unknown",
             "label": KIND_LABELS["unknown"],
+            "location": None,
         }
         return hop, reached, reply_error

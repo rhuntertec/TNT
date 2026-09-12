@@ -3,7 +3,8 @@
    sorting with a persisted sort per table, sortable <th> buttons, the "add as ping target"
    button on IP cells (one singleton mirrors the ping list into every mounted table), open-port
    pills that open in the browser / launch ssh, the Device Type badge, CSV export and the
-   default cell renderers.
+   default cell renderers. The WiFi page's radio table uses only the sorting and headers, with
+   custom columns and cells for access points.
    Loaded before the views; only touches TNT.util / TNT.ui / TNT.api inside functions because
    app.js (which defines them) loads last. */
 (function () {
@@ -24,12 +25,17 @@
      as hst.device_type, so this file only has to render it. classifyDevice() below is a
      fallback for rows that predate the field (a cached run from an older service): same rules,
      same priority. Nothing else may duplicate the rule set. */
-  const DEVICE_TYPES = ['Router', 'DW Server', 'Camera', 'Phone', 'Wifi'];
-  const DEVICE_TYPE_CLASS = { router: 'blue', 'dw server': 'purple', camera: 'orange', phone: 'green', wifi: 'yellow' };
-  const DW_SERVER_PORT = 7001, CAMERA_PORT = 554, PHONE_PORT = 5060, WIFI_PORT = 22;
+  const DEVICE_TYPES = ['Router', 'DW Server', 'Camera', 'Phone', 'Ubiquiti'];
+  const DEVICE_TYPE_CLASS = { router: 'blue', 'dw server': 'purple', camera: 'orange', phone: 'green', ubiquiti: 'yellow' };
+  /** Device types earlier versions stored (a cached run, a saved report) and what they are called now. */
+  const LEGACY_DEVICE_TYPES = new Map([['Wifi', 'Ubiquiti']]);
+  const DW_SERVER_PORT = 7001, CAMERA_PORT = 554, PHONE_PORT = 5060, UBIQUITI_PORT = 22;
+
+  /** The current name of a device type (an older name is renamed; anything else is returned trimmed). */
+  const currentType = (type) => { const t = String(type == null ? '' : type).trim(); return LEGACY_DEVICE_TYPES.get(t) || t; };
 
   /** Badge colour for a device type ('grey' for anything unknown). */
-  const deviceTypeClass = (type) => DEVICE_TYPE_CLASS[String(type || '').trim().toLowerCase()] || 'grey';
+  const deviceTypeClass = (type) => DEVICE_TYPE_CLASS[currentType(type).toLowerCase()] || 'grey';
 
   /** Pure mirror of tnt/discovery.py classify_device: gateway → 7001 → 554 → 5060 → 22+Ubiquiti.
    *  `gateway` is one address or a list of them. Returns null when nothing matches. */
@@ -42,7 +48,7 @@
     if (ports.includes(DW_SERVER_PORT)) return 'DW Server';
     if (ports.includes(CAMERA_PORT)) return 'Camera';
     if (ports.includes(PHONE_PORT)) return 'Phone';
-    if (ports.includes(WIFI_PORT) && /ubiquiti/i.test(String(hst.vendor || ''))) return 'Wifi';
+    if (ports.includes(UBIQUITI_PORT) && /ubiquiti/i.test(String(hst.vendor || ''))) return 'Ubiquiti';
     return null;
   }
 
@@ -58,7 +64,7 @@
   /** What to show for a host: the service's answer, or the fallback when the row has no field. */
   function deviceType(hst) {
     if (!hst) return null;
-    if (hst.device_type != null && hst.device_type !== '') return String(hst.device_type);
+    if (hst.device_type != null && hst.device_type !== '') return currentType(hst.device_type);
     if ('device_type' in hst) return null;      // the service looked and found nothing
     return classifyDevice(hst, stateGateway());
   }

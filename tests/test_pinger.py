@@ -139,6 +139,8 @@ def fake_netinfo(monkeypatch):
 
     mod = types.ModuleType("tnt.netinfo")
     mod.gateway = "10.0.0.251"
+    mod.gateway_lookups = 0
+    mod.adapters = []           # what get_adapters() lists; empty: nothing tells why a gateway is gone
     mod.classify_calls = []
 
     def classify_ip(ip: str, adapters=None) -> str:
@@ -147,10 +149,15 @@ def fake_netinfo(monkeypatch):
         return "local" if (a.is_private or a.is_link_local or a.is_loopback) else "internet"
 
     def get_default_gateway() -> Optional[str]:
+        mod.gateway_lookups += 1
         return mod.gateway
+
+    def get_adapters(include_down: bool = True, include_loopback: bool = False) -> List[Any]:
+        return list(mod.adapters)
 
     mod.classify_ip = classify_ip
     mod.get_default_gateway = get_default_gateway
+    mod.get_adapters = get_adapters
     monkeypatch.setitem(sys.modules, "tnt.netinfo", mod)
     return mod
 
@@ -993,3 +1000,276 @@ def test_raw_log_recreates_a_deleted_directory(tmp_path):
     log.close()
     assert (d / "2026-03-11.csv").read_text(encoding="utf-8").splitlines() == [
         "ts,target_id,host,ok,rtt_ms,bytes", f"{clock():.3f},1,1.1.1.1,1,2.0,32"]
+
+
+# ---------------------------------------------------------------------------------------
+# Network changes (tnt.netwatch -> PingManager.on_network_change); synthetic addresses only
+# ---------------------------------------------------------------------------------------
+def _ip_changes(mgr: PingManager) -> List[Tuple[str, Optional[str], Optional[str], Optional[str]]]:
+    seen: List[Tuple[str, Optional[str], Optional[str], Optional[str]]] = []
+    mgr.add_ip_listener(lambda view, old, new, reason: seen.append((view["host"], old, new, reason)))
+    return seen
+
+
+def test_gateway_alias_follows_a_network_change_on_the_next_tick(env):
+    seen = _ip_changes(env.mgr)
+    gw = env.mgr.add_target("gateway", "Gateway")["id"]
+    env.tick_all(gw, 1)
+    assert env.mgr.target(gw)["ip"] == "10.0.0.251"
+    env.netinfo.gateway = "10.20.30.1"                      # plugged in at another site
+    env.tick_all(gw, 1)
+    assert env.mgr.target(gw)["ip"] == "10.0.0.251", "a healthy alias is not looked up every second"
+    env.events.clear()
+    env.mgr.on_network_change({"gateway_changed": True, "subnets_changed": True})
+    env.tick_all(gw, 1)
+    v = env.mgr.target(gw)
+    assert v["ip"] == "10.20.30.1" and v["resolved"] is True and v["kind"] == "local"
+    assert env.pinger.calls[-1][0] == "10.20.30.1"
+    assert env.events_of("ping.targets")[-1]["data"]["targets"][0]["ip"] == "10.20.30.1"
+    assert seen == [("gateway", "10.0.0.251", "10.20.30.1", "network changed")]
+    # another router: the window starts empty instead of mixing in the old router's echoes
+    assert v["window"]["sent"] == 1 and v["consecutive_ok"] == 1
+
+
+def test_gateway_alias_is_rechecked_every_poll_and_soon_after_a_miss(env):
+    gw = env.mgr.add_target("gateway")["id"]
+    env.tick_all(gw, 1)
+    env.netinfo.gateway = "10.20.30.1"
+    env.tick_all(gw, 3)                                     # 1..3 s after the lookup: still the cached router
+    assert env.mgr.target(gw)["ip"] == "10.0.0.251"
+    env.tick_all(gw, 2)                                     # network.poll_s (5 s) after it: looked up again
+    assert env.mgr.target(gw)["ip"] == "10.20.30.1"
+    # without any event, a missed echo makes the lookup due 2 s after the previous one
+    env.netinfo.gateway = "192.168.50.1"
+    env.pinger.script = [(False, None)]
+    env.tick_all(gw, 1)
+    assert env.mgr.target(gw)["ip"] == "10.20.30.1" and env.mgr.target(gw)["consecutive_missed"] == 1
+    env.tick_all(gw, 1)
+    assert env.mgr.target(gw)["ip"] == "192.168.50.1"
+
+
+ETH_GUID = "{0D7C1A00-0000-4000-8000-00000000B002}"
+
+
+def _nic(name: str = "Ethernet", index: int = 12, ipv4=(), gateways=(), up: bool = True, guid: str = ETH_GUID) -> Any:
+    """An adapter as tnt.netinfo lists it, as far as the gateway alias looks at one."""
+    return types.SimpleNamespace(name=name, index=index, guid=guid, is_up=up, gateways=list(gateways),
+                                 ipv4=[types.SimpleNamespace(address=a, prefix=p, preferred=True) for a, p in ipv4])
+
+
+def test_a_gateway_configured_away_stops_pinging_the_old_router(env):
+    seen = _ip_changes(env.mgr)
+    env.netinfo.adapters = [_nic(ipv4=[("10.0.0.112", 24)], gateways=["10.0.0.251"])]
+    gw = env.mgr.add_target("gateway", "Gateway")["id"]
+    env.tick_all(gw, 5)
+    assert env.mgr.light(gw) == "green"
+    # a static bench address typed in without a gateway (the DHCP server tool leaves the adapter the same way)
+    env.netinfo.adapters = [_nic(ipv4=[("172.16.20.15", 24)])]
+    env.netinfo.gateway = None
+    env.mgr.on_network_change({"gateway_changed": True})
+    calls = len(env.pinger.calls)
+    env.events.clear()
+    assert env.mgr.tick(gw) is None
+    env.clock.advance(1)
+    assert env.mgr.tick(gw) is None
+    assert len(env.pinger.calls) == calls, "nothing is pinged without a gateway"
+    assert env.events_of("ping.sample") == []
+    v = env.mgr.target(gw)
+    assert v["ip"] is None and v["resolved"] is False and "no default gateway" in v["resolve_error"]
+    assert v["light"] == "grey" and v["window"]["sent"] == 0 and env.mgr.samples(gw) == []
+    assert seen == [("gateway", "10.0.0.251", None, "network changed")]
+    assert env.events_of("ping.targets")[-1]["data"]["targets"][0]["ip"] is None
+    # without a gateway it looks again every network.poll_s (5 s), not on every one-second tick
+    env.clock.advance(1)
+    before = env.netinfo.gateway_lookups
+    env.tick_all(gw, 20)
+    assert env.netinfo.gateway_lookups - before == 4, "one lookup per watcher poll, not one per tick"
+    # the gateway comes back: a network change makes the lookup due at once and pinging resumes
+    env.netinfo.gateway = "10.0.0.251"
+    env.netinfo.adapters = [_nic(ipv4=[("10.0.0.112", 24)], gateways=["10.0.0.251"])]
+    env.mgr.on_network_change({"gateway_changed": True})
+    assert env.mgr.tick(gw).ok is True and env.mgr.target(gw)["ip"] == "10.0.0.251"
+
+
+def test_a_lost_gateway_is_still_pinged_so_its_misses_count(env):
+    """Wi-Fi dropped, a cable pulled, a router reboot that took the link down: Windows removes the default gateway
+    with the connection, but that is a local outage, not "nothing to measure"."""
+    seen = _ip_changes(env.mgr)
+    env.netinfo.adapters = [_nic("Wi-Fi", 7, ipv4=[("10.0.0.112", 24)], gateways=["10.0.0.251"])]
+    gw = env.mgr.add_target("gateway", "Gateway")["id"]
+    env.tick_all(gw, 3)
+    env.netinfo.adapters = [_nic("Wi-Fi", 7, up=False)]
+    env.netinfo.gateway = None
+    env.pinger.script = [(False, None)]
+    env.mgr.on_network_change({"gateway_changed": True})
+    env.events.clear()
+    samples = env.tick_all(gw, 5)
+    assert len(samples) == 5 and not any(s.ok for s in samples), "every tick records a miss"
+    assert [c[0] for c in env.pinger.calls[-5:]] == ["10.0.0.251"] * 5
+    v = env.mgr.target(gw)
+    assert v["ip"] == "10.0.0.251" and v["resolved"] is False and "no default gateway" in v["resolve_error"]
+    assert v["consecutive_missed"] == 5 and v["light"] == "red" and len(env.events_of("ping.sample")) == 5
+    assert seen == [], "still the same address: nothing for the outage tracker to close"
+    # a self-assigned address after the lease was lost is lost too
+    env.netinfo.adapters = [_nic("Wi-Fi", 7, ipv4=[("169.254.7.7", 16)])]
+    env.tick_all(gw, 5)
+    assert env.mgr.target(gw)["ip"] == "10.0.0.251" and env.mgr.target(gw)["consecutive_missed"] == 10
+    # back on the same network: the misses end on the next answers, nothing was reset
+    env.netinfo.adapters = [_nic("Wi-Fi", 7, ipv4=[("10.0.0.112", 24)], gateways=["10.0.0.251"])]
+    env.netinfo.gateway = "10.0.0.251"
+    env.pinger.script = [(True, 1.0)]
+    env.mgr.on_network_change({"gateway_changed": True})
+    assert env.mgr.tick(gw).ok is True
+    v = env.mgr.target(gw)
+    assert v["resolved"] is True and v["resolve_error"] is None and v["window"]["sent"] == 14 and seen == []
+
+
+def test_gateway_left_out_tells_a_configured_away_gateway_from_a_lost_one(fake_netinfo):
+    owner = (ETH_GUID.lower(), 12, "Ethernet")
+    fake_netinfo.adapters = [_nic(ipv4=[("172.16.20.15", 24)])]
+    assert P._gateway_left_out(owner) is True, "up, a usable address, no gateway: configured that way"
+    fake_netinfo.adapters = [_nic(guid="", index=19, ipv4=[("172.16.20.15", 24)])]
+    assert P._gateway_left_out((" ", 12, "Ethernet")) is False, "another adapter"
+    assert P._gateway_left_out(("", 19, "Ethernet")) is True, "no GUID: index and name"
+    for adapters in ([_nic(up=False)], [_nic(ipv4=[("169.254.23.45", 16)])], [_nic()], [],
+                     [_nic(ipv4=[("172.16.20.15", 24)], gateways=["172.16.20.1"])]):
+        fake_netinfo.adapters = adapters
+        assert P._gateway_left_out(owner) is False, adapters
+    fake_netinfo.adapters = [_nic(ipv4=[("172.16.20.15", 24)])]
+    assert P._gateway_left_out(None) is False
+    fake_netinfo.adapters = [_nic(ipv4=[("172.16.20.15", 24)], gateways=["10.0.0.251"])]
+    assert P._gateway_owner("10.0.0.251") == owner and P._gateway_owner("10.9.9.9") is None
+    del fake_netinfo.get_adapters                           # a netinfo without an adapter list: never "configured away"
+    assert P._gateway_left_out(owner) is False and P._gateway_owner("10.0.0.251") is None
+
+
+def test_the_first_answer_after_a_network_change_carries_the_reason_even_after_a_failed_lookup(env):
+    """The new network's DNS was not answering yet when net.changed arrived: the answer that comes later still counts
+    as the one after the change, so the outage tracker closes the outage about the old address with the note."""
+    seen = _ip_changes(env.mgr)
+    env.resolver.table["example.test"] = "203.0.113.10"
+    tid = env.mgr.add_target("example.test")["id"]
+    env.tick_all(tid, 1)
+    env.mgr.on_network_change({"subnets_changed": False})
+    env.resolver.table["example.test"] = None
+    env.tick_all(tid, 1)
+    v = env.mgr.target(tid)
+    assert v["ip"] == "203.0.113.10" and v["resolved"] is False and seen == []
+    env.resolver.table["example.test"] = "198.51.100.20"
+    env.tick_all(tid, 5)                                    # the 5 s retry, no second network change
+    assert env.mgr.target(tid)["ip"] == "198.51.100.20"
+    assert seen == [("example.test", "203.0.113.10", "198.51.100.20", "network changed")]
+
+
+def test_host_names_re_resolve_on_a_network_change_and_a_stale_lookup_is_repeated(env):
+    seen = _ip_changes(env.mgr)
+    env.resolver.table["intranet.test"] = "10.1.2.3"
+    tid = env.mgr.add_target("intranet.test")["id"]
+    env.tick_all(tid, 1)
+    assert env.mgr.target(tid)["ip"] == "10.1.2.3"
+    env.resolver.table["intranet.test"] = "172.16.8.3"      # split-horizon DNS: another answer at site B
+    env.tick_all(tid, 3)
+    assert env.mgr.target(tid)["ip"] == "10.1.2.3", "host names keep ping.resolve_interval_s between lookups"
+    env.mgr.on_network_change({"dns_changed": True, "subnets_changed": False})
+    env.tick_all(tid, 1)
+    assert env.mgr.target(tid)["ip"] == "172.16.8.3"
+    assert seen == [("intranet.test", "10.1.2.3", "172.16.8.3", "network changed")]
+    # a lookup still running when the network changes again is thrown away and repeated at once
+    answers = iter(["172.16.8.99", "192.168.50.3"])
+
+    def overtaken(host: str) -> Optional[str]:
+        answer = next(answers)
+        if answer == "172.16.8.99":
+            env.mgr.on_network_change({})                   # the watcher reports another change mid-lookup
+        return answer
+
+    env.mgr._resolver = overtaken
+    env.mgr.on_network_change({})
+    env.tick_all(tid, 1)
+    assert env.mgr.target(tid)["ip"] == "192.168.50.3"
+    assert "172.16.8.99" not in [c[0] for c in env.pinger.calls]
+
+
+def test_a_periodic_lookup_that_rotates_has_no_reason(env):
+    seen = _ip_changes(env.mgr)
+    env.resolver.table["cdn.test"] = "203.0.113.10"
+    tid = env.mgr.add_target("cdn.test")["id"]
+    env.tick_all(tid, 1)
+    env.resolver.table["cdn.test"] = "203.0.113.11"
+    env.clock.advance(float(env.config.get("ping.resolve_interval_s")))
+    env.tick_all(tid, 1)
+    assert env.mgr.target(tid)["ip"] == "203.0.113.11"
+    assert seen == [("cdn.test", "203.0.113.10", "203.0.113.11", None)]
+
+
+def test_kind_is_recomputed_when_the_local_subnets_change(env):
+    env.netinfo.classify_ip = lambda ip, adapters=None: "internet"
+    tid = env.mgr.add_target("203.0.113.50")["id"]
+    assert env.mgr.target(tid)["kind"] == "internet"
+    env.netinfo.classify_ip = lambda ip, adapters=None: "local"     # this PC now sits on that subnet
+    env.events.clear()
+    env.mgr.on_network_change({"subnets_changed": False})
+    assert env.mgr.target(tid)["kind"] == "internet" and env.events_of("ping.targets") == []
+    env.mgr.on_network_change({"subnets_changed": True})
+    assert env.mgr.target(tid)["kind"] == "local"
+    assert env.events_of("ping.targets")[-1]["data"]["targets"][0]["kind"] == "local"
+
+
+def test_load_defaults_applies_the_current_gateway_to_the_existing_tile(env):
+    views = env.mgr.load_defaults()
+    gw = next(v for v in views if v["host"] == "gateway")
+    assert gw["ip"] == "10.0.0.251" and gw["resolved"] is True
+    env.tick_all(gw["id"], 3)
+    env.netinfo.gateway = "10.20.30.1"                      # moved: no event seen yet, no time passed
+    env.netinfo.adapters = [_nic(ipv4=[("10.20.30.45", 24)], gateways=["10.20.30.1"])]
+    gw2 = next(v for v in env.mgr.load_defaults() if v["host"] == "gateway")
+    assert gw2["id"] == gw["id"] and gw2["ip"] == "10.20.30.1" and gw2["resolved"] is True
+    # a static address typed in without a gateway: the tile stays, visibly without one
+    env.netinfo.gateway = None
+    env.netinfo.adapters = [_nic(ipv4=[("172.16.20.15", 24)])]
+    gw3 = next(v for v in env.mgr.load_defaults() if v["host"] == "gateway")
+    assert gw3["ip"] is None and gw3["resolved"] is False and gw3["light"] == "grey"
+
+
+def test_adding_the_new_gateway_address_finds_the_alias_tile(env):
+    gw = env.mgr.add_target("gateway")["id"]
+    env.tick_all(gw, 1)
+    env.netinfo.gateway = "10.20.30.1"                      # the alias still holds the previous router
+    v = env.mgr.add_target("10.20.30.1")
+    assert v["id"] == gw and v["ip"] == "10.20.30.1" and len(env.mgr.targets()) == 1
+    old = env.mgr.add_target("10.0.0.251")                  # the previous router is an ordinary target now
+    assert old["id"] != gw and len(env.mgr.targets()) == 2
+
+
+def test_a_minute_that_spans_a_network_change_is_written_as_two_rows(env):
+    """tnt.networks: a minute aggregate carries the network of its samples; when the current network changes the partial minute
+    is flushed and the rest of the minute is a row of its own.  An unknown network is untagged (0).  The history reads one minute."""
+    current: Dict[str, Optional[int]] = {"id": 1}
+    m0 = float(int(T0 // 60) * 60) + 10
+    env.clock.now = m0
+    env.pinger.script = [(True, 10.0)]
+    mgr = PingManager(env.db, env.config, env.bus, pinger=env.pinger, raw_log=env.raw, clock=env.clock,
+                      sleep=lambda s: env.clock.advance(s), resolver=env.resolver, network_fn=lambda: current["id"])
+    tid = mgr.add_target("1.1.1.1")["id"]
+    minute_ts = int(m0 // 60) * 60
+
+    def stored() -> List[Tuple[int, int, int]]:
+        return [tuple(r) for r in env.db._conn.execute(
+            "SELECT network_id, sent, received FROM ping_minutes WHERE target_id=? AND minute_ts=? ORDER BY network_id", (tid, minute_ts))]
+
+    try:
+        for _ in range(5):
+            mgr.tick(tid)
+            env.clock.advance(1.0)
+        current["id"] = 2
+        for _ in range(3):
+            mgr.tick(tid)
+            env.clock.advance(1.0)
+        assert stored() == [(1, 5, 5)], "flushed at the change, not at the end of the minute"
+        current["id"] = None
+        mgr.tick(tid)
+        mgr.stop()
+        assert stored() == [(0, 1, 1), (1, 5, 5), (2, 3, 3)]
+        assert [(r["sent"], r["received"], r["avg_ms"]) for r in env.db.ping_minutes(tid, minute_ts, minute_ts + 60)] == [(9, 9, 10.0)]
+    finally:
+        mgr.stop()

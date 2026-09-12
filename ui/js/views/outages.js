@@ -147,6 +147,8 @@
       unsubs.push(TNT.api.events.on('hello', scheduleReload));
     },
     update() { /* data is fetched directly; nothing derived from the status snapshot */ },
+    // an outage the service closes because the PC changed networks carries a note: show it
+    netChanged() { if (root) scheduleReload(); },
     unmount() {
       if (timer) { clearInterval(timer); timer = null; }
       if (reloadTimer) { clearTimeout(reloadTimer); reloadTimer = null; }

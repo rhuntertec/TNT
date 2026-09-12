@@ -339,7 +339,8 @@ class FakeLan:
 def _trace_dict(host: str, **kw: Any) -> Dict[str, Any]:
     """A contract-shaped tnt.traceroute result (TRACE / HOP dicts)."""
     gw = {"ttl": 1, "ip": "10.0.0.251", "alt_ips": [], "hostname": "router.lan", "rtts": [0.8, 0.9, 1.0], "avg_ms": 0.9,
-          "min_ms": 0.8, "max_ms": 1.0, "loss": 0, "responder_status": 11013, "kind": "gateway", "label": "Gateway"}
+          "min_ms": 0.8, "max_ms": 1.0, "loss": 0, "responder_status": 11013, "kind": "gateway", "label": "Gateway",
+          "location": None}
     dst = dict(gw, ttl=2, ip="198.51.100.7", hostname=None, rtts=[20.0, None, 21.0], avg_ms=20.5, min_ms=20.0, max_ms=21.0,
                loss=1, responder_status=0, kind="destination", label="Destination")
     return {"host": host, "target_ip": "198.51.100.7", "ts": T0, "duration_s": 0.4, "max_hops": kw.get("max_hops", 30),
@@ -364,6 +365,53 @@ class FakeTracer:
             raise RuntimeError("a traceroute is already running")
         self.last = _trace_dict(host, **kw)
         return dict(self.last)
+
+
+GEO = {"ip": "203.0.113.9", "place": "Anytown, TX", "place_full": "Anytown, Texas, United States", "city": "Anytown",
+       "region": "Texas", "region_code": "TX", "country": "United States", "country_code": "US", "lat": 32.95,
+       "lon": -96.73, "asn": 64500, "as_org": "Example Broadband", "isp": "Example Broadband", "month": "2026-09"}
+
+
+class FakeGeoIp:
+    """Stand-in for tnt.geoip.GeoIpManager; set as ``engine.geoip`` inside the IP location tests only."""
+
+    def __init__(self, enabled: bool = True, location: Optional[Dict[str, Any]] = None) -> None:
+        self.enabled = enabled
+        self.location = location
+        self.fail = False
+        self.lookups: List[str] = []
+        self.hop_calls: List[Any] = []
+        self.checks = 0
+
+    def status(self) -> Dict[str, Any]:
+        if not self.enabled:
+            return {"enabled": False, "state": "disabled", "available": False, "month": None, "bytes": None,
+                    "installed_ts": None, "checked_ts": None, "next_check_ts": None, "download": None, "error": None}
+        return {"enabled": True, "state": "ready", "available": True, "month": "2026-09", "bytes": 1234,
+                "installed_ts": T0, "checked_ts": T0, "next_check_ts": T0 + 3600, "download": None, "error": None}
+
+    def lookup(self, ip: str) -> Optional[Dict[str, Any]]:
+        self.lookups.append(ip)
+        if self.fail:
+            raise RuntimeError("lookup failed")
+        if not self.enabled or ip == "10.0.0.1":
+            return None
+        return dict(GEO, ip=ip)
+
+    def files(self) -> List[Dict[str, Any]]:
+        return [{"name": "dbip-city-lite-2026-09.mmdb", "bytes": 1000}, {"name": "dbip-asn-lite-2026-09.mmdb", "bytes": 234}]
+
+    def origin(self) -> Optional[Any]:
+        return (32.95, -96.73)
+
+    def check_now(self) -> bool:
+        self.checks += 1
+        return self.enabled
+
+    def locate_hop(self, ip: Any, hostname: Optional[str] = None, min_ms: Optional[float] = None, origin: Any = None,
+                   kind: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        self.hop_calls.append((ip, hostname, min_ms, origin, kind))
+        return dict(self.location) if self.location else None
 
 
 class FakeEngine:
@@ -612,6 +660,20 @@ def test_body_too_large_is_rejected(server):
         conn.close()
 
 
+def test_reports_routes_need_the_report_manager(server):
+    """The fake engine has no ``reports``: every /api/reports route is 503 and /api/status carries null.
+    Only the Full Scan's Wi-Fi post may exceed the 1 MB body cap (tests/test_reports.py sends one)."""
+    for method, path in (("GET", "/api/reports"), ("GET", "/api/reports/sites"), ("GET", "/api/reports/scan"),
+                         ("POST", "/api/reports/scan"), ("POST", "/api/reports/scan/wifi"), ("GET", "/api/reports/1"),
+                         ("GET", "/api/reports/1/pdf"), ("GET", "/api/reports/compare?a=1&b=2")):
+        status, data = call_json(server, method, path)
+        assert status == 503 and data["error"]["code"] == "unavailable", path
+    status, data = call_json(server, "GET", "/api/status")
+    assert status == 200 and data["reports"] is None
+    assert api_server.body_limit("/api/reports/scan/wifi/") == 2 * 1024 * 1024
+    assert api_server.body_limit("/api/settings") == api_server.MAX_BODY_BYTES == 1024 * 1024
+
+
 def test_server_threads_are_daemons(server):
     assert server.httpd.daemon_threads is True
     assert any(t.name == "tnt-api" and t.daemon for t in threading.enumerate())
@@ -729,7 +791,7 @@ def test_status_shape(server, engine):
     status, data = call_json(server, "GET", "/api/status")
     assert status == 200
     expected = {"version", "started_ts", "uptime_s", "mode", "monitoring", "paused", "overall_light",
-                "targets", "outages", "speed", "discovery", "netinfo", "settings", "map", "dhcp"}
+                "targets", "outages", "speed", "discovery", "netinfo", "net", "settings", "map", "dhcp"}
     assert expected <= set(data)
     assert data["version"] == __version__ and data["mode"] == "console"
     assert set(data["dhcp"]) == {"available", "running", "adapter", "server_ip", "pool", "bound", "offered", "since_ts", "error"}
@@ -741,8 +803,56 @@ def test_status_shape(server, engine):
     assert data["speed"]["backend"] == "cloudflare" and "next_run_ts" in data["speed"]
     assert data["discovery"] == {"running": False, "progress": None, "last_run": None}
     assert data["netinfo"]["internet_nic"]["name"] == "Ethernet" and data["netinfo"]["adapter_count"] == 2
+    # no network watcher on this engine: generation 0, the rest from the netinfo summary
+    assert data["net"] == {"generation": 0, "changed_ts": None, "default_gateway": "10.0.0.251", "internet_nic": "Ethernet",
+                           "summary": None, "networks": [], "network_id": None}
     assert data["settings"] == {"theme": "light", "loaded": True}
     assert data["uptime_s"] >= 5
+
+
+def test_networks_current_and_the_status_network_id(server, engine):
+    status, data = call_json(server, "GET", "/api/networks/current")
+    assert status == 200 and data == {"network": None}, "no network tracker on this engine"
+    from tnt import networks as networks_mod
+
+    facts = {"gateway_ip": "10.0.0.251", "subnet": "10.0.0.0/24", "dhcp_server": "10.0.0.251", "dns_suffix": "lan", "nic": "Ethernet",
+             "if_index": 12}
+    tracker = networks_mod.NetworkTracker(engine.db, facts_fn=lambda hint: dict(facts),
+                                          neighbour_fn=lambda ip, index: ("02:00:5E:00:53:FB", "reachable"))
+    tracker.start()
+    engine.networks = tracker
+    try:
+        nid = tracker.current_network_id()
+        status, data = call_json(server, "GET", "/api/networks/current")
+        net = data["network"]
+        assert status == 200 and set(net) == {"id", "mac", "vendor", "gateway_ip", "subnet", "dhcp_server", "identity", "virtual_mac",
+                                              "portable", "first_seen", "last_seen", "last_report", "offline"}
+        assert (net["id"], net["mac"], net["identity"], net["gateway_ip"], net["subnet"], net["dhcp_server"], net["last_report"],
+                net["portable"], net["offline"]) == (nid, "02:00:5E:00:53:FB", "mac", "10.0.0.251", "10.0.0.0/24", "10.0.0.251", None, False, False)
+        rid = engine.db.add_report("Harbor View", "harbor view", T0, T0 + 90, "complete", __version__, {}, {}, network_id=nid)
+        engine.db.add_report("Unnamed site", "unnamed site", T0 + 60, T0 + 150, "complete", __version__, {}, {}, network_id=nid)
+        status, data = call_json(server, "GET", "/api/networks/current")
+        assert data["network"]["last_report"] == {"id": rid, "site": "Harbor View", "created_ts": T0}, "an unnamed report names no site"
+        status, data = call_json(server, "GET", "/api/status")
+        assert data["net"]["network_id"] == nid
+        # PATCH /api/networks/{id}: a network carried from site to site (a hotspot), or not; it needs the report manager
+        status, data = call_json(server, "PATCH", f"/api/networks/{nid}", {"portable": True})
+        assert status == 503
+        from tnt import reports as reports_mod
+
+        engine.reports = reports_mod.ReportManager(engine.db, None, None, engine, networks=tracker)
+        status, data = call_json(server, "PATCH", f"/api/networks/{nid}", {"portable": True})
+        assert status == 200 and data["network"]["id"] == nid and data["network"]["portable"] is True and "first_seen" not in data["network"]
+        assert call_json(server, "GET", "/api/networks/current")[1]["network"]["portable"] is True
+        for body, code in (({}, 400), ({"portable": "yes"}, 400), ({"portable": 1}, 400)):
+            assert call_json(server, "PATCH", f"/api/networks/{nid}", body)[0] == code, body
+        for path, code in (("/api/networks/0", 400), ("/api/networks/abc", 400), ("/api/networks/999", 404)):
+            assert call_json(server, "PATCH", path, {"portable": False})[0] == code, path
+        assert call_json(server, "PATCH", f"/api/networks/{nid}", {"portable": False})[1]["network"]["portable"] is False
+    finally:
+        tracker.stop()
+        engine.networks = None
+        engine.reports = None
 
 
 def test_targets_post_delete_defaults_samples(server, engine):
@@ -1062,7 +1172,7 @@ def test_traceroute_routes(server, engine):
     assert set(data) == {"host", "target_ip", "ts", "duration_s", "max_hops", "probes", "timeout_ms", "complete", "error",
                          "pc", "gateway", "hops"}
     assert set(data["hops"][0]) == {"ttl", "ip", "alt_ips", "hostname", "rtts", "avg_ms", "min_ms", "max_ms", "loss",
-                                    "responder_status", "kind", "label"}
+                                    "responder_status", "kind", "label", "location"}
     assert data["hops"][1]["rtts"] == [20.0, None, 21.0] and data["hops"][1]["kind"] == "destination"
     assert engine.tracer.calls[-1] == ("www.example", {"max_hops": 30, "probes": 3, "timeout_ms": 1500, "resolve_names": True})
 
@@ -1136,6 +1246,131 @@ def test_traceroute_503_without_pinger_then_lazy_tracer(server, engine):
     first = engine.tracer
     status, data = call_json(server, "POST", "/api/tools/traceroute", {"host": "198.51.100.7", "probes": 1, "resolve_names": False})
     assert status == 200 and engine.tracer is first
+
+
+# ---------------------------------------------------------------------------
+# IP location (tnt.geoip)
+# ---------------------------------------------------------------------------
+def test_status_geoip_null_without_component_and_status_with_it(server, engine):
+    from tnt import geoip
+
+    status, data = call_json(server, "GET", "/api/status")
+    assert status == 200 and "geoip" in data and data["geoip"] is None
+    engine.geoip = FakeGeoIp()
+    status, data = call_json(server, "GET", "/api/status")
+    assert status == 200 and data["geoip"] == engine.geoip.status() and set(data["geoip"]) == set(geoip.STATUS_KEYS)
+    engine.geoip.enabled = False
+    status, data = call_json(server, "GET", "/api/status")
+    assert data["geoip"]["state"] == "disabled" and set(data["geoip"]) == set(geoip.STATUS_KEYS)
+
+    def boom() -> Dict[str, Any]:
+        raise RuntimeError("status failed")
+
+    engine.geoip.status = boom        # one broken component only blanks its own key
+    status, data = call_json(server, "GET", "/api/status")
+    assert status == 200 and data["geoip"] is None and data["version"] == __version__
+
+
+def test_geoip_routes(server, engine):
+    from urllib.parse import urlencode
+
+    def lookup_path(ip: str) -> str:
+        return "/api/geoip/lookup?" + urlencode({"ip": ip})
+
+    for method, path in (("GET", "/api/geoip"), ("GET", lookup_path("203.0.113.9")), ("POST", "/api/geoip/check")):
+        status, data = call_json(server, method, path)
+        assert status == 503 and data["error"]["code"] == "unavailable", path
+
+    gm = engine.geoip = FakeGeoIp()
+    status, data = call_json(server, "GET", "/api/geoip")
+    assert status == 200 and data == gm.status()
+    status, data = call_json(server, "GET", "/api/geoip/lookup?ip=203.0.113.9")
+    assert status == 200 and data == {"ip": "203.0.113.9", "result": dict(GEO, ip="203.0.113.9")}
+    status, data = call_json(server, "GET", lookup_path("10.0.0.1"))
+    assert status == 200 and data == {"ip": "10.0.0.1", "result": None}
+
+    n = len(gm.lookups)
+    for bad in ("", "nope", "999.1.1.1", "1" * 65, "203.0.113.9/24", "[]", "%12"):
+        status, data = call_json(server, "GET", lookup_path(bad))
+        assert status == 400 and data["error"] == {"code": "bad_request", "message": "ip must be an IPv4 or IPv6 address"}, bad
+    status, data = call_json(server, "GET", "/api/geoip/lookup")
+    assert status == 400 and data["error"]["code"] == "bad_request"
+    assert len(gm.lookups) == n       # nothing invalid reaches the manager
+
+    status, data = call_json(server, "GET", lookup_path("[2001:db8::1]"))
+    assert status == 200 and data["ip"] == "2001:db8::1" and gm.lookups[-1] == "2001:db8::1"
+    status, data = call_json(server, "GET", lookup_path("fe80::1%12"))
+    assert status == 200 and data["ip"] == "fe80::1" and gm.lookups[-1] == "fe80::1"
+    status, data = call_json(server, "GET", lookup_path(" 2001:DB8:0::5 "))
+    assert status == 200 and data["ip"] == "2001:db8::5" and data["result"]["ip"] == "2001:db8::5"
+    gm.fail = True                    # a lookup that raises is a null result, not a 500
+    status, data = call_json(server, "GET", lookup_path("203.0.113.9"))
+    assert status == 200 and data == {"ip": "203.0.113.9", "result": None}
+    gm.fail = False
+
+    status, data = call_json(server, "POST", "/api/geoip/check")
+    assert status == 200 and data == gm.status() and gm.checks == 1
+    gm.enabled = False
+    status, data = call_json(server, "POST", "/api/geoip/check")
+    assert status == 409 and data["error"] == {"code": "conflict", "message": "IP location is switched off"}
+    assert gm.checks == 2
+    status, data = call_json(server, "GET", lookup_path("203.0.113.9"))
+    assert status == 200 and data == {"ip": "203.0.113.9", "result": None}
+    status, data = call_json(server, "GET", "/api/geoip")
+    assert status == 200 and data["state"] == "disabled"
+
+
+def test_settings_toggle_geoip(server, engine, data_dir):
+    seen: List[Dict[str, Any]] = []
+    engine.bus.subscribe(lambda e: seen.append(e) if e["type"] == "settings.changed" else None)
+    status, data = call_json(server, "GET", "/api/settings")
+    assert status == 200 and data["geoip"] == {"enabled": True}
+
+    status, data = call_json(server, "PUT", "/api/settings", {"geoip": {"enabled": False}})
+    assert status == 200 and data["changed"] == ["geoip.enabled"] and data["settings"]["geoip"] == {"enabled": False}
+    assert tnt_config.Config(data_dir / "config.json").load().get("geoip.enabled") is False
+    assert _wait_for(lambda: len(seen) >= 1)
+    assert seen[-1]["data"]["keys"] == ["geoip.enabled"] and seen[-1]["data"]["settings"]["geoip"] == {"enabled": False}
+
+    status, data = call_json(server, "PATCH", "/api/settings", {"geoip": {"enabled": True}})
+    assert status == 200 and data["changed"] == ["geoip.enabled"]
+    status, data = call_json(server, "PUT", "/api/settings", {"geoip": "x"})
+    assert status == 400 and "must be an object" in data["error"]["message"]
+    status, data = call_json(server, "GET", "/api/settings")
+    assert status == 200 and data["geoip"] == {"enabled": True}
+
+
+def test_lazy_tracer_gets_the_geo_provider(server, engine):
+    from tnt.icmp import PingResult
+
+    class OneHopPinger:
+        def ping(self, ip, size=32, timeout_ms=1000, ttl=128):
+            return PingResult(True, 0.7, 0, None, 64, size, ip, responder=ip)
+
+    loc = {"text": "Richardson, TX", "source": "database", "hint": None, "db_text": "Richardson, TX", "asn": 64510,
+           "as_org": "Example Transit, Inc."}
+    engine.pinger = OneHopPinger()
+    gm = engine.geoip = FakeGeoIp(location=loc)
+    body = {"host": "198.51.100.7", "probes": 1, "resolve_names": False}
+    status, data = call_json(server, "POST", "/api/tools/traceroute", body)
+    assert status == 200 and data["hops"][0]["location"] == loc
+    assert gm.hop_calls == [("198.51.100.7", None, 0.7, (32.95, -96.73), "destination")]
+    status, data = call_json(server, "GET", "/api/tools/traceroute/last")
+    assert status == 200 and data["trace"]["hops"][0]["location"] == loc
+
+    # the provider is asked on every trace: without the component the same tracer gives null locations
+    engine.geoip = None
+    status, data = call_json(server, "POST", "/api/tools/traceroute", body)
+    assert status == 200 and data["hops"][0]["location"] is None and len(gm.hop_calls) == 1
+
+
+def test_diagnostics_geoip_section_with_the_component(engine):
+    from tnt import diagnostics, geoip
+
+    engine.geoip = FakeGeoIp()
+    d = diagnostics.collect(engine)
+    assert set(d["geoip"]) == set(geoip.DIAG_KEYS)
+    assert d["geoip"] == {"available": True, "status": engine.geoip.status(), "files": engine.geoip.files()}
 
 
 def test_lan_peer_and_throughput_routes(server, engine):
@@ -1241,6 +1476,103 @@ def test_lan_routes_503_when_component_missing(server, engine):
         assert status == 503 and data["error"]["code"] == "unavailable", path
     status, data = call_json(server, "GET", "/api/status")
     assert status == 200 and data["version"] == __version__
+
+
+# ---------------------------------------------------------------------------
+# GET /api/oui (vendor names for the WiFi tile; only 24-bit prefixes reach the service)
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def fake_oui(monkeypatch):
+    """``tnt.oui.vendor_for_oui`` backed by a synthetic registry; records every lookup."""
+    from tnt import oui
+
+    calls: List[str] = []
+    registry = {"AC:DE:48": "Synthetic Networks Ltd", "00:00:5E": "Synthetic Standards Body"}
+
+    def fake(prefix: str) -> Optional[str]:
+        calls.append(prefix)
+        return registry.get(prefix)
+
+    monkeypatch.setattr(oui, "vendor_for_oui", fake)
+    return calls
+
+
+def test_request_query_all():
+    req = Request("GET", "/x", query={"prefix": "b"}, raw_query="prefix=a&x=1&prefix=b&prefix=")
+    assert req.query_all("prefix") == ["a", "b", ""] and req.query_all("x") == ["1"] and req.query_all("none") == []
+    assert Request("GET", "/x", query={"prefix": "only"}).query_all("prefix") == ["only"], "built without a raw query"
+
+
+def test_oui_route_repeated_and_comma_separated_prefixes(server, fake_oui):
+    status, data = call_json(server, "GET", "/api/oui?prefix=ac:de:48&prefix=00-00-5e&prefix=02AABB")
+    assert status == 200
+    assert data == {"vendors": {"AC:DE:48": "Synthetic Networks Ltd", "00:00:5E": "Synthetic Standards Body", "02:AA:BB": None}}
+    assert list(data["vendors"]) == ["AC:DE:48", "00:00:5E", "02:AA:BB"] and fake_oui == ["AC:DE:48", "00:00:5E", "02:AA:BB"]
+    fake_oui.clear()
+    status, data = call_json(server, "GET", "/api/oui?prefix=AC:DE:48,%2000:00:5E&prefix=ac-de-48")
+    assert status == 200 and list(data["vendors"]) == ["AC:DE:48", "00:00:5E"] and fake_oui == ["AC:DE:48", "00:00:5E"], \
+        "a prefix asked for twice is looked up once"
+    status, data = call_json(server, "GET", "/api/oui?prefix=AC%3ADE%3A48")
+    assert status == 200 and data == {"vendors": {"AC:DE:48": "Synthetic Networks Ltd"}}
+
+
+@pytest.mark.parametrize("query, needle", [
+    ("", "prefix is required"),
+    ("?prefix=", "prefix is required"),
+    ("?prefix=,%20,", "prefix is required"),
+    ("?vendor=AC:DE:48", "prefix is required"),
+    ("?prefix=AC:DE", "is not a 24-bit OUI prefix"),
+    ("?prefix=AC:DE:48:00", "is not a 24-bit OUI prefix"),
+    ("?prefix=AC:DE:48:00:11:22", "is not a 24-bit OUI prefix"),      # a whole MAC is refused, never cut down
+    ("?prefix=AC:DE-48", "is not a 24-bit OUI prefix"),               # one separator style per prefix
+    ("?prefix=AC.DE.48", "is not a 24-bit OUI prefix"),
+    ("?prefix=ACDE4G", "is not a 24-bit OUI prefix"),
+    ("?prefix=AC:DE:48&prefix=nope", "is not a 24-bit OUI prefix"),
+])
+def test_oui_route_rejects_malformed_prefixes(server, fake_oui, query, needle):
+    status, data = call_json(server, "GET", "/api/oui" + query)
+    assert status == 400 and data["error"]["code"] == "bad_request" and needle in data["error"]["message"], query
+    assert fake_oui == []
+
+
+def test_oui_route_takes_at_most_256_prefixes(server, fake_oui):
+    many = [f"AC:{i // 256:02X}:{i % 256:02X}" for i in range(256)]
+    status, data = call_json(server, "GET", "/api/oui?prefix=" + ",".join(many))
+    assert status == 200 and len(data["vendors"]) == 256 and len(fake_oui) == 256
+    status, data = call_json(server, "GET", "/api/oui?" + "&".join(f"prefix={p}" for p in many + ["AC:DF:00"]))
+    assert status == 400 and data["error"]["message"] == "at most 256 prefixes per request, got 257"
+    status, data = call_json(server, "GET", "/api/oui?prefix=" + ",".join(["AC:DE:48"] * 257))
+    assert status == 400, "the limit counts what was sent, before duplicates are merged"
+
+
+def test_oui_route_get_only_and_degrades(server, monkeypatch):
+    from tnt import oui
+
+    status, data = call_json(server, "POST", "/api/oui?prefix=AC:DE:48", {})
+    assert status == 405 and data["error"]["code"] == "method_not_allowed"
+
+    def boom(prefix):
+        raise RuntimeError("registry corrupt")
+
+    monkeypatch.setattr(oui, "vendor_for_oui", boom)
+    status, data = call_json(server, "GET", "/api/oui?prefix=AC:DE:48")
+    assert status == 200 and data == {"vendors": {"AC:DE:48": None}}, "one failed lookup is null, not a 500"
+    monkeypatch.setitem(sys.modules, "tnt.oui", None)
+    status, data = call_json(server, "GET", "/api/oui?prefix=AC:DE:48")
+    assert status == 503 and data["error"]["code"] == "unavailable"
+    status, data = call_json(server, "GET", "/api/oui?prefix=bad")
+    assert status == 400, "input is validated before the lookup module is needed"
+
+
+def test_vendor_for_oui_normalises_and_skips_unregistrable_prefixes():
+    from tnt import oui
+
+    assert [oui.normalize_oui(p) for p in ("00-00-5e", "00005E", " 00:00:5e ", "00:00-5E", "0000:5E", "00:00:5E:01", 7, None)] \
+        == ["00:00:5E", "00:00:5E", "00:00:5E", None, None, None, None, None]
+    name = oui.vendor_for_oui("00-00-5E")
+    assert isinstance(name, str) and name and name == oui.vendor_for_oui("00005e"), "IANA's block is in netaddr's registry"
+    for prefix in ("02:00:5E", "01:00:5E", "FF:FF:FF", "not-an-oui", None):
+        assert oui.vendor_for_oui(prefix) is None, prefix
 
 
 def test_dhcp_config_section_validation():
@@ -1349,9 +1681,47 @@ def test_netinfo_route_is_lazy(server, monkeypatch):
     monkeypatch.setitem(sys.modules, "tnt.netinfo", fake)
     status, data = call_json(server, "GET", "/api/netinfo")
     assert status == 200 and data["adapters"] == [] and data["ts"] == T0
+    assert data["generation"] == 0 and data["changed_ts"] is None      # no network watcher on this engine
     monkeypatch.setitem(sys.modules, "tnt.netinfo", None)
     status, data = call_json(server, "GET", "/api/netinfo")
     assert status == 503 and data["error"]["code"] == "unavailable"
+
+
+def test_status_and_netinfo_carry_the_network_generation(server, engine, monkeypatch):
+    from tnt import diagnostics
+
+    fake = types.ModuleType("tnt.netinfo")
+    fake.netinfo_snapshot = lambda: {"ts": T0, "adapters": [], "internet_nic_index": 12, "default_gateway": "10.20.30.1",
+                                     "public_hint": None}
+    monkeypatch.setitem(sys.modules, "tnt.netinfo", fake)
+    summary = "Ethernet 2: 10.20.30.45/24 · gateway 10.20.30.1"
+    engine.netwatch = SimpleNamespace(
+        state=lambda: {"generation": 3, "changed_ts": T0 + 60, "default_gateway": "10.20.30.1", "internet_nic": "Ethernet 2",
+                       "summary": summary, "networks": ["10.20.30.0/24", "172.16.20.0/24"], "running": True, "poll_s": 5.0,
+                       "polls": 40, "failures": 0, "last_error": None, "pending": False},
+        last_event=lambda: {"generation": 3, "summary": summary})
+    status, data = call_json(server, "GET", "/api/status")
+    assert status == 200
+    # the summary is what a page that missed the event shows; the networks tell a scan of this PC's subnets from another's
+    assert data["net"] == {"generation": 3, "changed_ts": T0 + 60, "default_gateway": "10.20.30.1", "internet_nic": "Ethernet 2",
+                           "summary": summary, "networks": ["10.20.30.0/24", "172.16.20.0/24"], "network_id": None}
+    status, data = call_json(server, "GET", "/api/netinfo")
+    assert status == 200 and data["generation"] == 3 and data["changed_ts"] == T0 + 60 and data["default_gateway"] == "10.20.30.1"
+    net = diagnostics.collect(engine)["network"]
+    assert net["available"] is True and net["generation"] == 3 and net["last_change"]["summary"] == summary
+    # a watcher whose state() fails degrades to the netinfo summary: never a 500
+    def broken():
+        raise RuntimeError("watcher exploded")
+
+    engine.netwatch = SimpleNamespace(state=broken)
+    status, data = call_json(server, "GET", "/api/status")
+    assert status == 200
+    assert data["net"] == {"generation": 0, "changed_ts": None, "default_gateway": "10.0.0.251", "internet_nic": "Ethernet",
+                           "summary": None, "networks": [], "network_id": None}
+    status, data = call_json(server, "GET", "/api/netinfo")
+    assert status == 200 and data["generation"] == 0 and data["changed_ts"] is None
+    engine.netwatch = None
+    assert diagnostics.collect(engine)["network"] == {"available": False}
 
 
 # ---------------------------------------------------------------------------
@@ -1519,6 +1889,7 @@ def test_diagnostics_collect_shape_and_isolated_failures(server, engine, data_di
     assert isinstance(d["cpu_pct"], float)
     assert isinstance(d["recent_log"], list) and isinstance(d["recent_events"], list)
     assert isinstance(d["errors_24h"], int)
+    assert d["geoip"] == {"available": False, "status": None, "files": []}
 
     class BrokenDb:
         path = "broken"
@@ -1612,10 +1983,12 @@ def test_engine_discovery_flow(data_dir):
         assert st["default_range"] == "10.0.0.0/24" and st["last_run"] is None
         assert eng.discovery_start("10.0.0.0/30", [80]) is False  # already running
         assert _wait_for(lambda: any(e["type"] == "discovery.progress" for e in events))
+        eng._on_net_changed({"generation": 1, "summary": "Ethernet: 10.20.30.45/24 · gateway 10.20.30.1"})   # moved mid-scan
         assert eng.discovery_cancel() is True
         assert _wait_for(lambda: any(e["type"] == "discovery.done" for e in events))
         done = next(e for e in events if e["type"] == "discovery.done")
         assert done["data"]["cancelled"] is True and done["data"]["run_id"] == 1 and done["data"]["found"] == 0
+        assert done["data"]["network_changed"] is True
         assert eng.discovery.stopped is True
         assert _wait_for(lambda: not eng.discovery_status()["running"])
 
@@ -1624,7 +1997,8 @@ def test_engine_discovery_flow(data_dir):
         assert eng.discovery_start("10.0.0.0/30", [80, 443]) is True
         assert _wait_for(lambda: any(e["type"] == "discovery.done" for e in events))
         done = next(e for e in events if e["type"] == "discovery.done")
-        assert done["data"] == {**done["data"], "run_id": 2, "ok": True, "cancelled": False, "found": 1, "cidr": "10.0.0.0/30"}
+        assert done["data"] == {**done["data"], "run_id": 2, "ok": True, "cancelled": False, "found": 1, "cidr": "10.0.0.0/30",
+                                "network_changed": False}
         run = eng.db.get_discovery_run(2)
         assert run["cidr"] == "10.0.0.0/30" and run["ports"] == [80, 443] and run["hosts"][0]["ip"] == "10.0.0.1"
         assert run["hosts"][0]["vendor"] == "ACME" and run["found"] == 1
@@ -1637,6 +2011,87 @@ def test_engine_discovery_flow(data_dir):
         assert any("discovery" == e["category"] for e in eng.db.list_events(10))
     finally:
         eng.db.close()
+
+
+def test_engine_on_net_changed_resets_caches_and_tells_every_component(data_dir):
+    from tnt.engine import Engine
+
+    eng = Engine(console=True, port=0, data_dir=data_dir)
+    eng.db = tnt_db.Database(data_dir / "tnt.db")
+    calls: List[Any] = []
+
+    class Component:
+        def __init__(self, name: str, fail: bool = False) -> None:
+            self.name, self.fail = name, fail
+
+        def on_network_change(self, data: Dict[str, Any]) -> None:
+            calls.append((self.name, data["generation"]))
+            if self.fail:
+                raise RuntimeError("boom")
+
+    eng.ping, eng.linkmap, eng.lan, eng.dhcp = Component("ping", fail=True), Component("linkmap"), Component("lan"), Component("dhcp")
+    eng.outages = Component("outages")
+    eng._netinfo_cache, eng._netinfo_cache_ts = {"internet_nic": {"name": "Wi-Fi"}, "adapter_count": 2}, time.time()
+    eng._disc_defaults, eng._disc_defaults_ts = {"default_range": "192.168.10.0/24"}, time.time()
+    release = threading.Event()
+    eng._disc_thread = threading.Thread(target=release.wait, args=(5.0,), daemon=True)
+    eng._disc_thread.start()
+    try:
+        eng._on_net_changed({"generation": 4, "ts": T0, "summary": "Ethernet: 10.20.30.45/24 · gateway 10.20.30.1"})
+        assert calls == [("ping", 4), ("outages", 4), ("linkmap", 4), ("lan", 4), ("dhcp", 4)], \
+            "a failing component never stops the rest"
+        assert eng._netinfo_cache is None and eng._netinfo_cache_ts == 0.0
+        assert eng._disc_defaults == {} and eng._disc_defaults_ts == 0.0 and eng._disc_net_changed is True
+        assert _wait_for(lambda: any(e["category"] == "network" for e in eng.db.list_events(10)))
+        row = next(e for e in eng.db.list_events(10) if e["category"] == "network")
+        assert row["level"] == "info" and row["message"] == "network changed: Ethernet: 10.20.30.45/24 · gateway 10.20.30.1"
+        assert row["ts"] == T0, "stamped with the change, not with whenever the database took the row"
+    finally:
+        release.set()
+        eng.db.close()
+
+
+def test_engine_network_rows_are_coalesced_while_the_network_flaps(data_dir, monkeypatch):
+    from tnt.engine import Engine
+
+    monkeypatch.setattr(Engine, "NET_EVENT_ROW_GAP_S", 0.6)
+    eng = Engine(console=True, port=0, data_dir=data_dir)
+    eng.db = tnt_db.Database(data_dir / "tnt.db")
+
+    def rows() -> List[Dict[str, Any]]:
+        return [e for e in eng.db.list_events(20) if e["category"] == "network"]
+
+    try:
+        eng._on_net_changed({"generation": 1, "ts": T0, "summary": "Wi-Fi disconnected · No network connection"})
+        assert _wait_for(lambda: len(rows()) == 1)
+        for gen in (2, 3, 4):                                   # the network keeps flapping within the gap
+            eng._on_net_changed({"generation": gen, "ts": T0 + gen, "summary": f"Wi-Fi: 192.168.50.{gen}/24 · gateway 192.168.50.1"})
+        time.sleep(0.2)
+        assert len(rows()) == 1, "held back while the gap runs"
+        assert _wait_for(lambda: len(rows()) == 2, 3.0), "one row for all of them when it is up"
+        newest = rows()[0]
+        assert newest["message"] == "network changed 3 more times, now: Wi-Fi: 192.168.50.4/24 · gateway 192.168.50.1"
+        assert newest["ts"] == T0 + 4
+        # one change held back reads like any other, and stop() writes what is still held back
+        eng._on_net_changed({"generation": 5, "ts": T0 + 5, "summary": "Ethernet: 10.20.30.45/24 · gateway 10.20.30.1"})
+        eng._flush_net_rows()
+        assert rows()[0]["message"] == "network changed: Ethernet: 10.20.30.45/24 · gateway 10.20.30.1" and len(rows()) == 3
+        assert eng._net_row_timer is None and eng._net_row_pending is None
+    finally:
+        eng._flush_net_rows()
+        eng.db.close()
+
+
+def test_engine_sleep_gap_wakes_the_network_watcher(data_dir):
+    from tnt.engine import Engine
+
+    eng = Engine(console=True, port=0, data_dir=data_dir)
+    pokes: List[str] = []
+    eng.netwatch = SimpleNamespace(poll_soon=lambda: pokes.append("poke"))
+    eng._monitoring_gap(T0, T0 + 3600, "system sleep")
+    assert pokes == ["poke"]
+    eng._monitoring_gap(T0, T0 + 60, "monitoring paused")
+    assert pokes == ["poke"], "only a sleep can have carried the machine to another network"
 
 
 def test_engine_start_and_stop_smoke(data_dir):
@@ -1678,6 +2133,29 @@ def test_engine_start_and_stop_smoke(data_dir):
         else:
             assert "dhcp" in eng.errors
         assert eng.db.get_meta("dhcp.nic_changed") in (None, "")
+        # the network watcher runs from the start and /api/status carries its generation
+        assert eng.netwatch is not None and eng.netwatch.running and "netwatch" not in eng.errors
+        status, data = call_json(eng.api, "GET", "/api/status")
+        assert isinstance(data["net"]["generation"], int) and set(data["net"]) == {"generation", "changed_ts",
+                                                                                   "default_gateway", "internet_nic",
+                                                                                   "summary", "networks", "network_id"}
+        # the network tracker runs from the start, before every writer
+        assert eng.networks is not None and "networks" not in eng.errors
+        assert data["net"]["network_id"] == eng.networks.current_network_id()
+        # site reports: the manager runs from the start (no scan) and its routes answer
+        assert eng.reports is not None and "reports" not in eng.errors
+        assert data["reports"] == {"count": 0, "sites": 0, "last": None, "job": None}
+        status, data = call_json(eng.api, "GET", "/api/reports")
+        assert status == 200 and data == {"reports": [], "total": 0}
+        status, data = call_json(eng.api, "GET", "/api/reports/scan")
+        assert status == 200 and data == {"job": None}
+        # IP location: the manager runs from the start on the data folder (its first check waits; tests are offline)
+        from tnt import geoip, paths
+
+        assert eng.geoip is not None and "geoip" not in eng.errors and paths.geoip_dir() == data_dir / "geoip"
+        status, data = call_json(eng.api, "GET", "/api/status")
+        assert data["geoip"]["state"] in ("starting", "error", "ready") and set(data["geoip"]) == set(geoip.STATUS_KEYS)
+        assert "public_geo" in data["map"]
         assert eng.start() is None  # idempotent
     finally:
         t1 = time.monotonic()
@@ -1691,7 +2169,9 @@ def test_engine_start_and_stop_smoke(data_dir):
         assert float(check.get_meta("last_heartbeat")) > time.time() - 60
     finally:
         check.close()
-    assert not any(t.name in ("tnt-api", "tnt-maint") and t.is_alive() for t in threading.enumerate())
+    assert not any(t.name in ("tnt-api", "tnt-maint", "tnt-netwatch", "tnt-reports-scan") and t.is_alive()
+                   for t in threading.enumerate())
+    assert _wait_for(lambda: not any(t.name == "tnt-geoip" and t.is_alive() for t in threading.enumerate()), 3.0)
 
 
 def test_engine_wires_dhcp_restore_construct_and_stop(data_dir, monkeypatch):
@@ -1737,6 +2217,9 @@ def test_engine_wires_dhcp_restore_construct_and_stop(data_dir, monkeypatch):
     try:
         assert order == ["restore", "pinger", "construct"]
         assert "dhcp" not in eng.errors and "dhcp-restore" not in eng.errors
+        # the lease returning for the restored adapter is labelled as TNT's own change for a while
+        assert eng.netwatch is not None and eng.netwatch._own_marker()["adapter"] == "Ethernet"
+        assert eng.netwatch._own_marker()["phase"] == "restored"
         assert isinstance(eng.dhcp, FakeDhcpServer)
         assert eng.dhcp.ctor["db"] is eng.db and eng.dhcp.ctor["config"] is eng.config and eng.dhcp.ctor["bus"] is eng.bus
         assert eng.dhcp.ctor["pinger"] is eng.pinger
@@ -1796,8 +2279,10 @@ def test_engine_dhcp_skipped_without_db_and_started_after_retry(data_dir, monkey
     try:
         assert eng.db is None and eng.dhcp is None
         assert eng.errors["dhcp"] == "database unavailable" and calls == []
+        assert eng.reports is None and eng.errors["reports"] == "database unavailable"
         assert _wait_for(lambda: eng.db is not None and eng.dhcp is not None, 5.0)
         assert calls == ["restore", "construct"] and "dhcp" not in eng.errors
+        assert _wait_for(lambda: eng.reports is not None, 5.0) and "reports" not in eng.errors
     finally:
         eng.stop()
 
@@ -1936,6 +2421,49 @@ def test_service_version_help_and_bad_args(capsys):
     assert service.parse_console_args(["--port=7137", "--data-dir", "D:\\x"]) == {"port": 7137, "data_dir": "D:\\x"}
     with pytest.raises(ValueError):
         service.parse_console_args(["--bogus"])
+
+
+def test_selfcheck_modules_include_geoip():
+    import importlib
+
+    from tnt import service
+
+    mods = list(service.SELFCHECK_MODULES)
+    for name in ("mmap", "tnt.mmdb", "tnt.geohints", "tnt.geohints_data", "tnt.geoip"):
+        assert name in mods, name
+        importlib.import_module(name)
+    assert mods[mods.index("tnt.netwatch") + 1:mods.index("tnt.netwatch") + 5] == ["tnt.mmdb", "tnt.geohints",
+                                                                                   "tnt.geohints_data", "tnt.geoip"]
+
+
+def test_selfcheck_geoip_checks_are_offline(monkeypatch):
+    import tempfile
+
+    from tnt import service
+
+    def no_network(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("the IP location selfcheck must not touch the network")
+
+    monkeypatch.setattr(socket, "create_connection", no_network)
+    monkeypatch.setattr(socket.socket, "connect", no_network)
+    made: List[str] = []
+    real_mkdtemp = tempfile.mkdtemp
+
+    def mkdtemp(*args: Any, **kwargs: Any) -> str:
+        folder = real_mkdtemp(*args, **kwargs)
+        made.append(folder)
+        return folder
+
+    monkeypatch.setattr(tempfile, "mkdtemp", mkdtemp)
+    checks = service._geoip_selfchecks()
+    assert [c[0] for c in checks] == ["geohints data", "MMDB reader (mmap)", "gzip stream", "Windows certificate store"]
+    for name, ok, detail in checks:
+        assert isinstance(ok, bool) and isinstance(detail, str), name
+        if name == "Windows certificate store" and sys.platform != "win32":
+            continue
+        assert ok is True, (name, detail)
+    assert dict((c[0], c[2]) for c in checks)["MMDB reader (mmap)"].endswith(" bytes")
+    assert len(made) == 1 and Path(made[0]).name.startswith("tnt-selfcheck-") and not Path(made[0]).exists()
 
 
 def test_service_cli_output_survives_missing_streams(monkeypatch):

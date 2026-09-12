@@ -271,6 +271,14 @@
         }));
       },
       update() { /* nothing here follows the status snapshot */ },
+      /* Joining a Wi-Fi network makes Windows save a profile for it: re-read the list when a Wi-Fi
+         adapter took part in the change. Masked only, and never while keys are shown (that list stays
+         as the user asked for it until Refresh). */
+      netChanged(info) {
+        if (!mounted || shown || loading || !wifiInChange(info)) return;
+        if (TNT.util.nowS() - lastLoadTs < HELLO_QUIET_S) return;
+        load(false);
+      },
       unmount() {
         mounted = false;
         for (const u of unsubs) { try { u(); } catch (e) { /* ignore */ } }
@@ -280,5 +288,11 @@
     };
   }
 
-  TNT.tools.wifi = { create, maskKey, securityClass, securityText, rowsToCsv, csvName, MASK, CSV_COLUMNS, EMPTY_TEXT, INTRO, ADMIN_TEXT };
+  /** Pure: whether a net.changed payload involves a Wi-Fi adapter (the adapter names in `changes`). */
+  function wifiInChange(info) {
+    const changes = info && Array.isArray(info.changes) ? info.changes : [];
+    return changes.some((c) => !!c && /wi-?fi|wlan|wireless/i.test(String(c.adapter || '')));
+  }
+
+  TNT.tools.wifi = { create, maskKey, securityClass, securityText, rowsToCsv, csvName, wifiInChange, MASK, CSV_COLUMNS, EMPTY_TEXT, INTRO, ADMIN_TEXT };
 })();

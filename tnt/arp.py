@@ -39,15 +39,18 @@ import subprocess
 import sys
 import threading
 from ctypes import POINTER, Structure, Union, byref, c_char, c_ubyte, c_ulong, c_ulonglong, c_ushort, c_void_p
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 from .oui import normalize_mac
 
 log = logging.getLogger(__name__)
 
-__all__ = ["get_arp_table", "get_arp_table_native", "get_arp_table_cmd", "parse_arp_output"]
+__all__ = ["get_arp_table", "get_arp_table_native", "get_arp_table_cmd", "parse_arp_output", "neighbour",
+           "neighbour_rows_native"]
 
+AF_UNSPEC = 0
 AF_INET = 2
+AF_INET6 = 23
 NO_ERROR = 0
 ERROR_NOT_FOUND = 1168
 NLNS_UNREACHABLE = 0
@@ -251,3 +254,81 @@ def get_arp_table() -> Dict[str, str]:
 def neighbour_state_name(state: int) -> Optional[str]:
     """Human name of an ``NL_NEIGHBOR_STATE`` value (diagnostics helper)."""
     return NL_STATE_NAMES.get(int(state))
+
+
+def _plain_ip(ip: str) -> Optional[ipaddress._BaseAddress]:
+    try:
+        return ipaddress.ip_address(str(ip).strip().split("%", 1)[0])
+    except ValueError:
+        return None
+
+
+def neighbour_rows_native(family: int = AF_UNSPEC) -> List[Tuple[str, int, str, str]]:
+    """``(ip, interface index, MAC, state name)`` of every neighbour row with a unicast 6-byte address that is not
+    unreachable, IPv4 and IPv6 (``GetIpNetTable2``; a router of an IPv6-only network is an NDP entry).  Raises ``OSError``."""
+    dll = _dll()
+    table = c_void_p()
+    rc = dll.GetIpNetTable2(int(family), byref(table))
+    if rc == ERROR_NOT_FOUND:
+        if table.value:
+            dll.FreeMibTable(table)
+        return []
+    if rc != NO_ERROR:
+        raise OSError(rc, f"GetIpNetTable2 failed: {ctypes.FormatError(rc)} ({rc})")
+    if not table.value:
+        return []
+    out: List[Tuple[str, int, str, str]] = []
+    try:
+        count = c_ulong.from_address(table.value).value
+        if count > _MAX_ROWS:
+            raise OSError(0, f"GetIpNetTable2 reported an implausible {count} rows")
+        rows = (MIB_IPNET_ROW2 * count).from_address(table.value + _ROWS_OFFSET)
+        for row in rows:
+            fam = row.Address.si_family
+            if fam not in (AF_INET, AF_INET6) or row.PhysicalAddressLength != 6 or row.State == NLNS_UNREACHABLE:
+                continue
+            mac = normalize_mac(bytes(row.PhysicalAddress[:6]).hex())
+            if mac is None or mac == NULL_MAC or int(mac[:2], 16) & 0x01:
+                continue
+            if fam == AF_INET:
+                addr: ipaddress._BaseAddress = ipaddress.IPv4Address(bytes(row.Address.Ipv4.sin_addr))
+            else:
+                addr = ipaddress.IPv6Address(bytes(row.Address.Ipv6.sin6_addr))
+            if addr.is_multicast or addr.is_unspecified:
+                continue
+            out.append((str(addr), int(row.InterfaceIndex), mac, NL_STATE_NAMES.get(int(row.State), "unknown")))
+    finally:
+        dll.FreeMibTable(table)
+    return out
+
+
+_STATE_RANK = {name: rank for rank, name in NL_STATE_NAMES.items()}
+
+
+def neighbour(ip: str, if_index: Optional[int] = None) -> Optional[Tuple[str, Optional[str]]]:
+    """``(MAC, state)`` of the neighbour *ip* (an IPv6 zone is ignored) on the interface *if_index* (any interface when None;
+    of several rows the best state wins), ``None`` when there is none.  State names: ``permanent``, ``reachable``, ``stale``,
+    ``delay``, ``probe``.  When the native table cannot be read the ``arp -a`` fallback answers for IPv4 with state None
+    (it has none: a caller treats it as unconfirmed).  Never raises."""
+    target = _plain_ip(ip)
+    if target is None:
+        return None
+    try:
+        rows = neighbour_rows_native(AF_INET if target.version == 4 else AF_INET6)
+    except Exception as exc:  # noqa: BLE001 - fall back, never break the caller
+        log.debug("GetIpNetTable2 failed (%s); looking the neighbour up with 'arp -a'", exc)
+        if target.version != 4:
+            return None
+        try:
+            mac = get_arp_table_cmd().get(str(target))
+        except Exception:  # noqa: BLE001
+            log.debug("'arp -a' fallback failed", exc_info=True)
+            return None
+        return (mac, None) if mac else None
+    best: Optional[Tuple[str, Optional[str]]] = None
+    for row_ip, index, mac, state in rows:
+        if _plain_ip(row_ip) != target or (if_index is not None and index != int(if_index)):
+            continue
+        if best is None or _STATE_RANK.get(state, 0) > _STATE_RANK.get(best[1] or "", 0):
+            best = (mac, state)
+    return best

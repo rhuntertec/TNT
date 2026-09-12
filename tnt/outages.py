@@ -75,6 +75,40 @@ Interpretations of the contract (listed as deviations in the module report):
 * Database writes happen *before* the matching in-memory state change, so a
   failed write (disk full, locked file) leaves the state machine consistent
   and the change is retried on the next sample instead of being lost.
+* Network changes: the PingManager's ``add_ip_listener`` reports a target that
+  now pings another address because the network changed (the ``gateway``
+  alias following a new default gateway or losing it, a host name whose first
+  lookup on the new network answered elsewhere).  Its open outage was about
+  the old address, so it is closed at that moment with note
+  ``"network changed"``, its miss/recovery run starts afresh and its group's
+  total is re-evaluated (and closed with the same note when it no longer
+  holds).  A host name whose periodic lookup merely rotated keeps its outage.
+* ``OutageTracker.on_network_change`` (the Engine, for ``net.changed``): when
+  this PC has a default gateway other than the last one it had (a move,
+  directly or through a spell without any), every open target and total
+  outage is closed at that moment with note ``"network changed"`` and every
+  miss/recovery run starts afresh: they were about the network it left.
+  Losing the connection changes nothing about what is recorded (a Wi-Fi drop
+  is a local and internet outage, as it always was), but an outage that was
+  open while this PC had no default gateway and no internet adapter and ends
+  without a note of its own gets ``"no network connection"``.  One that ends by
+  recovering on another network gets ``"network changed"`` even when its
+  answers beat the event: the live default gateway (*gateway_fn*, the Engine's
+  netinfo lookup) differs from the one it began on.
+* The ``host`` stored on a target outage row (and shown in its events) is what
+  was actually pinged: ``"gateway (192.168.10.1)"`` / ``"example.com
+  (203.0.113.10)"`` when a name resolved to an address, the plain host for an
+  IP target.  An open outage keeps the address it was opened for.
+* Networks (ARCHITECTURE 3.20): ``OutageTracker(..., network_fn=)`` gives the
+  network this PC is on; every row (target, total and gap) is opened with
+  ``network_id`` = that network at that moment (a gap row only lists where
+  monitoring stopped: its time is never an outage).  ``close_stale_outages(...,
+  network_id=)`` tags the gap of the time the service was stopped with the
+  network the previous run was on.  ``on_network_id_change(event)`` (a
+  ``tnt.networks`` listener) handles a move the default gateway cannot show (two
+  sites behind the same address): every outage that opened before ``event["ts"]``
+  closes then with ``"network changed"``, and on an immediate switch every
+  miss/recovery run starts afresh.
 """
 from __future__ import annotations
 
@@ -111,6 +145,10 @@ OUTAGE_KINDS: Tuple[str, ...] = ("target",) + TOTAL_KINDS
 # Deferred side effects computed under the lock and executed after releasing it:
 # ("in_outage", target_id, flag) or ("event", event_type, data).
 _Effect = Tuple[str, Any, Any]
+
+#: Notes of outages that end because of (or across) a network change.
+NETWORK_CHANGED_NOTE = "network changed"
+NO_NETWORK_NOTE = "no network connection"
 
 
 def _finite(value: Any) -> Optional[float]:
@@ -197,8 +235,18 @@ def _sample_fields(sample: Any) -> Tuple[float, bool]:
     return ts, bool(ok)
 
 
+def _pinged_host(view: Dict[str, Any]) -> Optional[str]:
+    """What a target outage is about: ``"host (ip)"`` when a name (or the ``gateway`` alias)
+    resolved to an address, else the plain host; ``None`` without a host."""
+    host = str(view.get("host") or "").strip()
+    if not host:
+        return None
+    ip = str(view.get("ip") or "").strip()
+    return f"{host} ({ip})" if ip and ip.lower() != host.lower() else host
+
+
 def close_stale_outages(db: "Database", now: Optional[float] = None,
-                        keep_ids: Iterable[int] = ()) -> Dict[str, Any]:
+                        keep_ids: Iterable[int] = (), network_id: Optional[int] = None) -> Dict[str, Any]:
     """Startup housekeeping (contract 3.5 "Startup").
 
     Closes every outage row still open in the database with
@@ -232,6 +280,10 @@ def close_stale_outages(db: "Database", now: Optional[float] = None,
         ]
         if existing:
             gap_id = int(existing[0]["id"])
+        elif network_id is not None:
+            gap_id = db.open_outage("gap", None, hb, note="not monitoring", network_id=network_id)
+            db.close_outage(gap_id, now, 0, "not monitoring")
+            log.info("inserted monitoring gap #%d: %s (%.0f -> %.0f)", gap_id, _fmt_duration(now - hb), hb, now)
         else:
             gap_id = db.open_outage("gap", None, hb, note="not monitoring")
             db.close_outage(gap_id, now, 0, "not monitoring")
@@ -316,18 +368,28 @@ class OutageTracker:
 
     def __init__(self, db: "Database", config: "Config", bus: "EventBus", ping_manager: Any,
                  clock: Callable[[], float] = time.time,
-                 suppress_new: Optional[Callable[[], bool]] = None) -> None:
+                 suppress_new: Optional[Callable[[], bool]] = None,
+                 gateway_fn: Optional[Callable[[], Optional[str]]] = None,
+                 network_fn: Optional[Callable[[], Optional[int]]] = None) -> None:
         self._db = db
         self._config = config
         self._bus = bus
         self._pm = ping_manager
         self._clock = clock
+        # The network this PC is on (tnt.networks; None: unknown): every row is opened with it. Without it nothing is tagged.
+        self._network_fn = network_fn
         # While this returns True (the Engine passes "a speed test is running") misses do not
         # start a NEW outage: saturating a slow uplink can delay 1200-byte echoes past the
         # timeout and would otherwise log a false outage every 15 minutes. Open outages still
         # recover normally and real failures are detected as soon as the test ends.
         self._suppress_new = suppress_new
         self.suppressed_misses = 0
+        # The default gateway right now (the Engine passes a netinfo lookup; None: not known), for
+        # the note of an outage that recovers on another network than it began on.
+        self._gateway_fn = gateway_fn
+        self._net_gateway: Optional[str] = None     # the last default gateway this PC had
+        self._offline = False                        # net.changed: no default gateway and no internet adapter
+        self._outage_net: Dict[int, Dict[str, Any]] = {}    # open outage id -> {"gateway", "offline"}
         self._lock = threading.RLock()
         self._states: Dict[int, _TargetState] = {}
         self._totals: Dict[str, Dict[str, Any]] = {}   # group -> open total outage row
@@ -362,6 +424,10 @@ class OutageTracker:
             except Exception:  # noqa: BLE001
                 log.exception("closing stale outages failed")
             self._running = True
+        if self._gateway_fn is not None:
+            gateway = self._live_gateway()
+            with self._lock:
+                self._net_gateway = self._net_gateway or gateway
         # older outage rows get their host filled in from the targets table / raw ping log;
         # a background job because reading a day's log takes a moment
         threading.Thread(target=self._backfill_hosts, name="tnt-outage-host-backfill", daemon=True).start()
@@ -380,6 +446,14 @@ class OutageTracker:
                     unsubs.append(u)
             except Exception:  # noqa: BLE001
                 log.exception("could not register the removal listener")
+        add_ip = getattr(self._pm, "add_ip_listener", None)
+        if callable(add_ip):
+            try:
+                u = add_ip(self.on_target_ip_changed)
+                if callable(u):
+                    unsubs.append(u)
+            except Exception:  # noqa: BLE001
+                log.exception("could not register the address change listener")
         with self._lock:
             self._unsubs.extend(unsubs)
         log.info("outage tracker started (thresholds miss=%d recover=%d)",
@@ -444,7 +518,7 @@ class OutageTracker:
                     self._close_total(group, start_ts, note, effects)
                     info["closed"] += 1
                 if end_ts - start_ts >= 1.0:
-                    gid = int(self._db.open_outage("gap", None, float(start_ts), note=note))
+                    gid = int(self._db.open_outage("gap", None, float(start_ts), note=note, **self._network_kw()))
                     self._db.close_outage(gid, float(end_ts), 0, note)
                     info["gap_id"] = gid
         except Exception:  # noqa: BLE001
@@ -578,6 +652,180 @@ class OutageTracker:
         except Exception:  # noqa: BLE001 - runs on the PingManager's thread
             log.exception("ignoring malformed target removal %r", target)
 
+    def on_target_ip_changed(self, view: Dict[str, Any], old_ip: Optional[str], new_ip: Optional[str],
+                             reason: Optional[str] = None) -> None:
+        """A target now pings another address (``PingManager.add_ip_listener``). Never raises.
+
+        Only a switch *caused by a network change* (*reason* set) counts: the open outage was about
+        the old address, so it is closed now with *reason* as its note, the target's miss/recovery
+        run restarts and its group's total is re-evaluated.  Without a reason (a host name's
+        periodic lookup rotated) nothing happens.
+        """
+        if not reason:
+            return
+        try:
+            tid = int(view["id"])
+        except (KeyError, TypeError, ValueError):
+            return
+        now = float(self._clock())
+        effects: List[_Effect] = []
+        try:
+            with self._lock:
+                st = self._states.get(tid)
+                if self._stopped or st is None:
+                    return
+                group = st.kind
+                closed = st.outage is not None
+                if closed:
+                    self._close_target(st, now, reason, effects, notify_pm=True)
+                st.consecutive_missed = 0
+                st.consecutive_ok = 0
+                st.first_miss_ts = None
+                st.first_ok_ts = None
+                st.host = _pinged_host(view) or st.host
+                self._hosts[tid] = st.host
+            if closed:
+                views = self._safe_targets()
+                if views is not None:
+                    with self._lock:
+                        if not self._stopped:
+                            self._evaluate_totals(views, now, now, group, reason, effects, groups=(group,))
+            log.info("target %s now pings %s instead of %s (%s)", tid, new_ip or "nothing", old_ip, reason)
+        except Exception:  # noqa: BLE001
+            log.exception("handling the address change of target %s failed", tid)
+        self._run_effects(effects)
+
+    def on_network_change(self, data: Optional[Dict[str, Any]] = None) -> None:
+        """``net.changed`` (the Engine, on the network watcher's thread; quick, never raises).
+
+        A default gateway other than the last one this PC had closes every open target and total
+        outage at ``data["ts"]`` with note ``"network changed"`` and restarts every miss/recovery
+        run (those outages were about the network it left).  No default gateway and no internet
+        adapter marks the open outages, and the ones that begin before the connection is back,
+        for the note ``"no network connection"`` should they end without one of their own.
+        """
+        try:
+            data = data or {}
+            gateway = str(data.get("default_gateway") or "") or None
+            offline = gateway is None and not data.get("internet_nic")
+            ts = _finite(data.get("ts"))
+            ts = float(self._clock()) if ts is None else ts
+        except Exception:  # noqa: BLE001 - bad data, not a code path worth a traceback
+            log.warning("ignoring a malformed network change %r", data)
+            return
+        effects: List[_Effect] = []
+        closed = 0
+        previous: Optional[str] = None
+        try:
+            with self._lock:
+                if self._stopped:
+                    return
+                previous = self._net_gateway or (str(data.get("previous_gateway") or "") or None)
+                if gateway is not None and previous is not None and gateway != previous:
+                    for st in self._states.values():
+                        if st.outage is not None:
+                            self._close_target(st, ts, NETWORK_CHANGED_NOTE, effects, notify_pm=True)
+                            closed += 1
+                        st.consecutive_missed = 0
+                        st.consecutive_ok = 0
+                        st.first_miss_ts = None
+                        st.first_ok_ts = None
+                    for group in list(self._totals):
+                        self._close_total(group, ts, NETWORK_CHANGED_NOTE, effects)
+                        closed += 1
+                if gateway is not None:
+                    self._net_gateway = gateway
+                self._offline = offline
+                if offline:
+                    open_ids = [int(st.outage["id"]) for st in self._states.values() if st.outage is not None]
+                    open_ids += [int(t["id"]) for t in self._totals.values()]
+                    for oid in open_ids:
+                        self._outage_net.setdefault(oid, {"gateway": self._net_gateway})["offline"] = True
+        except Exception:  # noqa: BLE001
+            log.exception("handling a network change in the outage tracker failed")
+        self._run_effects(effects)
+        if closed:
+            log.info("this PC moved from gateway %s to %s: closed %d outage(s) of the network it left",
+                     previous, gateway, closed)
+
+    def on_network_id_change(self, event: Dict[str, Any]) -> None:
+        """``tnt.networks``: this PC's network is another one since ``event["ts"]`` (also where the default gateway address stayed
+        the same: two sites behind 192.168.1.1).  Every open target and total outage that began before that moment was about the
+        network left behind and closes then with ``"network changed"``; on an immediate switch (``late`` false) every
+        miss/recovery run starts afresh.  A late one (the router's MAC arrived after the switch) leaves the outages that opened
+        since the change alone: they are the new network's.  Never raises."""
+        try:
+            ts = _finite((event or {}).get("ts"))
+            ts = float(self._clock()) if ts is None else ts
+            late = bool((event or {}).get("late"))
+        except Exception:  # noqa: BLE001
+            log.warning("ignoring a malformed network id change %r", event)
+            return
+        effects: List[_Effect] = []
+        closed = 0
+        try:
+            with self._lock:
+                if self._stopped:
+                    return
+                for st in self._states.values():
+                    if st.outage is not None and float(st.outage["start_ts"]) < ts:
+                        self._close_target(st, ts, NETWORK_CHANGED_NOTE, effects, notify_pm=True)
+                        closed += 1
+                        st.consecutive_missed = st.consecutive_ok = 0
+                        st.first_miss_ts = st.first_ok_ts = None
+                    elif not late:
+                        st.consecutive_missed = st.consecutive_ok = 0
+                        st.first_miss_ts = st.first_ok_ts = None
+                for group in list(self._totals):
+                    if float(self._totals[group]["start_ts"]) < ts:
+                        self._close_total(group, ts, NETWORK_CHANGED_NOTE, effects)
+                        closed += 1
+        except Exception:  # noqa: BLE001
+            log.exception("handling a network id change in the outage tracker failed")
+        self._run_effects(effects)
+        if closed:
+            log.info("this PC is on network %s since %.0f (was %s): closed %d outage(s) of the network it left",
+                     (event or {}).get("new_id"), ts, (event or {}).get("old_id"), closed)
+
+    def _network_kw(self) -> Dict[str, Any]:
+        """``{"network_id": id}`` for an outage row opened now, or ``{}`` without *network_fn* (the row is not tagged)."""
+        fn = self._network_fn
+        if fn is None:
+            return {}
+        try:
+            nid = fn()
+        except Exception:  # noqa: BLE001
+            log.debug("the current network id could not be read", exc_info=True)
+            nid = None
+        return {"network_id": nid if isinstance(nid, int) and not isinstance(nid, bool) else None}
+
+    def _live_gateway(self) -> Optional[str]:
+        fn = self._gateway_fn
+        if fn is None:
+            return None
+        try:
+            gateway = fn()
+            return str(gateway) if gateway else None
+        except Exception:  # noqa: BLE001
+            log.debug("default gateway lookup failed", exc_info=True)
+            return None
+
+    def _network_note(self, outage_id: int) -> Optional[str]:
+        """The note of an outage that ends without one of its own (call with the lock held):
+        ``"network changed"`` when this PC's default gateway now is another than when it began,
+        ``"no network connection"`` when it was open while this PC had none; else ``None``."""
+        mark = self._outage_net.get(int(outage_id))
+        if mark is None:
+            return None
+        now = self._live_gateway()
+        if now:
+            # something answers again, so this is the network the PC is on: outages that begin from here on are about it
+            self._net_gateway = now
+        began = mark.get("gateway")
+        if began and now and now != began:
+            return NETWORK_CHANGED_NOTE
+        return NO_NETWORK_NOTE if mark.get("offline") else None
+
     # -- queries -----------------------------------------------------------
     def status(self) -> Dict[str, Any]:
         """Summary for the status endpoint / Outages tile."""
@@ -708,12 +956,13 @@ class OutageTracker:
     # -- internals: state changes (call with the lock held) ----------------
     def _state_for(self, target_id: int, view: Dict[str, Any]) -> _TargetState:
         st = self._states.get(target_id)
-        host = view.get("host")
+        host = _pinged_host(view)
         kind = view.get("kind")
         if st is None:
             st = _TargetState(target_id=target_id, host=str(host or target_id))
             self._states[target_id] = st
-        if host:
+        if host and st.outage is None:
+            # an open outage stays about the address it was opened for
             st.host = str(host)
         if kind in GROUPS:
             st.kind = kind
@@ -739,12 +988,13 @@ class OutageTracker:
         # The row insert must succeed before the in-memory outage exists (a failed insert
         # is retried on the next miss); the missed counter write is best-effort so a
         # failure there cannot leave the row open without a matching state.
-        oid = int(self._db.open_outage("target", st.target_id, start_ts, host=st.host))
+        oid = int(self._db.open_outage("target", st.target_id, start_ts, host=st.host, **self._network_kw()))
         # the run that opened it was all misses, so sent == missed at this point
         st.outage = {
-            "id": oid, "kind": "target", "target_id": st.target_id, "start_ts": float(start_ts),
+            "id": oid, "kind": "target", "target_id": st.target_id, "host": st.host, "start_ts": float(start_ts),
             "end_ts": None, "missed": int(st.consecutive_missed), "sent": int(st.consecutive_missed), "note": None,
         }
+        self._outage_net[oid] = {"gateway": self._net_gateway, "offline": self._offline}
         if st.outage["missed"]:
             self._persist_missed(st.outage)
         log.warning("outage started: %s (target %d) since %.0f", st.host, st.target_id, start_ts)
@@ -759,10 +1009,13 @@ class OutageTracker:
             return
         end_ts = max(float(end_ts), float(o["start_ts"]))
         sent = max(int(o["missed"]), int(o.get("sent") or 0) - max(0, int(recovery_samples)))
+        if note is None:
+            note = self._network_note(int(o["id"]))
         # db first: if the write fails the outage stays open in memory and the close is
         # retried on the next successful sample (consecutive_ok keeps growing, and so does
         # the sent counter, so sent - recovery_samples stays right)
         self._db.close_outage(int(o["id"]), end_ts, int(o["missed"]), note, sent=sent)
+        self._outage_net.pop(int(o["id"]), None)
         o["sent"] = sent
         st.outage = None
         o["end_ts"] = end_ts
@@ -778,11 +1031,12 @@ class OutageTracker:
 
     def _open_total(self, group: str, start_ts: float, effects: List[_Effect]) -> None:
         kind = f"total_{group}"
-        oid = int(self._db.open_outage(kind, None, start_ts))
+        oid = int(self._db.open_outage(kind, None, start_ts, **self._network_kw()))
         self._totals[group] = {
             "id": oid, "kind": kind, "target_id": None, "start_ts": float(start_ts),
             "end_ts": None, "missed": 0, "note": None,
         }
+        self._outage_net[oid] = {"gateway": self._net_gateway, "offline": self._offline}
         log.warning("%s outage started: all %s targets down since %.0f", kind, group, start_ts)
         self._db_event("warning", f"All {group} targets are down", self._clock())
         effects.append(("event", "outage.start", self._decorate(self._totals[group], self._clock())))
@@ -792,7 +1046,10 @@ class OutageTracker:
         if o is None:
             return
         end_ts = max(float(end_ts), float(o["start_ts"]))
+        if note is None:
+            note = self._network_note(int(o["id"]))
         self._db.close_outage(int(o["id"]), end_ts, int(o["missed"]), note)   # db first, see _close_target
+        self._outage_net.pop(int(o["id"]), None)
         self._totals.pop(group, None)
         self._last_total_end[group] = end_ts
         o["end_ts"] = end_ts

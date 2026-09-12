@@ -28,6 +28,7 @@
       blue: cssVar('--blue', '#6FA8FF'),
       purple: cssVar('--purple', '#B48CFF'),
       orange: cssVar('--orange', '#FFA45C'),
+      teal: cssVar('--teal', '#4FD1C5'),
     };
   }
 

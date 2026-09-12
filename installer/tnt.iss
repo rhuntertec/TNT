@@ -33,7 +33,8 @@
 ;      ("TNT DHCP server (UDP 67 in)", "TNT LAN discovery (UDP 7132 in)",
 ;      "TNT LAN throughput (TCP 7133 in)") are deleted. %ProgramData%\TNT is KEPT
 ;      unless the user answers Yes to "Remove monitoring data" (or runs the
-;      uninstaller with /REMOVEDATA=1)
+;      uninstaller with /REMOVEDATA=1); the downloaded IP location data
+;      (%ProgramData%\TNT\geoip) is always removed
 ;    * launches TNT.exe after install as the signed-in (non-elevated) user
 ;    * installs LICENSE (TNT's MIT licence) and THIRD-PARTY-NOTICES.txt (the licences of the
 ;      bundled third-party components) into {app}; no license page: TNT is published under the
@@ -186,6 +187,8 @@ Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\_service"
 Type: filesandordirs; Name: "{app}\_client"
+; the IP location data the service downloaded (tnt.geoip); the rest of %ProgramData%\TNT is kept unless the user removes it
+Type: filesandordirs; Name: "{commonappdata}\TNT\geoip"
 
 [Code]
 var

@@ -25,15 +25,36 @@
     if (net.includes('/')) return ipv4 + '/' + net.split('/')[1];
     return null;
   }
-  /** "10.0.0.112/24" from a /api/netinfo payload (the internet adapter's first IPv4 with a prefix), or null. */
+  /** "10.0.0.112/24" from a /api/netinfo payload (the internet adapter's first IPv4 with a prefix, else a connected
+   *  adapter's before one that is down), or null. */
   function prefillFromNetinfo(n) {
     if (!n || !Array.isArray(n.adapters)) return null;
-    const list = n.adapters.slice().sort((a, b) => (a.index === n.internet_nic_index ? 0 : 1) - (b.index === n.internet_nic_index ? 0 : 1));
+    const rank = (a) => (a.index === n.internet_nic_index ? 0 : 2) + (a.status === 'down' ? 1 : 0);
+    const list = n.adapters.slice().sort((a, b) => rank(a) - rank(b));
     for (const a of list) {
       for (const e of a.ipv4 || []) if (e && e.address && e.prefix != null) return e.address + '/' + e.prefix;
       for (const g of a.subnets || []) if (g && g.family !== 6 && g.network && (g.addresses || []).length) return g.addresses[0] + '/' + String(g.network).split('/')[1];
     }
     return null;
+  }
+
+  /** Pure: the address the field should take from this PC now, or null to leave it. Only while the user
+   *  has not typed, and only into an empty field or one still holding the address filled in before. */
+  function autoFill(field, next) {
+    field = field || {};
+    const value = String(field.value || '').trim();
+    if (field.touched || !next || next === value) return null;
+    return !value || value === String(field.auto || '') ? next : null;
+  }
+
+  /** Pure: whether to fill the field from the adapters list (/api/netinfo) because the status names no internet
+   *  adapter: the field is empty, or still holds the address filled in before (the PC moved to a network with no
+   *  default route, a bench cable or no DHCP server, and that address was the old network's). Never once typed in. */
+  function refillFromAdapters(field, fromStatus) {
+    field = field || {};
+    if (field.touched || fromStatus) return false;
+    const value = String(field.value || '').trim();
+    return !value || value === String(field.auto || '');
   }
 
   /* ------------------------------------------------------------- card */
@@ -44,12 +65,13 @@
     let touched = false;       // the user typed: never overwrite with a prefill
     let mounted = false;
     let prefillTried = false;
+    let autoValue = null;      // the address last filled in for the user: replaced when the PC moves
     let splitChoice = null;
     const els = {};
 
     els.input = h('input', { class: 'input', type: 'text', placeholder: '10.0.0.112/24  ·  10.0.0.112 255.255.255.0  ·  10.0.0.112', 'aria-label': 'IP address with prefix or mask', spellcheck: 'false', autocomplete: 'off' });
     els.input.addEventListener('input', () => { touched = true; compute(); });
-    els.useBtn = h('button', { class: 'btn btn-sm', type: 'button', title: "Fill in this PC's internet address", on: { click: () => { touched = false; prefillTried = false; prefill(TNT.state); } } }, TNT.ui.icon('network'), 'This PC');
+    els.useBtn = h('button', { class: 'btn btn-sm', type: 'button', title: "Fill in this PC's internet address", on: { click: () => useThisPc() } }, TNT.ui.icon('network'), 'This PC');
     const form = h('div', { class: 'form-row tool-form' }, h('div', { class: 'field wide' }, h('label', null, 'Address / prefix or mask'), els.input), els.useBtn);
     els.note = h('div', { class: 'tool-summary muted' });
     els.grid = h('div', { class: 'subnet-grid', hidden: true });
@@ -163,17 +185,32 @@
       renderSplitOptions();
       renderSplit();
     }
+    function fill(v) { els.input.value = v; autoValue = v; compute(); }
+    /* Follows this PC's internet adapter until the user types: an empty field, or one still holding
+       the address filled in before, takes the current one (the PC may have moved to another network). */
     function prefill(state) {
-      if (touched || (els.input.value || '').trim()) return;
-      const v = prefillFrom(state);
-      if (v) { els.input.value = v; compute(); return; }
-      if (prefillTried || !(state && state.status)) return;
+      const fromStatus = prefillFrom(state);
+      const next = autoFill({ value: els.input.value, auto: autoValue, touched }, fromStatus);
+      if (next) { fill(next); return; }
+      // no internet adapter in the status: the adapters list, once per mount or network change
+      if (prefillTried || !(state && state.status) || !refillFromAdapters({ value: els.input.value, auto: autoValue, touched }, fromStatus)) return;
       prefillTried = true;
       TNT.api.netinfo().then((n) => {
-        if (!mounted || touched || (els.input.value || '').trim()) return;
+        if (!mounted || !refillFromAdapters({ value: els.input.value, auto: autoValue, touched }, prefillFrom(TNT.state))) return;
         const w = prefillFromNetinfo(n);
-        if (w) { els.input.value = w; compute(); }
-      }).catch(() => { /* leave the field empty */ });
+        if (w) fill(w);
+      }).catch(() => { /* leave the field as it is */ });
+    }
+    /* "This PC": always this PC's current address, whatever the field holds. */
+    function useThisPc() {
+      touched = false;
+      const v = prefillFrom(TNT.state);
+      if (v) { fill(v); return; }
+      TNT.api.netinfo().then((n) => {
+        if (!mounted) return;
+        const w = prefillFromNetinfo(n);
+        if (w) fill(w); else TNT.ui.toast('This PC has no IPv4 address right now', 'warn');
+      }).catch((err) => { if (mounted) TNT.ui.toast("Could not read this PC's address: " + err.message, 'error'); });
     }
 
     return {
@@ -181,9 +218,11 @@
       head: null,
       mount() { mounted = true; touched = false; prefillTried = false; compute(); prefill(TNT.state); },
       update(state) { if (mounted) prefill(state); },
+      // the new address arrives with the status that follows the change (update() keeps up with it too)
+      netChanged(info, state) { if (mounted) { prefillTried = false; prefill(state || TNT.state); } },
       unmount() { mounted = false; current = null; },
     };
   }
 
-  TNT.tools.subnetcalc = { create, prefillFrom, prefillFromNetinfo, SPLIT_SHOWN, SPLIT_MAX_STEP };
+  TNT.tools.subnetcalc = { create, prefillFrom, prefillFromNetinfo, autoFill, refillFromAdapters, SPLIT_SHOWN, SPLIT_MAX_STEP };
 })();

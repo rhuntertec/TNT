@@ -73,6 +73,33 @@ Contract gaps and small additions (documented as required by the contract):
   boundaries coincide with local-time minute boundaries for every real time zone.
 * The traffic light is ``grey`` while paused, when the target has no sample yet, or
   when no sample falls inside the threshold window.
+* Network changes (``on_network_change``, called by the Engine for ``net.changed``): every
+  hostname target and the ``gateway`` alias re-resolve on their next tick (a lookup the change
+  overtook is thrown away and repeated), and ``kind`` is recomputed when the local subnets
+  changed. The alias is also looked up at least every ``network.poll_s`` and 2 s after a miss,
+  so it follows a new default gateway even before the watcher reports it. Without a default
+  gateway ``resolve_error`` says "this machine has no default gateway right now" and what
+  happens depends on why it is gone. *Lost* (Wi-Fi dropped, a cable pulled, a router reboot
+  that took the link down, a lease lost - the adapter it belonged to is down, gone, without an
+  address or on 169.254.x.x): the alias keeps pinging the last gateway, so the misses are
+  recorded and a local outage is logged exactly as before network-change awareness.
+  *Configured away* (that adapter is still up with a usable address and no gateway: a static
+  bench address, the DHCP server tool, a lease without a router) or never had one: the alias
+  stops pinging, its IP is cleared, no sample is recorded, its light is grey. While it has no
+  gateway it looks again every ``network.poll_s`` (and at once after a network change). When
+  the alias moves to another router (or to none) its in-memory samples and counters start
+  afresh. ``add_ip_listener(fn(view, old_ip, new_ip, reason))`` reports such a switch
+  (``reason`` = ``"network changed"`` for the alias and for a hostname whose first answer
+  after a network change is another address - a lookup that failed in between does not use
+  that up); the OutageTracker closes that target's open outage with the note.
+* ``load_defaults`` looks the default gateway up fresh (netinfo cache invalidated) and applies
+  it to the ``gateway`` tile before returning, so the response carries the current gateway IP;
+  adding an IP literal compares it with a freshly looked-up alias.
+* Networks (ARCHITECTURE 3.20): ``PingManager(..., network_fn=)`` returns the id of the network this
+  PC is on (``NetworkTracker.current_network_id``, an attribute read; None: unknown). It is read once
+  per sample, and a minute aggregate carries it: when it differs from the aggregate's, the partial
+  minute is flushed and a new aggregate starts, so a minute that spans a network change is written as
+  two rows (``upsert_ping_minute(..., network_id)``). Without *network_fn* nothing is tagged.
 """
 from __future__ import annotations
 
@@ -105,6 +132,9 @@ _STOP_JOIN_S = 2.0              # per-thread join timeout on stop/remove
 _STOP_TOTAL_S = 3.5             # overall budget for stop() (joins + flush + raw log close)
 _ERR_LOG_EVERY_S = 60.0         # repeated failures of the same kind are logged this often at most
 _LABEL_MAX = 80                 # longest target label accepted from the API
+_ALIAS_MISS_RECHECK_S = 2.0     # a missed gateway echo makes the alias look the gateway up again this soon
+NETWORK_CHANGED_NOTE = "network changed"
+_STALE = object()               # a lookup a network change overtook
 
 
 class _Throttle:
@@ -249,6 +279,71 @@ def _default_gateway() -> Optional[str]:
     except Exception:  # noqa: BLE001
         log.warning("default gateway lookup failed; skipping it in load_defaults", exc_info=True)
         return None
+
+
+def _invalidate_netinfo_cache() -> None:
+    """Drop netinfo's one-second adapter cache (a stand-in module may not have one)."""
+    try:
+        fn = getattr(importlib.import_module("tnt.netinfo"), "_invalidate_cache", None)
+        if callable(fn):
+            fn()
+    except Exception:  # noqa: BLE001
+        log.debug("netinfo cache invalidation failed", exc_info=True)
+
+
+_AdapterId = Tuple[str, Optional[int], str]
+
+
+def _adapter_id(adapter: Any) -> _AdapterId:
+    return (str(getattr(adapter, "guid", "") or "").lower(), getattr(adapter, "index", None), str(getattr(adapter, "name", "") or ""))
+
+
+def _netinfo_adapters() -> Optional[List[Any]]:
+    """Every adapter via ``tnt.netinfo.get_adapters`` (its one-second cache); ``None`` when unavailable."""
+    try:
+        fn = getattr(importlib.import_module("tnt.netinfo"), "get_adapters", None)
+        return list(fn(include_down=True, include_loopback=False) or []) if callable(fn) else None
+    except Exception:  # noqa: BLE001
+        log.debug("adapter lookup failed", exc_info=True)
+        return None
+
+
+def _gateway_owner(gateway: str) -> Optional[_AdapterId]:
+    """``(guid, index, name)`` of the adapter *gateway* belongs to (the default gateway lookup just
+    filled netinfo's cache); ``None`` when that cannot be told."""
+    for a in _netinfo_adapters() or []:
+        if gateway in [str(g) for g in (getattr(a, "gateways", None) or [])]:
+            return _adapter_id(a)
+    return None
+
+
+def _gateway_left_out(owner: Optional[_AdapterId]) -> bool:
+    """Whether a default gateway that disappeared was configured away rather than lost.
+
+    True when the adapter it belonged to (*owner*) is still up with a usable, not self-assigned
+    IPv4 address and no IPv4 gateway: a static address typed in without one, the DHCP server tool
+    re-addressing it, a lease without a router.  False when that adapter went down or away, lost
+    its address or fell back to 169.254.x.x (Wi-Fi dropped, a cable pulled, a lease lost), and
+    whenever it cannot be told: then the last gateway is still pinged and its misses still count.
+    """
+    adapters = _netinfo_adapters() if owner is not None else None
+    if not adapters or owner is None:
+        return False
+    match = next((a for a in adapters if owner[0] and _adapter_id(a)[0] == owner[0]), None)
+    if match is None:
+        match = next((a for a in adapters if _adapter_id(a)[1:] == owner[1:]), None)
+    if match is None or not bool(getattr(match, "is_up", False)):
+        return False
+    if any(":" not in str(g) for g in (getattr(match, "gateways", None) or [])):
+        return False
+    for entry in getattr(match, "ipv4", None) or []:
+        try:
+            addr = ipaddress.IPv4Address(str(getattr(entry, "address", "")))
+        except ValueError:
+            continue
+        if bool(getattr(entry, "preferred", True)) and not addr.is_link_local:
+            return True
+    return False
 
 
 def _next_slot(start: float, interval: float, n: int, now: float) -> Tuple[int, float]:
@@ -535,10 +630,11 @@ class RawPingLog:
 # Per-target state
 # ---------------------------------------------------------------------------------------
 class _MinuteAgg:
-    __slots__ = ("minute_ts", "sent", "received", "sum", "min", "max", "last_rtt", "jitter_acc", "jitter_n")
+    __slots__ = ("minute_ts", "network_id", "sent", "received", "sum", "min", "max", "last_rtt", "jitter_acc", "jitter_n")
 
-    def __init__(self, minute_ts: int) -> None:
+    def __init__(self, minute_ts: int, network_id: Optional[int] = None) -> None:
         self.minute_ts = minute_ts
+        self.network_id = network_id            # the network current for these samples (None: untagged)
         self.sent = 0
         self.received = 0
         self.sum = 0.0
@@ -591,8 +687,12 @@ class _TargetState:
         self.sort_order = int(row.get("sort_order") or 0)
         self.lock = threading.RLock()
         self.is_literal = _is_ip_literal(self.host)
+        self.is_alias = is_gateway_alias(self.host)
         self.ip: Optional[str] = self.host if self.is_literal else None
         self.resolved = self.is_literal
+        self.net_epoch = 0              # bumped by on_network_change: a lookup already running is stale
+        self.resolved_epoch = 0         # net_epoch of the last lookup that found an address
+        self.gateway_owner: Optional[_AdapterId] = None     # the alias: the adapter its gateway belongs to
         self.resolve_error: Optional[str] = None
         self.last_resolve_ts: Optional[float] = now if self.is_literal else None
         self.kind = self.kind_for(self.ip)
@@ -699,13 +799,15 @@ class PingManager:
 
     def __init__(self, db: Any, config: Any, bus: Any, pinger: Any = None, raw_log: Optional[RawPingLog] = None,
                  clock: Callable[[], float] = time.time, sleep: Callable[[float], None] = time.sleep,
-                 resolver: Optional[Callable[[str], Optional[str]]] = None) -> None:
+                 resolver: Optional[Callable[[str], Optional[str]]] = None,
+                 network_fn: Optional[Callable[[], Optional[int]]] = None) -> None:
         self._db = db
         self._config = config
         self._bus = bus
         self._clock = clock
         self._sleep = sleep
         self._resolver = resolver
+        self._network_fn = network_fn           # the current network id (tnt.networks); None: minutes are not tagged
         self.pinger = pinger
         self._own_pinger = pinger is None
         self.raw_log = raw_log
@@ -715,6 +817,7 @@ class PingManager:
         self._targets: Dict[int, _TargetState] = {}
         self._sample_listeners: List[Callable[[Dict[str, Any], Sample], None]] = []
         self._removal_listeners: List[Callable[[int], None]] = []
+        self._ip_listeners: List[Callable[[Dict[str, Any], Optional[str], Optional[str], Optional[str]], None]] = []
         self._paused = False
         self._running = False
         self._live_workers = 0                  # worker threads started and not yet exited
@@ -936,7 +1039,8 @@ class PingManager:
             self._close_pinger()
 
     def tick(self, target_id: int) -> Optional[Sample]:
-        """Run one worker iteration for *target_id* synchronously (None if paused/unknown)."""
+        """Run one worker iteration for *target_id* synchronously (None if paused/unknown, and for
+        the ``gateway`` alias while this machine has no default gateway)."""
         st = self._state(target_id)
         if st is None:
             return None
@@ -951,6 +1055,10 @@ class PingManager:
         timeout_ms = int(cfg.get("ping.timeout_ms", 1000))
         ttl = int(cfg.get("ping.ttl", 128))
         ip = self._maybe_resolve(st, now)
+        if ip is None and st.is_alias:
+            # no default gateway and none lost (a static address without one, the DHCP tool took the
+            # NIC, never had one): nothing to ping, and nothing to count against the network
+            return None
         if ip is None or self.pinger is None:
             sample = Sample(ts=now, ok=False, rtt_ms=None)
         else:
@@ -976,9 +1084,11 @@ class PingManager:
             log.debug("dropping late sample for removed target %s", st.host)
             return
         minute_ts = _minute_of(sample.ts)
+        network_id = self._network_id()         # once per sample, outside every lock
         finished: Optional[_MinuteAgg] = None
         with st.lock:
-            if st.minute is not None and st.minute.minute_ts != minute_ts:
+            if st.minute is not None and (st.minute.minute_ts != minute_ts or st.minute.network_id != network_id):
+                # a new minute, or the same minute on another network: that part is a row of its own
                 finished, st.minute = st.minute, None
         if finished is not None:
             self._upsert(st, finished)          # db write outside the lock, before the view is built
@@ -994,7 +1104,7 @@ class PingManager:
                 st.consecutive_missed += 1
                 st.consecutive_ok = 0
             if st.minute is None:
-                st.minute = _MinuteAgg(minute_ts)
+                st.minute = _MinuteAgg(minute_ts, network_id)
             st.minute.add(sample)
             view = self._view_locked(st, sample.ts)
             light = view["light"]
@@ -1035,60 +1145,166 @@ class PingManager:
             return None, "name resolution failed"
         return str(ip), None
 
+    def _alias_interval(self) -> float:
+        """The ``gateway`` alias is looked up at least this often: every network watcher poll."""
+        try:
+            value = float(self._config.get("network.poll_s", 5))
+        except Exception:  # noqa: BLE001
+            return 5.0
+        return max(2.0, min(60.0, value)) if value == value else 5.0
+
     def _maybe_resolve(self, st: _TargetState, now: float) -> Optional[str]:
-        """Return the IP to ping (None when unknown), re-resolving hostnames when due."""
+        """Return the IP to ping (None when unknown), re-resolving hostnames when due.
+
+        The ``gateway`` alias is due at least every ``network.poll_s`` and 2 s after a miss (a
+        cheap native lookup), so it follows a new default gateway even before the network
+        watcher reports the change; without a gateway it looks every ``network.poll_s``, never
+        every tick. A lookup that a network change overtook (``net_epoch`` moved while it ran) is
+        thrown away and repeated at once.
+        """
+        for _attempt in range(2):
+            with st.lock:
+                if st.is_literal:
+                    return st.ip
+                try:
+                    interval = float(self._config.get("ping.resolve_interval_s", 300))
+                except Exception:  # noqa: BLE001
+                    interval = 300.0
+                last = st.last_resolve_ts
+                if last is None or now < last:
+                    due = True
+                elif st.ip is None:
+                    due = not st.is_alias or now - last >= self._alias_interval()
+                elif not st.resolved:
+                    due = now - last >= (min(_RESOLVE_RETRY_S, self._alias_interval()) if st.is_alias else _RESOLVE_RETRY_S)
+                elif st.is_alias:
+                    due = (now - last >= min(interval, self._alias_interval())
+                           or (st.consecutive_missed > 0 and now - last >= _ALIAS_MISS_RECHECK_S))
+                else:
+                    due = now - last >= interval
+                if not due:
+                    return st.ip
+                epoch = st.net_epoch
+            ip, err = self._do_resolve(st.host)          # outside the lock: may take up to 3 s
+            kind = st.kind_for(ip) if ip else None       # outside the lock: may enumerate adapters
+            owner, left_out = self._alias_facts(st, ip)  # outside the lock: may enumerate adapters
+            current = self._apply_resolution(st, now, ip, kind, err, epoch, owner, left_out)
+            if current is not _STALE:
+                return current
         with st.lock:
-            if st.is_literal:
-                return st.ip
-            try:
-                interval = float(self._config.get("ping.resolve_interval_s", 300))
-            except Exception:  # noqa: BLE001
-                interval = 300.0
-            last = st.last_resolve_ts
-            if st.ip is None:
-                due = True
-            elif not st.resolved:
-                due = last is None or now - last >= _RESOLVE_RETRY_S or now < last
-            else:
-                due = last is None or now - last >= interval or now < last
-            if not due:
-                return st.ip
-        ip, err = self._do_resolve(st.host)          # outside the lock: may take up to 3 s
-        kind = st.kind_for(ip) if ip else None       # outside the lock: may enumerate adapters
-        changed = False
+            return st.ip
+
+    @staticmethod
+    def _alias_facts(st: _TargetState, ip: Optional[str]) -> Tuple[Optional[_AdapterId], bool]:
+        """For the ``gateway`` alias (call outside every lock): ``(the adapter a gateway it found
+        belongs to, whether a gateway it no longer finds was configured away)``; ``(None, False)``
+        for any other target."""
+        if not st.is_alias:
+            return None, False
+        if ip:
+            return _gateway_owner(ip), False
         with st.lock:
+            had, owner = st.ip, st.gateway_owner
+        return None, bool(had) and _gateway_left_out(owner)
+
+    def _apply_resolution(self, st: _TargetState, now: float, ip: Optional[str], kind: Optional[str],
+                          err: Optional[str], epoch: int, owner: Optional[_AdapterId] = None,
+                          left_out: bool = False) -> Any:
+        """Store one lookup result on *st*; ``_STALE`` when a network change overtook the lookup.
+
+        For the ``gateway`` alias *owner* is the adapter of the gateway found and *left_out* says a
+        gateway that is gone was configured away (its IP is cleared) rather than lost (the last one
+        is still pinged). Publishes ``ping.targets`` when the IP or the resolved flag changed, and
+        tells the IP listeners when the target switched to another address (or the alias's gateway
+        was configured away).
+        """
+        with st.lock:
+            if st.net_epoch != epoch:
+                return _STALE
             st.last_resolve_ts = now
+            after_change = st.resolved_epoch != epoch
             was = (st.ip, st.resolved)
+            old_ip = st.ip
             if ip:
+                # only an answer uses the "after a network change" mark up: a lookup that failed while the
+                # new network's DNS was not ready must not rob the first real answer of its reason
+                st.resolved_epoch = epoch
                 if ip != st.ip:
                     st.ip = ip
                     st.kind = kind
+                if st.is_alias:
+                    st.gateway_owner = owner
                 st.resolved = True
                 st.resolve_error = None
             else:
                 st.resolved = False
                 st.resolve_error = err
+                if st.is_alias and left_out:
+                    st.ip = None            # configured without a gateway: never keep pinging the last router
+            if st.is_alias and old_ip is not None and st.ip != old_ip:
+                # another router (or none at all): the previous one's samples say nothing about it
+                st.samples.clear()
+                st.last = None
+                st.consecutive_missed = 0
+                st.consecutive_ok = 0
             changed = was != (st.ip, st.resolved)
             current = st.ip
         if changed:
             if ip:
                 log.info("%s resolved to %s (%s)", st.host, ip, st.kind)
+            elif st.is_alias and current:
+                log.warning("%s: %s; still pinging %s, the gateway it lost, so its misses count", st.host, err, current)
             else:
                 log.warning("%s: %s", st.host, err)
             self._publish_targets()
+        if old_ip is not None and current != old_ip:
+            self._notify_ip_change(st, old_ip, current, NETWORK_CHANGED_NOTE if (st.is_alias or after_change) else None)
         return current
 
+    def _refresh_alias(self, st: _TargetState, now: float) -> None:
+        """Look the default gateway up right now for the alias target *st* (a quick native call)."""
+        with st.lock:
+            epoch = st.net_epoch
+        ip, err = self._do_resolve(st.host)
+        kind = st.kind_for(ip) if ip else None
+        owner, left_out = self._alias_facts(st, ip)
+        self._apply_resolution(st, now, ip, kind, err, epoch, owner, left_out)
+
+    def _refresh_aliases(self) -> None:
+        now = float(self._clock())
+        for st in self._states():
+            if st.is_alias:
+                try:
+                    self._refresh_alias(st, now)
+                except Exception:  # noqa: BLE001
+                    log.exception("looking up the default gateway for %s failed", st.host)
+
     # -- minute aggregation --------------------------------------------------------------
+    def _network_id(self) -> Optional[int]:
+        """The current network id from *network_fn* (None without one, when unknown or when it fails)."""
+        fn = self._network_fn
+        if fn is None:
+            return None
+        try:
+            nid = fn()
+        except Exception:  # noqa: BLE001
+            log.debug("the current network id could not be read", exc_info=True)
+            return None
+        return int(nid) if isinstance(nid, int) and not isinstance(nid, bool) and nid > 0 else None
+
     def _upsert(self, st: _TargetState, agg: _MinuteAgg) -> None:
         if agg.sent <= 0:
             return
         minute_ts, sent, received, avg, mn, mx, jit = agg.row()
+        args: Tuple[Any, ...] = (st.id, minute_ts, sent, received, avg, mn, mx, jit)
+        if agg.network_id is not None:
+            args += (agg.network_id,)
         # off the ping worker's thread whenever the writer runs (a locked database must
         # stall the writer, never the pings); synchronous fallback otherwise (tests, shutdown)
-        if self._writer.submit(self._db.upsert_ping_minute, st.id, minute_ts, sent, received, avg, mn, mx, jit):
+        if self._writer.submit(self._db.upsert_ping_minute, *args):
             return
         try:
-            self._db.upsert_ping_minute(st.id, minute_ts, sent, received, avg, mn, mx, jit)
+            self._db.upsert_ping_minute(*args)
         except Exception:  # noqa: BLE001
             log.exception("upsert_ping_minute failed for %s minute %s", st.host, minute_ts)
 
@@ -1146,6 +1362,8 @@ class PingManager:
                       window: Optional[Dict[str, Any]] = None) -> str:
         if self._paused or not st.samples:
             return "grey"
+        if st.is_alias and st.ip is None:
+            return "grey"               # no default gateway: nothing is being measured
         th = th or self._thresholds()
         if st.in_outage:
             return "red"
@@ -1309,6 +1527,7 @@ class PingManager:
         # An IP that an existing target already resolves to (typically the 'gateway' alias)
         # is the same device: hand that target back instead of pinging one address twice.
         if _is_ip_literal(clean):
+            self._refresh_aliases()     # compare with the gateway of the network this PC is on now
             with self._lock:
                 dup = next((s for s in self._targets.values()
                             if s.ip == clean or str(s.host).lower() == clean.lower()), None)
@@ -1384,10 +1603,9 @@ class PingManager:
         target is removed so the result is exactly the three defaults in that order; with
         ``replace=False`` the defaults are merely added in front of the existing tiles.
         """
-        # the alias follows the current default gateway (see GATEWAY_HOSTS); it is added even
-        # when there is no gateway right now (a docked laptop gets one later)
-        if _default_gateway() is None:
-            log.info("no default gateway at the moment; the 'gateway' tile will resolve once one appears")
+        # a fresh look at the adapters: the gateway tile must carry the gateway of the network this
+        # PC is on now, not one cached before the laptop moved
+        _invalidate_netinfo_cache()
         keep = {h.lower() for h, _ in DEFAULT_TILES}
         if replace:
             for st in self._states():
@@ -1397,9 +1615,21 @@ class PingManager:
                     except Exception:  # noqa: BLE001
                         log.exception("removing %s while loading the defaults failed", st.host)
         ids: List[int] = []
+        now = float(self._clock())
         for host, label in DEFAULT_TILES:
             try:
-                ids.append(int(self._add(host, label, publish=False)["id"]))
+                tid = int(self._add(host, label, publish=False)["id"])
+                ids.append(tid)
+                st = self._state(tid)
+                if st is not None and st.is_alias:
+                    # the alias follows the current default gateway (see GATEWAY_HOSTS); it is kept
+                    # even when there is none right now (a docked laptop gets one later)
+                    self._refresh_alias(st, now)
+                    if st.ip is None:
+                        log.info("no default gateway at the moment; the 'gateway' tile will resolve once one appears")
+                elif st is not None and not st.is_literal:
+                    with st.lock:
+                        st.last_resolve_ts = None       # host names re-resolve on their next tick
             except ValueError as exc:
                 log.warning("skipping default target %r: %s", host, exc)
             except Exception:  # noqa: BLE001
@@ -1458,6 +1688,72 @@ class PingManager:
                     self._removal_listeners.remove(fn)
 
         return unsubscribe
+
+    def add_ip_listener(self, fn: Callable[[Dict[str, Any], Optional[str], Optional[str], Optional[str]], None]
+                        ) -> Callable[[], None]:
+        """``fn(view, old_ip, new_ip, reason)`` when a resolved target switches to another address
+        (or the ``gateway`` alias's gateway was configured away: *new_ip* ``None``). *reason* is
+        ``"network changed"`` when a network change caused it (always for the alias), else
+        ``None`` (a host name's periodic lookup answered another address). Called outside every
+        lock, on whichever thread did the lookup."""
+        with self._lock:
+            self._ip_listeners.append(fn)
+
+        def unsubscribe() -> None:
+            with self._lock:
+                if fn in self._ip_listeners:
+                    self._ip_listeners.remove(fn)
+
+        return unsubscribe
+
+    def _notify_ip_change(self, st: _TargetState, old_ip: Optional[str], new_ip: Optional[str],
+                          reason: Optional[str]) -> None:
+        with self._lock:
+            listeners = list(self._ip_listeners)
+            removed = self._targets.get(st.id) is not st
+        if not listeners or removed:
+            return
+        view = self._view(st)
+        for fn in listeners:
+            try:
+                fn(view, old_ip, new_ip, reason)
+            except Exception:  # noqa: BLE001
+                log.exception("IP change listener failed for %s", st.host)
+
+    def on_network_change(self, data: Optional[Dict[str, Any]] = None) -> None:
+        """``net.changed`` from the network watcher (on its thread: quick, never raises).
+
+        Every host name target and the ``gateway`` alias re-resolve on their next tick - their own
+        worker does the lookup, DNS may take seconds - and a lookup already running is discarded.
+        When the local subnets changed, ``kind`` (local/internet) is recomputed for every target
+        and ``ping.targets`` published if one moved.
+        """
+        try:
+            data = data or {}
+            states = self._states()
+            for st in states:
+                with st.lock:
+                    if st.is_literal:
+                        continue
+                    st.net_epoch += 1
+                    st.last_resolve_ts = None
+            if not data.get("subnets_changed", True):
+                return
+            moved = False
+            for st in states:
+                with st.lock:
+                    ip = st.ip
+                if not ip:
+                    continue
+                kind = st.kind_for(ip)                  # outside the lock: may enumerate adapters
+                with st.lock:
+                    if st.ip == ip and st.kind != kind:
+                        st.kind = kind
+                        moved = True
+            if moved:
+                self._publish_targets()
+        except Exception:  # noqa: BLE001
+            log.exception("handling a network change in the ping manager failed")
 
     def _publish_targets(self) -> None:
         try:

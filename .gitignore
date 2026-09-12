@@ -11,6 +11,8 @@ installer/output/
 .tmpdata/
 .tmpdata-dhcp/
 .publish-denylist.txt
+*.mmdb
+*.mmdb.gz
 
 # >>> public export: files that stay private (never commit them here) >>>
 # Added by the export from the private source repository; these names stay there.

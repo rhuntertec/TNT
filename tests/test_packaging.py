@@ -1,4 +1,5 @@
-"""Release packaging inputs: no Markdown in a PyInstaller bundle, the licence files in the installer.
+"""Release packaging inputs: no Markdown in a PyInstaller bundle, the licence files in the installer,
+the DB-IP credit for the IP location data the service downloads (CC BY 4.0) and its uninstall rule.
 
 The PyInstaller specs are not executed here (that is a full build). Instead the tests check the
 data filter both specs apply (``installer/pyi_common.without_markdown``) and run it over what
@@ -140,3 +141,85 @@ def test_licence_and_notices_files():
     refs = {int(n) for n in re.findall(r"\bT(\d+)\b", inventory)}
     present = {int(n) for n in re.findall(r"^\[T(\d+)\] ", texts, re.M)}
     assert refs and refs <= present, sorted(refs - present)
+
+
+def _private_doc(rel: str) -> str:
+    """A Markdown doc, or skip the test: the published source tree has no ``*.md`` (like test_ui.py's ``_doc``)."""
+    path = ROOT / rel
+    if not path.is_file():
+        pytest.skip(f"{rel} is not in this checkout (the Markdown docs are not published)")
+    return path.read_text(encoding="utf-8")
+
+
+def test_notices_credit_dbip():
+    """DB-IP Lite is CC BY 4.0: the attribution, the licence cited by URI, the changes TNT makes and the as-is
+    warranty, in Part 1 (section G, data the service downloads) and in Part 3."""
+    notices = (ROOT / "THIRD-PARTY-NOTICES.txt").read_text(encoding="utf-8")
+    for s in ("DB-IP", "CC-BY-4.0", "IP Geolocation by DB-IP", "https://db-ip.com",
+              "G. Data the service downloads at run time", "Changes:", "provided as is"):
+        assert s in notices, s
+    inventory, rest = notices.split("PART 2. LICENCE TEXTS", 1)
+    assert "G. Data the service downloads at run time" in inventory
+    statements = rest.split("PART 3. REQUIRED STATEMENTS", 1)[1]
+    assert "IP Geolocation by DB-IP (https://db-ip.com)" in statements
+    assert "https://creativecommons.org/licenses/by/4.0/" in statements
+
+
+def test_installer_removes_the_geoip_cache_on_uninstall():
+    """The downloaded IP location data is always removed on uninstall, and survives an upgrade."""
+    iss = (INSTALLER / "tnt.iss").read_text(encoding="utf-8")
+    uninstall = re.search(r"^\[UninstallDelete\]\s*$(.*?)^\[", iss, re.M | re.S).group(1)
+    assert re.search(r'^Type: filesandordirs; Name: "\{commonappdata\}\\TNT\\geoip"$', uninstall, re.M)
+    installs = re.search(r"^\[InstallDelete\]\s*$(.*?)^\[", iss, re.M | re.S).group(1)
+    assert "geoip" not in installs.lower()
+
+
+def test_gitignore_keeps_mmdb_files_out():
+    lines = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert "*.mmdb" in lines and "*.mmdb.gz" in lines
+
+
+def test_ip_location_is_in_the_design_doc():
+    docs = _private_doc("docs/DESIGN.md")
+    for s in ("IP Geolocation by DB-IP", "Location column", "Settings › IP location", "downloading data…",
+              "status.map.public_geo", "about 65 MB a month", "about 140 MB on disk", "router name", "Retry now",
+              "CC BY 4.0",
+              # words the other doc checks (tests/test_ui.py) rely on
+              "WAN", "IPv6", "Traceroute", "checking…", "no default gateway"):
+        assert s in docs, s
+
+
+def test_design_doc_location_row_matches_the_ui():
+    """ipinfo.js internetRows draws "downloading data…" only while downloading and "unavailable" only after a
+    failure; with no data and no attempt yet (state "starting") it draws no chips."""
+    docs = " ".join(_private_doc("docs/DESIGN.md").split())
+    assert "while there is no data yet a single" not in docs
+    for s in ('"LOCATION downloading data…" row while the service downloads it',
+              '"LOCATION unavailable" once its last attempt has failed',
+              "no chips while it waits for its first or next attempt"):
+        assert s in docs, s
+
+
+def test_ip_location_is_in_the_architecture_doc():
+    arch = _private_doc("docs/ARCHITECTURE.md")
+    for s in ("### 3.21", "tnt/mmdb.py", "tnt/geoip.py", "tnt/geohints.py", "geoip.enabled", "GET `/geoip`",
+              "GET `/geoip/lookup`", "POST `/geoip/check`", '"public_geo"', '"location"', "geoip.state",
+              "TNT_TEST_DBIP_DIR", "TNT_GEOIP_OFFLINE", "state.json", "IP Geolocation by DB-IP"):
+        assert s in arch, s
+
+
+def test_architecture_doc_lists_all_outbound_internet_traffic():
+    """Section 1 must not claim the IP location data is the only thing downloaded: the speed tests and the WAN
+    lookup (tnt/linkmap.py) reach the internet too."""
+    overview = " ".join(_private_doc("docs/ARCHITECTURE.md").split("\n## ", 2)[1].split())
+    assert "The only data the service downloads at run time is" not in overview
+    for s in ("only data files the service downloads and keeps are the IP location data", "ping targets",
+              "speed tests (Cloudflare / fast.com payloads, 3.6)", "`https://1.1.1.1/cdn-cgi/trace` every 10 min"):
+        assert s in overview, s
+
+
+def test_ip_location_is_in_the_readme():
+    """README.txt is published: read it directly, never skipped."""
+    readme = (ROOT / "README.txt").read_text(encoding="utf-8")
+    for s in ("IP Geolocation by DB-IP", "download.db-ip.com", "Reports", "Full Scan"):
+        assert s in readme, s

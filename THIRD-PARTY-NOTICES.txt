@@ -27,6 +27,9 @@ Runtime. When the WebView2 Runtime is missing or too old, the installer
 downloads Microsoft's Evergreen bootstrapper from Microsoft while it runs.
 Pillow's AVIF module (PIL._avif, the only part of Pillow that contains
 libavif and the dav1d and libaom AV1 codecs) is left out of both bundles.
+The IP location data (DB-IP IP to City Lite and IP to ASN Lite) is not in
+the installer either: TNTService.exe downloads it from DB-IP while it runs,
+unless IP location is switched off in Settings. It is listed in section G.
 
 
 PART 1. COMPONENTS
@@ -449,6 +452,27 @@ F. Python and .NET packages in the client (TNT.exe)
                  wheel 0.46.3             MIT [T30]; Copyright (c) 2012 Daniel
                                           Holth and contributors;
                                           https://github.com/pypa/wheel
+
+
+G. Data the service downloads at run time (not in the installer)
+------------------------------------------------------------------------------
+
+35. DB-IP IP to City Lite and IP to ASN Lite databases
+   Version:    monthly editions (dbip-city-lite-YYYY-MM, dbip-asn-lite-YYYY-MM)
+   Files:      %ProgramData%\TNT\geoip\dbip-city-lite-YYYY-MM.mmdb and
+               dbip-asn-lite-YYYY-MM.mmdb (downloaded and decompressed; the
+               files themselves are not modified)
+   Changes:    TNT shows shortened values: city names without the text in
+               brackets, US state and Canadian province codes, provider names
+               without legal suffixes such as ", Inc.". Traceroute locations
+               marked "router name" come from router host names, not DB-IP.
+   Licence:    CC-BY-4.0 (https://creativecommons.org/licenses/by/4.0/legalcode)
+   Copyright:  DB-IP.com (https://db-ip.com)
+   Attribution: IP Geolocation by DB-IP (https://db-ip.com)
+   Warranty:   provided as is, without warranties of any kind; see the licence
+   Upstream:   https://db-ip.com
+   Bundle:     none; TNTService.exe downloads it from https://download.db-ip.com/free/
+               (switch it off under Settings > IP location)
 
 
 PART 2. LICENCE TEXTS
@@ -5610,3 +5634,8 @@ This software is based in part on the work of the Independent JPEG Group.
 
 This software is based in part on the work of the FreeType Team
 (https://freetype.org/).
+
+IP Geolocation by DB-IP (https://db-ip.com). The DB-IP IP to City Lite and IP
+to ASN Lite databases are licensed under the Creative Commons Attribution 4.0
+International License (https://creativecommons.org/licenses/by/4.0/). TNT
+shortens some of the values it shows, as listed in entry 35.

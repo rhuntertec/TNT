@@ -63,7 +63,10 @@
       const blob = await resp.blob();
       const cd = resp.headers.get('Content-Disposition') || '';
       const m = /filename\*?=(?:UTF-8''|")?([^";]+)/i.exec(cd);
-      return { blob, filename: m ? decodeURIComponent(m[1].trim()) : null, headers: resp.headers };
+      let filename = m ? m[1].trim() : null;
+      // a stray '%' in a plain filename= is not an escape: keep the name as sent rather than throw
+      if (filename) { try { filename = decodeURIComponent(filename); } catch (e) { /* as sent */ } }
+      return { blob, filename, headers: resp.headers };
     }
     if (resp.status === 204) return null;
     const text = await resp.text();
@@ -77,12 +80,17 @@
     get: (path, opts) => request('GET', path, undefined, opts),
     post: (path, body, opts) => request('POST', path, body === undefined ? {} : body, opts),
     put: (path, body, opts) => request('PUT', path, body, opts),
+    patch: (path, body, opts) => request('PATCH', path, body === undefined ? {} : body, opts),
     del: (path, opts) => request('DELETE', path, undefined, opts),
 
     // convenience wrappers for every route in the contract
     health: () => api.get('/health'),
     status: () => api.get('/status'),
     netinfo: () => api.get('/netinfo'),
+    // IP location (DB-IP Lite): the data's state, a lookup made on this PC only, and Retry now
+    geoip: () => api.get('/geoip'),
+    geoipLookup: (ip) => api.get('/geoip/lookup?ip=' + encodeURIComponent(ip)),
+    geoipCheck: () => api.post('/geoip/check'),
     targets: () => api.get('/targets'),
     addTarget: (host, label) => api.post('/targets', label ? { host, label } : { host }),
     removeTarget: (id) => api.del('/targets/' + encodeURIComponent(id)),
@@ -130,6 +138,9 @@
     // ?reveal=1 asks for the plaintext keys, which the service only hands to a Windows
     // administrator (else 403 admin_required).
     wifiProfiles: (reveal) => api.get('/tools/wifi/profiles' + (reveal ? '?reveal=1' : '?reveal=0'), { timeout: 30000 }),
+    // WiFi page: vendor names for 24-bit OUIs ("AA:BB:CC", 1-256 per call). Only OUIs go to the
+    // service, never a full BSSID: the survey itself stays inside the TNT window.
+    ouiVendors: (prefixes) => api.get('/oui?' + (prefixes || []).map((p) => 'prefix=' + encodeURIComponent(p)).join('&')),
     settings: () => api.get('/settings'),
     updateSettings: (patch) => api.put('/settings', patch),
     pause: () => api.post('/monitoring/pause'),
@@ -141,6 +152,197 @@
       if (range === 'custom') { body.from = from; body.to = to; }
       return api.post('/export', body, { blob: true, timeout: 120000 });
     },
+    // Reports: the site reports a Full Scan saves (the list rows carry the summary, never the data) and the one full
+    // scan the service runs at a time. The report and comparison PDFs are built on request, so they get a long timeout.
+    reports: (opts) => {
+      const o = opts || {};
+      const q = ['site_key', 'q', 'limit', 'offset'].filter((k) => o[k] != null && o[k] !== '').map((k) => k + '=' + encodeURIComponent(o[k]));
+      return api.get('/reports' + (q.length ? '?' + q.join('&') : ''));
+    },
+    reportSites: (text, limit) => api.get('/reports/sites?q=' + encodeURIComponent(text || '') + (limit ? '&limit=' + limit : '')),
+    report: (id) => api.get('/reports/' + encodeURIComponent(id), { timeout: 30000 }),
+    renameReport: (id, site) => api.patch('/reports/' + encodeURIComponent(id), { site }),
+    deleteReport: (id) => api.del('/reports/' + encodeURIComponent(id)),
+    reportPdf: (id) => api.get('/reports/' + encodeURIComponent(id) + '/pdf', { blob: true, timeout: 120000 }),
+    fullScanStart: (site) => api.post('/reports/scan', site ? { site } : {}),
+    fullScanJob: () => api.get('/reports/scan'),
+    fullScanName: (site) => api.patch('/reports/scan', { site }),
+    fullScanCancel: () => api.del('/reports/scan'),
+    fullScanWifi: (snapshot) => api.post('/reports/scan/wifi', snapshot, { timeout: 30000 }),
+    compareReports: (a, b) => api.get('/reports/compare?a=' + encodeURIComponent(a) + '&b=' + encodeURIComponent(b), { timeout: 30000 }),
+    comparePdf: (a, b) => api.get('/reports/compare/pdf?a=' + encodeURIComponent(a) + '&b=' + encodeURIComponent(b), { blob: true, timeout: 120000 }),
+    // the network this PC is on (identified by its router's MAC, else its gateway and subnet) and the newest report made on it
+    networkCurrent: () => api.get('/networks/current'),
+    // a network carried from site to site (a phone hotspot, a travel router): no site is suggested for it
+    setNetworkPortable: (id, portable) => api.patch('/networks/' + encodeURIComponent(id), { portable: !!portable }),
+  };
+
+  /* ------------------------------------------------------ network changes */
+  // Pure helpers for following this PC onto another network; app.js drives them (node tests load
+  // this file on its own). The service counts every change it publishes as `net.changed` in
+  // status.net.generation, which starts again at 0 whenever the service restarts.
+  const NET_STALE_GRACE_MS = 15000;   // how long a status older than a net.changed event is skipped
+  const NET_TOAST_GAP_MS = 8000;      // at most one new network toast in this long
+
+  /** A /api/status snapshot against the last network marker { started, generation, eventMs } ->
+   *  { next, changed, stale, restarted }. `changed`: the views that show network state reload (a
+   *  higher generation, or a restarted service); `stale`: the snapshot predates a net.changed event
+   *  this page applied in the last 15 s, so it is skipped. The first snapshot only sets the marker. */
+  function netCompare(last, st, nowMs) {
+    const n = st && st.net;
+    if (!n || typeof n.generation !== 'number') return { next: last || null, changed: false, stale: false, restarted: false };
+    const next = { started: st.started_ts == null ? null : st.started_ts, generation: n.generation, eventMs: 0 };
+    if (!last) return { next, changed: false, stale: false, restarted: false };
+    if (last.started !== undefined && next.started !== last.started) return { next, changed: true, stale: false, restarted: true };
+    if (n.generation < last.generation && last.eventMs && nowMs - last.eventMs < NET_STALE_GRACE_MS) {
+      return { next: last, changed: false, stale: true, restarted: false };
+    }
+    return { next, changed: n.generation !== last.generation, stale: false, restarted: false };
+  }
+
+  /** A net.changed event against the marker -> { next, fresh }. `fresh` is false for a generation
+   *  this page already handled (a status snapshot got there first). */
+  function netFromEvent(last, data, nowMs) {
+    const gen = data && typeof data.generation === 'number' ? data.generation : null;
+    if (gen === null) return { next: last || null, fresh: true };
+    return { next: { started: last ? last.started : undefined, generation: gen, eventMs: nowMs }, fresh: !last || gen !== last.generation };
+  }
+
+  /** Several changes inside one settle window -> one: the newest payload, with every *_changed flag
+   *  that was set by any of them and all of their `changes`. */
+  function netMerge(prev, info) {
+    if (!prev) return info;
+    if (!info) return prev;
+    const out = Object.assign({}, prev, info);
+    for (const k of ['gateway_changed', 'internet_nic_changed', 'subnets_changed', 'dns_changed']) out[k] = !!(prev[k] || info[k]);
+    out.changes = [].concat(Array.isArray(prev.changes) ? prev.changes : [], Array.isArray(info.changes) ? info.changes : []);
+    return out;
+  }
+
+  /** How to show a network toast at `nowMs`: 'update' the one still on screen (text and timer), a
+   *  'new' one, or 'defer' it by `waitMs`, so a burst of changes never stacks toasts.
+   *  `last` = { shownMs, visible } of the previous network toast, or null. */
+  function netToastPlan(last, nowMs, gapMs) {
+    const gap = gapMs == null ? NET_TOAST_GAP_MS : gapMs;
+    if (!last) return { action: 'new', waitMs: 0 };
+    if (last.visible) return { action: 'update', waitMs: 0 };
+    const since = nowMs - last.shownMs;
+    return since >= gap ? { action: 'new', waitMs: 0 } : { action: 'defer', waitMs: gap - since };
+  }
+
+  /** The network toast for a change -> { text, kind }: "Network changed — <summary>", a warning without a
+   *  default gateway. A change TNT's own DHCP server made (cause "dhcp") already says so in its summary
+   *  ("DHCP server set Ethernet to 172.16.4.100 · …") and is never a warning: the user just asked for it. */
+  function netToastText(info) {
+    const summary = String((info && info.summary) || '');
+    if (info && info.cause === 'dhcp') return { text: summary, kind: 'info' };
+    // a warning too when no adapter faces the internet although a gateway is configured (a duplicate address, a gateway
+    // that routes nowhere); a payload without the internet_nic key (an older service) goes by the gateway alone
+    const noInternet = !!info && 'internet_nic' in info && !info.internet_nic;
+    return { text: 'Network changed — ' + summary, kind: info && info.default_gateway && !noInternet ? 'info' : 'warn' };
+  }
+
+  /** Whether a change is worth a toast (the views reload either way): not when every change is to IPv6 addresses
+   *  while IPv6 is hidden (`showIpv6` false), nor when only the adapter the internet goes through switched between
+   *  two adapters on the same network (gateway, subnets and DNS unchanged: Windows prefers one over the other as
+   *  link speeds move). A change without its `changes` (seen through /api/status) always is. */
+  function netToastWanted(info, showIpv6) {
+    const changes = info && Array.isArray(info.changes) ? info.changes : null;
+    if (!changes || !changes.length) return true;
+    if (!showIpv6 && changes.every((c) => c && c.kind === 'ipv6')) return false;
+    const sameNetwork = !info.gateway_changed && !info.subnets_changed && !info.dns_changed;
+    return !(sameNetwork && changes.every((c) => c && c.kind === 'internet_nic'));
+  }
+
+  /** "a.b.c.d/n" for status.netinfo.internet_nic, which the service sends as the bare address plus its
+   *  network ({ ipv4: "10.0.0.112", network: "10.0.0.0/24" }); an ipv4 that already carries its prefix is
+   *  taken as it is. null when either half is missing. */
+  function netNicCidr(nic) {
+    if (!nic || !nic.ipv4) return null;
+    const ip = String(nic.ipv4);
+    if (ip.includes('/')) return ip;
+    const net = String(nic.network || '');
+    return net.includes('/') ? ip + '/' + net.split('/')[1] : null;
+  }
+
+  /** "a.b.c.0/n", the IPv4 network of an address and prefix length; null for anything else. */
+  function netNetworkOf(ip, prefix) {
+    const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(String(ip == null ? '' : ip));
+    const p = /^\d{1,2}$/.test(String(prefix == null ? '' : prefix)) ? Number(prefix) : NaN;
+    if (!m || !(p >= 0 && p <= 32)) return null;
+    const o = m.slice(1).map(Number);
+    if (o.some((x) => x > 255)) return null;
+    const mask = p === 0 ? 0 : (0xFFFFFFFF << (32 - p)) >>> 0;
+    const net = ((((o[0] << 24) >>> 0) + (o[1] << 16) + (o[2] << 8) + o[3]) & mask) >>> 0;
+    return [net >>> 24, (net >>> 16) & 255, (net >>> 8) & 255, net & 255].join('.') + '/' + p;
+  }
+
+  /** Toast text for a change seen only through /api/status: status.net.summary (the service's text of its last
+   *  change), else pieced together from the internet adapter (a service without it). */
+  function netSummaryFromStatus(st) {
+    const nic = st && st.netinfo && st.netinfo.internet_nic;
+    const net = (st && st.net) || {};
+    if (net.summary) return String(net.summary);
+    const gw = net.default_gateway || (nic && nic.gateway) || null;
+    const addr = nic ? netNicCidr(nic) || nic.ipv4 : null;
+    if (nic && nic.name) return nic.name + (addr ? ': ' + addr : '') + (gw ? ' · gateway ' + gw : ' · no gateway');
+    return gw ? 'Gateway ' + gw : 'No network connection';
+  }
+
+  /** status.netinfo.internet_nic the way the service's /api/status carries it ({ name, ipv4: "a.b.c.d",
+   *  network: "a.b.c.0/n", gateway }), from a net.changed payload; null when there is no internet adapter.
+   *  The network is internet_nic.networks[0], else worked out from ipv4_prefixes[0] (a prefix length; an
+   *  "a.b.c.d/n" network is taken as it is). */
+  function netNicFromEvent(data) {
+    const nic = data && data.internet_nic;
+    if (!nic) return null;
+    let ip = Array.isArray(nic.ipv4) && nic.ipv4.length ? String(nic.ipv4[0]) : null;
+    let prefix = null;
+    if (ip && ip.includes('/')) [ip, prefix] = ip.split('/');
+    const pre = Array.isArray(nic.ipv4_prefixes) && nic.ipv4_prefixes.length ? String(nic.ipv4_prefixes[0]) : null;
+    let network = Array.isArray(nic.networks) && nic.networks.length ? String(nic.networks[0]) : null;
+    if (!network && pre && pre.includes('/')) network = pre;
+    if (!network && ip) network = netNetworkOf(ip, prefix != null ? prefix : pre);
+    return { name: nic.name || null, ipv4: ip, network, gateway: data.default_gateway || null };
+  }
+
+  /** true when a scanned range (CIDR or "a-b") shares no address with any IPv4 subnet this PC is on: an old scan
+   *  of another network. The subnets are `networks` (status.net.networks: every up adapter's, so a bench NIC's scan
+   *  is not "elsewhere" while Wi-Fi carries the internet), else the internet adapter's (`nic` =
+   *  status.netinfo.internet_nic, see netNicCidr). Needs TNT.subnet (js/tools/subnet.js) at call time; false
+   *  whenever it cannot tell. */
+  function netRunElsewhere(range, nic, networks) {
+    const S = TNT.subnet;
+    const text = String(range == null ? '' : range).trim();
+    if (!S || !text) return false;
+    const usable = (p) => !!p && p.ok && !p.assumed_prefix;
+    let mine = (Array.isArray(networks) ? networks : []).map((n) => S.parse(String(n))).filter(usable);
+    if (!mine.length) {
+      const cidr = netNicCidr(nic);
+      mine = [cidr ? S.parse(cidr) : null].filter(usable);
+    }
+    if (!mine.length) return false;
+    let lo, hi;
+    if (text.includes('/')) {
+      const r = S.parse(text);
+      if (!r.ok) return false;
+      lo = S.ipToInt(r.network); hi = S.ipToInt(r.broadcast);
+    } else {
+      const m = /^(\S+)\s*-\s*(\S+)$/.exec(text);
+      const a = m ? S.ipToInt(m[1]) : S.ipToInt(text), b = m ? S.ipToInt(m[2]) : a;
+      if (a == null || b == null) return false;
+      lo = Math.min(a, b); hi = Math.max(a, b);
+    }
+    if (lo == null || hi == null) return false;
+    return mine.every((p) => hi < S.ipToInt(p.network) || lo > S.ipToInt(p.broadcast));
+  }
+
+  api.net = {
+    compare: netCompare, fromEvent: netFromEvent, merge: netMerge, toastPlan: netToastPlan, toastText: netToastText,
+    toastWanted: netToastWanted,
+    summaryFromStatus: netSummaryFromStatus, nicFromEvent: netNicFromEvent, nicCidr: netNicCidr, networkOf: netNetworkOf,
+    runElsewhere: netRunElsewhere,
+    STALE_GRACE_MS: NET_STALE_GRACE_MS, TOAST_GAP_MS: NET_TOAST_GAP_MS,
   };
 
   /* ------------------------------------------------------------------ SSE */
@@ -148,9 +350,11 @@
     'hello', 'ping.sample', 'ping.targets', 'outage.start', 'outage.end',
     'speedtest.start', 'speedtest.progress', 'speedtest.done',
     'discovery.progress', 'discovery.done', 'settings.changed', 'monitoring.paused',
-    'dhcp.state', 'dhcp.lease', 'dhcp.scan', 'map.sample',
+    'dhcp.state', 'dhcp.lease', 'dhcp.scan', 'map.sample', 'geoip.state',
     'trace.start', 'trace.hop', 'trace.done',
     'lan.peers', 'lan.state', 'lan.throughput.progress', 'lan.throughput.done',
+    'net.changed',
+    'report.progress', 'report.saved', 'report.deleted', 'report.updated',
   ];
 
   /**

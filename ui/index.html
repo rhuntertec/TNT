@@ -27,6 +27,7 @@
     </span>
   </a>
   <div class="topbar-right">
+    <button class="btn topbar-scan" id="btn-full-scan" type="button"><span data-icon="report"></span><span class="scan-label" id="full-scan-label">Full Scan</span></button>
     <div class="status-pill grey" id="status-pill" role="status" aria-live="polite">
       <span class="light grey" id="status-light"></span>
       <span class="status-text" id="status-text">Connecting…</span>
@@ -61,9 +62,17 @@
       <div class="tile-head"><span class="tile-icon" data-icon="discovery"></span><span class="tile-title">Discovery</span></div>
       <div class="tile-body" id="tile-discovery"><div class="tile-line muted">Loading…</div></div>
     </a>
+    <a class="tile" data-view="wifi" href="#wifi" style="--accent: var(--teal)">
+      <div class="tile-head"><span class="tile-icon" data-icon="wifi"></span><span class="tile-title">WiFi</span></div>
+      <div class="tile-body" id="tile-wifi"><div class="tile-line muted">Loading…</div></div>
+    </a>
     <a class="tile" data-view="tools" href="#tools" style="--accent: var(--red)">
       <div class="tile-head"><span class="tile-icon" data-icon="tools"></span><span class="tile-title">Tools</span></div>
       <div class="tile-body" id="tile-tools"><div class="tile-line muted">Loading…</div></div>
+    </a>
+    <a class="tile" data-view="reports" href="#reports" style="--accent: var(--grey)">
+      <div class="tile-head"><span class="tile-icon" data-icon="report"></span><span class="tile-title">Reports</span></div>
+      <div class="tile-body" id="tile-reports"><div class="tile-line muted">Loading…</div></div>
     </a>
   </nav>
 
@@ -87,18 +96,22 @@
 
 <script src="js/api.js"></script>
 <script src="js/charts.js"></script>
+<script src="js/wifichart.js"></script>
 <script src="js/hosttable.js"></script>
 <script src="js/tools/subnet.js"></script>
 <script src="js/tools/traceroute.js"></script>
 <script src="js/tools/lan.js"></script>
 <script src="js/tools/subnetcalc.js"></script>
 <script src="js/tools/wifi.js"></script>
+<script src="js/reportsui.js"></script>
 <script src="js/views/ipinfo.js"></script>
 <script src="js/views/ping.js"></script>
 <script src="js/views/outages.js"></script>
 <script src="js/views/speed.js"></script>
 <script src="js/views/discovery.js"></script>
 <script src="js/views/tools.js"></script>
+<script src="js/views/wifi.js"></script>
+<script src="js/views/reports.js"></script>
 <script src="js/egg.js"></script>
 <script src="js/app.js"></script>
 </body>

@@ -10,7 +10,10 @@ works while the internet is down, and TNT sends no telemetry.
 FEATURES
 
   Network info  Adapters, addresses, gateways and DNS, plus a live link map
-                (PC -> gateway -> internet) with the router's public IP.
+                (PC -> gateway -> internet) with the router's public IP and its
+                internet provider and city (IP Geolocation by DB-IP). Follows the
+                PC onto another network within seconds and points out adapter
+                problems such as no DHCP answer or a gateway outside the subnet.
   Ping          Continuous pings to the gateway, 1.1.1.1, totalelectronics.com and
                 any host you add, with latency and loss history.
   Outages       Automatic outage detection (per target and total), a timeline, and
@@ -19,9 +22,18 @@ FEATURES
                 and time-of-day patterns.
   Discovery     LAN scan: open ports, MAC vendor and device type (router, camera,
                 phone, DW server, Wi-Fi).
-  Tools         DHCP server for gear with no address, traceroute with a path map,
-                LAN throughput test between TNT PCs, subnet calculator, and saved
-                Wi-Fi networks (passwords are shown to Windows administrators only).
+  WiFi          Wi-Fi survey of nearby access points on 2.4, 5 and 6 GHz: channel,
+                width, signal over time, security and vendor, with a spectrum chart
+                per band. Runs in the TNT window and needs Windows location access.
+  Tools         DHCP server for gear with no address, traceroute with a path map
+                and hop locations, LAN throughput test between TNT PCs, subnet
+                calculator, and saved Wi-Fi networks (passwords are shown to
+                Windows administrators only).
+  Reports       Full Scan: a speed test, a Discovery scan and a Wi-Fi scan, saved
+                with the last 7 days of pings and outages on that site's network
+                as a report for the site you name (a network scanned before
+                suggests its site). Reports stay on the PC, export as PDF, and
+                compare with any other report, for example a known good network.
 
 Also: PDF reports, a diagnostics page, and light and dark themes.
 
@@ -42,7 +54,7 @@ INSTALL
   2. Open TNT from the tray icon or the Start menu.
 
   Program files: C:\Program Files\TNT
-  Settings, database, logs and reports: C:\ProgramData\TNT
+  Settings, database, logs, reports and IP location data: C:\ProgramData\TNT
   Uninstall from Settings > Apps.
 
   Network use:
@@ -50,6 +62,7 @@ INSTALL
     UDP 7132         finding other TNT PCs on the LAN (can be switched off in Tools)
     TCP 7133         LAN throughput test between TNT PCs
     UDP 67           the DHCP server, only while it is switched on
+    HTTPS            download.db-ip.com: IP location data, about 65 MB a month (can be switched off in Settings)
   TNT adds the Windows Firewall rules these features need.
 
 
@@ -77,3 +90,5 @@ LICENSE
 
   MIT License, Copyright (c) 2026 Total Electronics. See LICENSE.
   Bundled third-party components and their licences: THIRD-PARTY-NOTICES.txt.
+  IP location data: IP Geolocation by DB-IP (https://db-ip.com), CC BY 4.0;
+  downloaded by the service, not included in the installer.

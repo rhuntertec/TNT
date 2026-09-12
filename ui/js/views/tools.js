@@ -27,6 +27,9 @@
   let busyMode = '';          // 'checking' | 'starting' | 'stopping'
   let dirty = false;          // the settings inputs were edited: do not overwrite them from status
   let loading = false;
+  let loadAgain = false;      // a reload was asked for while one was in flight
+  let netPending = false;     // the PC changed networks during a start / stop request: reload after it
+  let danger = null;          // the open "another DHCP server" modal: { networkChanged() }
   let unavailable = false;
   let tickTimer = null;
   let scanError = null;       // a start attempt failed because the pre-start scan itself failed: shown in the scan box
@@ -197,16 +200,26 @@
     if (status.running && status.since_ts) el.appendChild(h('span', null, '· on ' + relTime(status.since_ts, TNT.state && TNT.state.now)));
   }
 
+  /** The adapter picker's entries from the last status with `wanted` selected; an adapter that is not
+   *  there right now stays listed as "not connected" instead of silently turning into Auto. */
+  function renderAdapterOptions(wanted) {
+    const { h } = TNT.util;
+    els.adapter.innerHTML = '';
+    // Auto names the adapter the service picks right now (Wi-Fi once no Ethernet is up); status.adapter is that
+    // pick only while the settings name no adapter
+    const auto = !(status.settings && status.settings.adapter) && status.adapter && status.adapter.name;
+    els.adapter.appendChild(h('option', { value: '' }, 'Auto (' + (auto || 'Ethernet') + ')'));
+    for (const a of status.adapters || []) els.adapter.appendChild(h('option', { value: a.name }, adapterLabel(a)));
+    if (wanted && !Array.from(els.adapter.options).some((o) => o.value === wanted)) els.adapter.appendChild(h('option', { value: wanted }, wanted + ' — not connected'));
+    els.adapter.value = wanted || '';
+  }
+
   function renderSettings() {
     if (!els.adapter || !status) return;
-    const { h } = TNT.util;
     const s = status.settings || {};
-    if (dirty) return;
-    els.adapter.innerHTML = '';
-    els.adapter.appendChild(h('option', { value: '' }, 'Auto (Ethernet)'));
-    for (const a of status.adapters || []) els.adapter.appendChild(h('option', { value: a.name }, adapterLabel(a)));
-    const wanted = s.adapter || '';
-    els.adapter.value = Array.from(els.adapter.options).some((o) => o.value === wanted) ? wanted : '';
+    // edited inputs stay as typed, but the adapter labels follow the network (addresses, the internet flag)
+    if (dirty) { renderAdapterOptions(els.adapter.value); return; }
+    renderAdapterOptions(s.adapter || '');
     const pool = status.pool || {};
     els.poolStart.placeholder = pool.auto && pool.start ? pool.start : 'auto';
     els.poolEnd.placeholder = pool.auto && pool.end ? pool.end : 'auto';
@@ -350,7 +363,7 @@
 
   /* ------------------------------------------------------------ actions */
   async function loadStatus() {
-    if (loading) return;
+    if (loading) { loadAgain = true; return; }
     loading = true;
     try {
       const st = await TNT.api.dhcpStatus();
@@ -360,7 +373,10 @@
       if (!root) return;
       if (err.status === 503 || err.status === 404) setUnavailable(true);
       else TNT.ui.toast('Could not read the DHCP server status: ' + err.message, 'error');
-    } finally { loading = false; }
+    } finally {
+      loading = false;
+      if (loadAgain && root) { loadAgain = false; loadStatus(); }
+    }
   }
 
   function setBusy(v, mode) {
@@ -369,6 +385,8 @@
     renderBadge();
     renderToggle();
     setInputsDisabled(v);
+    // the network changed while a start / stop ran: read the adapters again once its answer is applied
+    if (!v && netPending && root) { netPending = false; setTimeout(() => { if (root) loadStatus(); }, 0); }
   }
 
   async function turnOn(force) {
@@ -442,11 +460,17 @@
       infoBox(box, 'bad loud', internetWarningParts(inet));
       body.appendChild(box);
     }
+    // "Proceed anyway" skips the check, so it must never apply to a network nobody checked
+    const moved = h('div', { class: 'dhcp-info warn', hidden: true, role: 'alert', style: { marginTop: '0' } }, TNT.ui.icon('warning'),
+      h('span', null, 'This PC changed networks while this was open, so the check above is out of date. Cancel and check again.'));
+    body.appendChild(moved);
     const cancel = h('button', { class: 'btn', type: 'button' }, TNT.ui.icon('back'), 'Cancel');
     const proceed = h('button', { class: 'btn btn-danger', type: 'button' }, TNT.ui.icon('warning'), 'Proceed anyway');
     let go = false;
+    const ctl = { networkChanged() { proceed.disabled = true; moved.hidden = false; } };
+    danger = ctl;
     const m = TNT.ui.modal({ title: 'Another DHCP server is already active', body, foot: [cancel, proceed],
-      onClose: () => { if (go) turnOn(true); else { renderBadge(); renderToggle(); } } });
+      onClose: () => { if (danger === ctl) danger = null; if (go) turnOn(true); else { renderBadge(); renderToggle(); } } });
     m.el.classList.add('danger');
     const h2 = m.el.querySelector('.modal-head h2');
     if (h2) h2.insertBefore(TNT.ui.icon('warning'), h2.firstChild);
@@ -603,7 +627,8 @@
       const { h } = TNT.util;
       root = el;
       els = {};
-      status = null; busy = false; busyMode = ''; dirty = false; loading = false; unavailable = false; scanError = null;
+      status = null; busy = false; busyMode = ''; dirty = false; loading = false; loadAgain = false; netPending = false; danger = null;
+      unavailable = false; scanError = null;
       const head = h('div', { class: 'section-head' }, h('h2', null, h('span', { class: 'section-accent' }), 'Tools'));
       buildDhcpCard();
       const cards = buildExtraCards();
@@ -628,6 +653,15 @@
       unsubs.push(TNT.api.events.on('hello', () => { if (root) loadStatus(); }));
       tickTimer = setInterval(() => { if (root) refreshCountdowns(); }, 10000);
     },
+    /* This PC changed networks: the DHCP card's adapters, addresses and internet flag (after a start or
+       stop still in flight), an open danger modal, and every tool card below it. */
+    netChanged(info, state) {
+      if (!root) return;
+      for (const m of extras) { try { if (m.netChanged) m.netChanged(info, state); } catch (e) { console.error('tool netChanged failed', e); } }
+      if (danger) danger.networkChanged();
+      if (busy) { netPending = true; return; }
+      loadStatus();
+    },
     update(state) {
       if (!root) return;
       for (const m of extras) { try { if (m.update) m.update(state); } catch (e) { console.error('tool update failed', e); } }
@@ -647,7 +681,8 @@
       if (table) table.destroy();
       for (const m of extras) { try { if (m.unmount) m.unmount(); } catch (e) { /* ignore */ } }
       extras = [];
-      root = null; els = {}; table = null; status = null; busy = false; busyMode = ''; loading = false; scanError = null;
+      root = null; els = {}; table = null; status = null; busy = false; busyMode = ''; loading = false; loadAgain = false; netPending = false; danger = null;
+      scanError = null;
     },
     // exposed for tests
     leaseText,

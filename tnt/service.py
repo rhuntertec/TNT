@@ -534,16 +534,64 @@ def run_console(port: Optional[int] = None, data_dir: Optional[str] = None,
 SELFCHECK_MODULES = (
     # stdlib C extensions whose DLLs a conda-based build can silently miss
     "ctypes", "sqlite3", "ssl", "hashlib", "zlib", "bz2", "lzma", "gzip", "xml.etree.ElementTree",
-    "socket", "select", "json", "http.server",
+    "socket", "select", "json", "http.server", "mmap",
     # every TNT component the engine loads lazily
     "tnt.paths", "tnt.config", "tnt.db", "tnt.events", "tnt.logging_setup", "tnt.icmp", "tnt.netinfo",
     "tnt.arp", "tnt.oui", "tnt.pinger", "tnt.outages", "tnt.speedtest", "tnt.speedtest.cloudflare",
     "tnt.speedtest.fastcom", "tnt.speedtest.scheduler", "tnt.speedtest.patterns",
     "tnt.discovery", "tnt.export_pdf", "tnt.diagnostics", "tnt.api.server", "tnt.api.routes",
-    "tnt.api.sse", "tnt.engine",
+    "tnt.api.sse", "tnt.engine", "tnt.netwatch", "tnt.mmdb", "tnt.geohints", "tnt.geohints_data", "tnt.geoip",
     # third-party packages the service depends on
     "netaddr", "reportlab", "psutil",
 )
+
+
+def _geoip_selfchecks() -> List[Tuple[str, bool, str]]:
+    """IP location pieces a broken frozen bundle would break, checked without the network."""
+    import gzip
+    import shutil
+    import ssl
+    import tempfile
+    import zlib
+
+    out: List[Tuple[str, bool, str]] = []
+    try:
+        from tnt import geohints
+
+        # an invented router name: no real carrier name sits in service code
+        hint = geohints.location_hint("ae3.rtr1.dllstx01.example.net")
+        out.append(("geohints data", hint is not None, str(hint.get("code")) if isinstance(hint, dict) else "no hint"))
+    except Exception as exc:  # noqa: BLE001
+        out.append(("geohints data", False, f"{type(exc).__name__}: {exc}"))
+    try:
+        from tnt import mmdb
+
+        tmp = Path(tempfile.mkdtemp(prefix="tnt-selfcheck-"))
+        try:
+            path = tmp / "selfcheck.mmdb"
+            path.write_bytes(mmdb.SELFCHECK_MMDB)
+            reader = mmdb.Reader(path)
+            try:
+                ok = reader.get(mmdb.SELFCHECK_IP) == mmdb.SELFCHECK_RECORD
+            finally:
+                reader.close()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        out.append(("MMDB reader (mmap)", ok, f"{len(mmdb.SELFCHECK_MMDB)} bytes"))
+    except Exception as exc:  # noqa: BLE001
+        out.append(("MMDB reader (mmap)", False, f"{type(exc).__name__}: {exc}"))
+    try:
+        d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        ok = d.decompress(gzip.compress(b"tnt" * 1000)) == b"tnt" * 1000 and d.eof
+        out.append(("gzip stream", bool(ok), ""))
+    except Exception as exc:  # noqa: BLE001
+        out.append(("gzip stream", False, f"{type(exc).__name__}: {exc}"))
+    try:
+        n = int(ssl.create_default_context().cert_store_stats()["x509_ca"])
+        out.append(("Windows certificate store", n > 0, f"{n} CA certificates"))
+    except Exception as exc:  # noqa: BLE001
+        out.append(("Windows certificate store", False, f"{type(exc).__name__}: {exc}"))
+    return out
 
 
 def selfcheck() -> int:
@@ -627,6 +675,8 @@ def selfcheck() -> int:
         report("PDF report generation", pdf[:4] == b"%PDF", f"{len(pdf)} bytes")
     except Exception as exc:  # noqa: BLE001
         report("PDF report generation", False, f"{type(exc).__name__}: {exc}")
+    for name, ok, detail in _geoip_selfchecks():
+        report(name, ok, detail)
     _out(f"selfcheck: {'PASSED' if failures == 0 else f'{failures} FAILURE(S)'} (frozen={paths.is_frozen()}, exe={sys.executable})")
     return 0 if failures == 0 else 1
 

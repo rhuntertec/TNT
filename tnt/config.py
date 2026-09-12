@@ -21,7 +21,7 @@ from . import paths
 log = logging.getLogger(__name__)
 
 #: 5060 (SIP) is in here so Discovery can categorise desk phones; 554 = RTSP cameras,
-#: 7001 = Digital Watchdog Spectrum media servers, 22 + a Ubiquiti MAC = access points.
+#: 7001 = Digital Watchdog Spectrum media servers, 22 + a Ubiquiti MAC = Ubiquiti gear.
 DEFAULT_PORTS: List[int] = [22, 80, 443, 554, 5060, 7001, 8000, 8080, 8443]
 DEFAULT_EXTRA_TARGETS: List[str] = ["1.1.1.1", "totalelectronics.com"]
 #: Earlier default port lists. A saved config that still holds one of these verbatim was never
@@ -115,9 +115,11 @@ DEFAULTS: Dict[str, Any] = {
         "max_hosts": 4096,
     },
     "retention": {"days": 365},
+    "network": {"poll_s": 5},       # tnt.netwatch: read the adapters' IP configuration this often
     "map": {"internet_host": "totalelectronics.com"},   # second hop of the live link map (Network info)
     "ui": {"theme": "light", "show_ipv6": False},   # Network info hides IPv6 addresses unless asked
     "lan": {"enabled": True},       # Tools > LAN throughput: beacon on UDP 7132, throughput server on TCP 7133
+    "geoip": {"enabled": True},     # IP location + ISP (Network info, Traceroute) from DB-IP Lite: the service downloads ~65 MB a month
     "targets": {"defaults_extra": list(DEFAULT_EXTRA_TARGETS)},
     "dhcp": {                       # Tools > DHCP server (the on/off state is NOT persisted: off after every start)
         "adapter": "",              # adapter name to serve on; "" = auto (first physical Ethernet, else the internet NIC)
@@ -161,6 +163,7 @@ _CLAMPS = {
     "discovery.concurrency": (1, 512),
     "discovery.max_hosts": (1, 65536),
     "retention.days": (7, 3650),
+    "network.poll_s": (2, 60),
     "dhcp.pool_size": (1, 250),
     "dhcp.lease_s": (120, 604800),
     "dhcp.static_prefix": (8, 30),
@@ -268,7 +271,8 @@ def validate(cfg: Dict[str, Any]) -> Dict[str, Any]:
         if v not in allowed:
             _set_path(out, dotted, _get_path(DEFAULTS, dotted))
     # booleans
-    for dotted in ("ping.loaded", "speedtest.enabled", "discovery.resolve_hostnames", "dhcp.ping_check", "ui.show_ipv6", "lan.enabled"):
+    for dotted in ("ping.loaded", "speedtest.enabled", "discovery.resolve_hostnames", "dhcp.ping_check", "ui.show_ipv6", "lan.enabled",
+                   "geoip.enabled"):
         _set_path(out, dotted, bool(_get_path(out, dotted)))
     # ports list
     ports = _get_path(out, "discovery.ports")

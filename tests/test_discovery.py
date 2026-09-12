@@ -204,20 +204,69 @@ class TestDefaultCidr:
         monkeypatch.setattr(discovery, "_internet_ipv4", lambda: ("192.168.1.50", 26))
         assert s.default_cidr() == "192.168.1.0/26"
 
-    def test_falls_back_to_local_guess_then_constant(self, tmp_path, monkeypatch):
+    def test_falls_back_to_another_adapter_then_local_guess_then_none(self, tmp_path, monkeypatch):
         s = discovery.DiscoveryScanner(make_config(tmp_path))
         monkeypatch.setattr(discovery, "_internet_ipv4", lambda: None)
+        # a static bench address without a gateway: no internet NIC, but that adapter's network
+        monkeypatch.setattr(discovery, "_first_up_ipv4", lambda: ("172.16.20.15", 24))
+        monkeypatch.setattr(discovery, "_local_ipv4_guess", lambda: "10.9.9.9")
+        assert s.default_cidr() == "172.16.20.0/24"
+        monkeypatch.setattr(discovery, "_first_up_ipv4", lambda: None)
         monkeypatch.setattr(discovery, "_local_ipv4_guess", lambda: "172.16.9.3")
         assert s.default_cidr() == "172.16.9.0/24"
+        # no IPv4 network at all (IPv6 only, nothing connected): no default, never a made-up 192.168.1.0/24
         monkeypatch.setattr(discovery, "_local_ipv4_guess", lambda: None)
-        assert s.default_cidr() == "192.168.1.0/24"
+        assert s.default_cidr() is None
+
+    def test_a_vpn_tunnel_route_defaults_to_the_lan_adapter(self, tmp_path, monkeypatch):
+        s = discovery.DiscoveryScanner(make_config(tmp_path))
+        monkeypatch.setattr(discovery, "_internet_ipv4", lambda: ("10.8.0.2", 32))      # full-tunnel VPN won the route
+        monkeypatch.setattr(discovery, "_first_up_ipv4", lambda: ("192.168.50.23", 24))
+        assert s.default_cidr() == "192.168.50.0/24"
+        monkeypatch.setattr(discovery, "_first_up_ipv4", lambda: None)                 # nothing better: the tunnel it is
+        assert s.default_cidr() == "10.8.0.2/32"
 
     def test_netinfo_failure_is_tolerated(self, tmp_path, monkeypatch):
         def boom():
             raise RuntimeError("no netinfo")
         monkeypatch.setattr(discovery, "_internet_ipv4", boom)
+        monkeypatch.setattr(discovery, "_first_up_ipv4", boom)
         monkeypatch.setattr(discovery, "_local_ipv4_guess", lambda: "10.1.2.3")
         assert discovery.DiscoveryScanner(make_config(tmp_path)).default_cidr() == "10.1.2.0/24"
+
+    def test_first_up_ipv4_skips_link_local_point_to_point_and_down_adapters(self, monkeypatch):
+        @dataclass
+        class Addr:
+            address: str
+            prefix: int
+            preferred: bool = True
+
+        @dataclass
+        class Nic:
+            ipv4: list
+            is_physical: bool = True
+            is_loopback: bool = False
+
+        calls = []
+
+        def get_adapters(include_down=True, include_loopback=False):
+            calls.append(include_down)
+            return adapters
+
+        adapters = [
+            Nic([Addr("100.64.0.9", 32)], is_physical=False),                  # tunnel /32
+            Nic([Addr("169.254.23.45", 16)]),                                   # self-assigned
+            Nic([Addr("172.16.4.100", 24, preferred=False)]),                   # still tentative
+            Nic([Addr("10.30.0.5", 24)], is_physical=False),                    # virtual switch
+            Nic([Addr("192.168.50.23", 24)]),                                   # the physical LAN adapter
+        ]
+        monkeypatch.setitem(sys.modules, "tnt.netinfo", fake_module("tnt.netinfo", get_adapters=get_adapters))
+        assert discovery._first_up_ipv4() == ("192.168.50.23", 24) and calls == [False]
+        # left with the self-assigned address and a virtual switch (Hyper-V / WSL stay up on every network): no default
+        adapters[:] = adapters[:4]
+        assert discovery._first_up_ipv4() is None
+        adapters[:] = adapters[:3]
+        assert discovery._first_up_ipv4() is None
 
 
 # --------------------------------------------------------------------------- native scan
@@ -629,10 +678,13 @@ class TestHardening:
         holder["nic"] = Nic([Addr("192.168.50.2", 24), Addr("10.0.0.112", 22)])
         monkeypatch.setattr(discovery, "_local_ipv4_guess", lambda: "10.0.0.112")
         assert discovery._internet_ipv4() == ("10.0.0.112", 22)
-        # a preferred APIPA-only adapter is still usable; garbage entries are skipped
+        # garbage entries are skipped, and a self-assigned address never counts: a /24 around it is nothing to scan
+        # (the internet adapter of an IPv6-only network has only that one)
         holder["nic"] = Nic([Addr("not-an-ip", 24), Addr("169.254.1.2", 16)])
         monkeypatch.setattr(discovery, "_local_ipv4_guess", lambda: None)
-        assert discovery._internet_ipv4() == ("169.254.1.2", 16)
+        assert discovery._internet_ipv4() is None
+        holder["nic"] = Nic([Addr("169.254.1.2", 16), Addr("192.168.7.20", 24, preferred=False)])
+        assert discovery._internet_ipv4() == ("192.168.7.20", 24)
         holder["nic"] = Nic([])
         assert discovery._internet_ipv4() is None
 
@@ -749,12 +801,12 @@ class TestClassifyDevice:
         ([80, 554], "Hangzhou Hikvision Digital Technology Co., Ltd.", "Camera"),
         ([7001], None, "DW Server"),
         ([7001, 8000], "Micro-Star INTL CO., LTD.", "DW Server"),
-        ([22], "Ubiquiti Inc.", "Wifi"),
-        ([22, 80, 443], "Ubiquiti Networks Inc.", "Wifi"),
-        ([22, 443], "UBIQUITI INC", "Wifi"),          # the vendor match is case-insensitive
+        ([22], "Ubiquiti Inc.", "Ubiquiti"),
+        ([22, 80, 443], "Ubiquiti Networks Inc.", "Ubiquiti"),
+        ([22, 443], "UBIQUITI INC", "Ubiquiti"),      # the vendor match is case-insensitive
         ([22], "Raspberry Pi Trading Ltd", None),     # plain ssh says nothing about the device
         ([22], None, None),                           # no vendor at all
-        ([80, 443], "Ubiquiti Inc.", None),           # a Ubiquiti box without 22 is not "Wifi"
+        ([80, 443], "Ubiquiti Inc.", None),           # a Ubiquiti box without 22 is not typed
         ([], "Ubiquiti Inc.", None),
         ([], None, None),
         ([80, 443, 8080], "Synology Incorporated", None),
@@ -779,15 +831,15 @@ class TestClassifyDevice:
     def test_router_wins_over_every_service(self, ports, vendor):
         assert discovery.classify_device("10.0.0.251", ports, None, vendor, None, ["10.0.0.251"]) == "Router"
 
-    def test_service_priority_is_dw_camera_phone_wifi(self):
+    def test_service_priority_is_dw_camera_phone_ubiquiti(self):
         # a box that answers on everything is named by the most specific service
         assert discovery.classify_device("10.0.0.5", [22, 5060, 554, 7001], None, "Ubiquiti Inc.") == "DW Server"
         assert discovery.classify_device("10.0.0.5", [22, 5060, 554], None, "Ubiquiti Inc.") == "Camera"
         assert discovery.classify_device("10.0.0.5", [22, 5060], None, "Ubiquiti Inc.") == "Phone"
-        assert discovery.classify_device("10.0.0.5", [22], None, "Ubiquiti Inc.") == "Wifi"
+        assert discovery.classify_device("10.0.0.5", [22], None, "Ubiquiti Inc.") == "Ubiquiti"
 
     def test_every_declared_category_is_reachable(self):
-        assert discovery.DEVICE_TYPES == ["Router", "DW Server", "Camera", "Phone", "Wifi"]
+        assert discovery.DEVICE_TYPES == ["Router", "DW Server", "Camera", "Phone", "Ubiquiti"]
         produced = {
             discovery.classify_device("10.0.0.251", [], gateways=["10.0.0.251"]),
             discovery.classify_device("10.0.0.1", [7001]),
@@ -845,7 +897,7 @@ class TestScanDeviceTypes:
         res = s.scan("10.0.0.1-7", ports=[22, 80, 554, 5060, 7001])
 
         assert {h.ip: h.device_type for h in res.hosts} == {
-            "10.0.0.1": "Router", "10.0.0.2": "Camera", "10.0.0.3": "Phone", "10.0.0.4": "Wifi",
+            "10.0.0.1": "Router", "10.0.0.2": "Camera", "10.0.0.3": "Phone", "10.0.0.4": "Ubiquiti",
             "10.0.0.5": "DW Server", "10.0.0.6": None, "10.0.0.7": None}
         assert res.to_dict()["hosts"][0]["device_type"] == "Router"   # it reaches the API payload
 
@@ -881,7 +933,19 @@ class TestFillDeviceTypes:
             {"ip": "10.0.0.41", "open_ports": []},
         ]
         assert discovery.fill_device_types(rows) is rows
-        assert [r.get("device_type") for r in rows] == ["Router", "Camera", "Camera", "Wifi", None]
+        assert [r.get("device_type") for r in rows] == ["Router", "Camera", "Camera", "Ubiquiti", None]
+
+    def test_types_stored_by_older_versions_are_renamed(self, monkeypatch):
+        def boom():
+            raise AssertionError("renaming a stored type needs no gateways")
+
+        monkeypatch.setitem(sys.modules, "tnt.netinfo", fake_module("tnt.netinfo", get_adapters=boom))
+        rows = [{"ip": "10.0.0.40", "open_ports": [22], "vendor": "Ubiquiti Inc.", "device_type": "Wifi"},
+                {"ip": "10.0.0.41", "open_ports": [554], "device_type": "Camera"},
+                {"ip": "10.0.0.42", "open_ports": [22], "device_type": ["junk"]}]
+        assert discovery.fill_device_types(rows) is rows
+        assert [r["device_type"] for r in rows] == ["Ubiquiti", "Camera", ["junk"]]
+        assert discovery.LEGACY_DEVICE_TYPES == {"Wifi": "Ubiquiti"}
 
     def test_explicit_gateways_skip_the_lookup(self, monkeypatch):
         def boom():
@@ -981,6 +1045,28 @@ class TestDeviceTypePersistence:
             assert db2.get_discovery_run(1)["hosts"][0]["device_type"] is None
         finally:
             db2.close()
+
+    def test_hosts_stored_as_wifi_are_renamed_when_the_database_opens(self, tmp_path):
+        """1.11 and older typed 22 open + a Ubiquiti MAC "Wifi"; the next open renames those rows, and only those."""
+        from tnt.db import Database
+
+        path = tmp_path / "tnt.db"
+        db = Database(path)
+        try:
+            rid = db.add_discovery_run(*self._run([
+                {"ip": "10.0.0.240", "hostname": None, "mac": None, "vendor": "Ubiquiti Inc.", "ping_ok": True,
+                 "rtt_ms": 1.0, "open_ports": [22], "device_type": "Wifi"},
+                {"ip": "10.0.0.35", "hostname": None, "mac": None, "vendor": None, "ping_ok": True,
+                 "rtt_ms": 1.0, "open_ports": [554], "device_type": "Camera"}]))
+        finally:
+            db.close()
+        for _ in range(2):                          # the second open finds nothing left to rename
+            db = Database(path)
+            try:
+                assert {h["ip"]: h["device_type"] for h in db.get_discovery_run(rid)["hosts"]} == {
+                    "10.0.0.240": "Ubiquiti", "10.0.0.35": "Camera"}
+            finally:
+                db.close()
 
     def test_runs_recorded_with_a_removed_method_still_load_and_report(self, tmp_path, monkeypatch, caplog):
         """1.6.x could record ``method = "nmap"``; those runs stay readable after the upgrade (the

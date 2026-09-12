@@ -706,3 +706,91 @@ def test_busy_bad_refused_and_validation(tmp_path):
         a.stop()
         b.stop()
     assert wait_for(lambda: lan_threads() == [], 3.0), lan_threads()
+
+
+# =========================================================================================
+# network changes (tnt.netwatch -> LanPeers.on_network_change)
+# =========================================================================================
+def test_network_change_drops_peers_of_a_left_subnet_and_rematches_the_rest(tmp_path):
+    clock = {"now": 1_700_000_000.0}
+    adapters = [adapter("Ethernet", "10.0.0.5", 24, index=12, gateway="10.0.0.1"), adapter("Wi-Fi", "192.168.1.20", 24, index=7)]
+    lp, events, _cfg = make(tmp_path, adapters=adapters, clock=lambda: clock["now"], ports=(7132, 7133))
+    lp.handle_datagram(lanpeers.encode_beacon("peer-a", "BENCH-A", "1.8.0", 7133, clock["now"]), ("10.0.0.7", 51000))
+    lp.handle_datagram(lanpeers.encode_beacon("peer-b", "OFFICE-PC", "1.8.0", 7133, clock["now"]), ("192.168.1.30", 51000))
+    lp.handle_datagram(lanpeers.encode_beacon("peer-c", "ELSEWHERE", "1.8.0", 7133, clock["now"]), ("172.16.9.9", 51000))
+    assert {p["id"]: p["adapter"] for p in lp.peers()} == {"peer-a": "Ethernet", "peer-b": "Wi-Fi", "peer-c": None}
+    assert lp.peers_view()["self"]["ip"] == "10.0.0.5"
+    # the laptop moves: Ethernet lands on another subnet and a USB adapter joins peer-c's
+    adapters[0] = adapter("Ethernet", "10.20.30.45", 24, index=12, gateway="10.20.30.1")
+    adapters.append(adapter("USB Ethernet", "172.16.9.20", 24, index=31))
+    events.clear()
+    lp.on_network_change({"subnets_changed": True})
+    assert {p["id"]: p["adapter"] for p in lp.peers()} == {"peer-b": "Wi-Fi", "peer-c": "USB Ethernet"}
+    assert [e["type"] for e in events] == ["lan.peers", "lan.state"]
+    assert [p["id"] for p in events[0]["data"]["peers"]] == ["peer-c", "peer-b"]
+    assert events[1]["data"]["self"]["ip"] == "10.20.30.45", "the cached self address was dropped"
+    assert lp._beacon_wake.is_set()
+    # nothing left to re-match: only the view goes out
+    events.clear()
+    lp.on_network_change({})
+    assert [e["type"] for e in events] == ["lan.state"]
+
+
+def test_this_pc_without_an_internet_adapter_is_an_address_the_beacons_leave_from():
+    """A bench cable (static or self-assigned addresses, no default route): "This PC" still names an address, a
+    physical adapter's before a virtual switch's and a routable one before 169.254.x.x; never a /32 tunnel or a down
+    adapter."""
+    switch = adapter("vEthernet (Example Switch)", "172.29.64.1", 20, index=30)
+    switch.is_physical = False
+    tunnel = adapter("Example VPN", "100.64.0.9", 32, index=40)
+    down = adapter("Wi-Fi", "192.168.1.20", 24, index=7, status="down")
+    apipa = adapter("Ethernet", "169.254.23.45", 16, index=12)
+    bench = adapter("Ethernet 2", "172.16.20.15", 24, index=18)
+    assert lanpeers._bench_ipv4([switch, tunnel, down, apipa]) == "169.254.23.45"
+    assert lanpeers._bench_ipv4([switch, tunnel, down, apipa, bench]) == "172.16.20.15"
+    assert lanpeers._bench_ipv4([tunnel, switch]) == "172.29.64.1"
+    assert lanpeers._bench_ipv4([tunnel, down]) is None and lanpeers._bench_ipv4([]) is None
+
+
+def test_network_change_sends_the_next_beacon_at_once(tmp_path):
+    lp, _events, _cfg = make(tmp_path)
+    sent: List[float] = []
+    lp.send_beacon = lambda: sent.append(time.monotonic()) or 0
+    lp.start()
+    try:
+        assert wait_for(lambda: len(sent) == 1)
+        time.sleep(0.2)
+        assert len(sent) == 1                                   # the next one is BEACON_INTERVAL_S away
+        lp.on_network_change({})
+        assert wait_for(lambda: len(sent) == 2, 2.0) and sent[1] - sent[0] < 2.0
+    finally:
+        lp.stop()
+    assert wait_for(lambda: lan_threads() == [], 3.0), lan_threads()
+
+
+def test_a_failed_adapter_read_during_a_network_change_keeps_the_peers_and_is_retried(tmp_path):
+    clock = {"now": 1_700_000_000.0}
+    adapters = [adapter("Ethernet", "10.20.0.50", 24, index=12, gateway="10.20.0.1")]
+    lp, events, _cfg = make(tmp_path, adapters=adapters, clock=lambda: clock["now"], ports=(7132, 7133))
+    lp.handle_datagram(lanpeers.encode_beacon("bench-peer-a", "BENCH-A", "1.8.0", 7133, clock["now"]), ("10.20.0.77", 51000))
+    assert {p["id"]: p["adapter"] for p in lp.peers()} == {"bench-peer-a": "Ethernet"}
+    failures = {"left": 1}
+
+    def flaky() -> List[Any]:
+        if failures["left"]:
+            failures["left"] -= 1
+            raise OSError(31, "simulated GetAdaptersAddresses failure")
+        return adapters
+
+    lp._adapters_fn = flaky
+    events.clear()
+    lp.on_network_change({})
+    assert {p["id"]: p["adapter"] for p in lp.peers()} == {"bench-peer-a": "Ethernet"}, "a failed read is not 'no subnets'"
+    assert [e["type"] for e in events] == ["lan.state"] and lp._rematch_pending is True
+    # the beacon thread matches the peers again before its next beacon; this time the network really changed
+    adapters[0] = adapter("Ethernet", "192.168.77.23", 24, index=12, gateway="192.168.77.1")
+    stop = threading.Event()
+    lp.send_beacon = lambda: (stop.set(), lp._beacon_wake.set(), 0)[-1]
+    lp._beacon_loop(stop)
+    assert lp.peers() == [] and lp._rematch_pending is False
+    assert [e["type"] for e in events][-1] == "lan.peers"

@@ -31,6 +31,14 @@ Safety first (the things that can bite when a second DHCP server appears on a LA
   is to reach the device from this PC, not to route it to the internet.
 * Every worker thread is wrapped so a malformed packet, a dead socket or a broken
   netsh can never kill the server thread or the service.
+* The serving NIC is watched: a network change (``on_network_change``, called by the Engine
+  for ``net.changed``) that took that adapter down, removed it or took the server address off
+  it stops the server on a helper thread (netsh and the joins take seconds; never on the
+  watcher's thread) and says why in ``status()["error"]`` ("stopped: Ethernet went down");
+  ``stop()`` restores the NIC as usual.  While the server re-addresses the NIC itself,
+  :meth:`DhcpServer.own_change` names the adapter, the static address and the phase
+  (``applying`` / ``serving`` / ``restoring``, then ``restored`` for 30 s while the lease comes
+  back) so the network watcher labels that change as TNT's own rather than a foreign one.
 
 Windows socket facts this code relies on (measured on Windows 11):
 
@@ -146,10 +154,12 @@ PROBE_DELAY_S = 2.0
 REPROBE_AFTER_S = 600.0
 NIC_SETTLE_S = 6.0
 NETSH_TIMEOUT_S = 20.0
+#: How long after putting a NIC back on DHCP its changes (the returning lease) still count as TNT's own.
+OWN_CHANGE_GRACE_S = 30.0
 #: ``IP_DAD_STATE`` values (``tnt.netinfo.IpAddr.dad_state``): a freshly set address is
 #: *tentative* while Windows runs duplicate-address detection, then *preferred* -- or
 #: *duplicate* when another host already answers for it.  Only a preferred address can be bound.
-IP_DAD_STATE_DUPLICATE = 3
+IP_DAD_STATE_DUPLICATE = 2      # NL_DAD_STATE: 1 tentative, 2 duplicate, 3 deprecated, 4 preferred
 IP_DAD_STATE_PREFERRED = 4
 #: How many service starts may fail to restore a re-addressed NIC before the record is dropped
 #: (the adapter was removed from the machine, typically a USB NIC).
@@ -1730,11 +1740,38 @@ class DhcpServer:
         # set once the NIC-bound socket has delivered a request: from then on the wildcard
         # socket is only a safety net (see _wildcard_accepts)
         self._specific_seen = False
+        # what this server is doing to a NIC right now (own_change), and until when "restored" lasts
+        self._own_change: Optional[Dict[str, Any]] = None
+        self._own_change_until: Optional[float] = None
 
     # -- small helpers ------------------------------------------------------------------
     @property
     def running(self) -> bool:
         return self._running
+
+    def own_change(self) -> Optional[Dict[str, Any]]:
+        """What this server is doing to a NIC right now, for the network watcher:
+        ``{"adapter", "index", "mac", "guid", "static_ip", "phase"}`` with phase ``applying`` (netsh
+        is switching it to the static address), ``serving``, ``restoring`` (going back to DHCP) or
+        ``restored`` (for :data:`OWN_CHANGE_GRACE_S` afterwards, while the lease returns); ``None``
+        when it touches no NIC."""
+        with self._lock:
+            marker, until = self._own_change, self._own_change_until
+        if marker is None or (until is not None and float(self._clock()) > until):
+            return None
+        return dict(marker)
+
+    def _set_own_change(self, adapter: Any, static_ip: Optional[str], phase: Optional[str]) -> None:
+        with self._lock:
+            if adapter is None or not phase:
+                self._own_change, self._own_change_until = None, None
+                return
+            self._own_change = {
+                "adapter": str(getattr(adapter, "name", "") or ""), "index": getattr(adapter, "index", None),
+                "mac": _normalize_mac(getattr(adapter, "mac", None)), "guid": str(getattr(adapter, "guid", "") or ""),
+                "static_ip": static_ip, "phase": phase,
+            }
+            self._own_change_until = float(self._clock()) + OWN_CHANGE_GRACE_S if phase == "restored" else None
 
     def _cfg(self, key: str, default: Any) -> Any:
         try:
@@ -2029,6 +2066,8 @@ class DhcpServer:
             changed = False
             try:
                 if will_change:
+                    # the network watcher sees this re-address as TNT's own (own_change)
+                    self._set_own_change(adapter, server_ip, "applying")
                     self._nic.set_static(name, server_ip, prefix)
                     changed = True
                     own_ips.add(server_ip)
@@ -2060,6 +2099,8 @@ class DhcpServer:
                     self._probe_q = queue.Queue()
                     self._running = True
                     self._since_ts = self._clock()
+                    if changed:
+                        self._set_own_change(adapter, server_ip, "serving")
                     self._rx_thread = threading.Thread(target=self._rx_loop, args=(stop_evt,), name="tnt-dhcp-rx", daemon=True)
                     self._probe_thread = threading.Thread(target=self._probe_loop, args=(stop_evt,), name="tnt-ping-dhcp-probe", daemon=True)
                     self._rx_thread.start()
@@ -2070,10 +2111,13 @@ class DhcpServer:
                 with self._lock:
                     self._running = False
                 if changed:
+                    self._set_own_change(adapter, server_ip, "restoring")
                     try:
                         self._nic.restore_dhcp(name, expect_gone=server_ip)
                     except Exception:  # noqa: BLE001
                         log.exception("could not restore '%s' after a failed start", name)
+                if changed or will_change:
+                    self._set_own_change(adapter, server_ip, "restored")   # set_static may have undone it itself
                 with self._lock:
                     self._error = str(exc)
                 self._publish_state()
@@ -2100,6 +2144,7 @@ class DhcpServer:
                 self._running = False
                 rx, pb = self._rx_thread, self._probe_thread
                 self._rx_thread = self._probe_thread = None
+                adapter = self._adapter
                 name = str(getattr(self._adapter, "name", "")) if self._adapter is not None else ""
                 changed = self._nic_changed
                 server_ip = self._server_ip
@@ -2111,6 +2156,7 @@ class DhcpServer:
             # race the database close -- and only then the thread joins.
             self._close_sockets()
             if changed and restore_nic:
+                self._set_own_change(adapter, server_ip, "restoring")
                 try:
                     if self._nic.restore_dhcp(name, expect_gone=server_ip):
                         with self._lock:
@@ -2120,6 +2166,9 @@ class DhcpServer:
                             self._warning = f"adapter '{name}' could not be put back on DHCP; it will be restored at the next service start"
                 except Exception:  # noqa: BLE001
                     log.exception("restore of '%s' failed", name)
+                self._set_own_change(adapter, server_ip, "restored")
+            else:
+                self._set_own_change(None, None, None)
             deadline = time.monotonic() + STOP_JOIN_S
             for t in (rx, pb):
                 if t is not None and t.is_alive() and t is not threading.current_thread():
@@ -2133,6 +2182,104 @@ class DhcpServer:
                 self._db_event("info", "DHCP server stopped")
             self._publish_state()
             return self.status()
+
+    # -- network changes ----------------------------------------------------------------
+    def on_network_change(self, data: Optional[Dict[str, Any]] = None) -> None:
+        """``net.changed`` (network watcher thread; quick, never raises).  While serving, check that
+        the serving NIC is still present, up and holding the server address; when it is not, stop
+        on a helper thread with the reason in ``status()["error"]``.  Otherwise addresses another
+        NIC gained join the own-address filter."""
+        try:
+            with self._lock:
+                running, adapter, server_ip = self._running, self._adapter, self._server_ip
+            if not running or adapter is None or not server_ip:
+                return
+            pool = _get_adapters(self._adapters_fn)
+            problem = self._serving_problem(adapter, server_ip, pool)
+            if problem is None:
+                ips = {ip for a in pool for ip, _p in _adapter_ipv4s(a)}
+                macs = {m for m in (_normalize_mac(getattr(a, "mac", None)) for a in pool) if m}
+                with self._lock:
+                    if self._running:
+                        self._own_ips = self._own_ips | ips
+                        self._own_macs = self._own_macs | macs
+                return
+            log.warning("DHCP server is stopping: %s", problem)
+            gone = self._same_nic(adapter, pool) is None
+            threading.Thread(target=self._stop_for_network, args=(problem, gone), name="tnt-dhcp-netstop",
+                             daemon=True).start()
+        except Exception:  # noqa: BLE001
+            log.exception("handling a network change in the DHCP server failed")
+
+    @staticmethod
+    def _same_nic(adapter: Any, pool: Sequence[Any]) -> Any:
+        """*adapter* in a fresh enumeration: by GUID, then index and name together, then MAC and
+        name, then name, MAC or index alone (a USB NIC re-plugged elsewhere keeps its MAC but may
+        get a new index; a virtual switch can clone a physical NIC's MAC)."""
+        guid = str(getattr(adapter, "guid", "") or "").lower()
+        mac = _normalize_mac(getattr(adapter, "mac", None))
+        index = getattr(adapter, "index", None)
+        name = str(getattr(adapter, "name", "") or "")
+
+        def same_name(a: Any) -> bool:
+            return bool(name) and str(getattr(a, "name", "") or "") == name
+
+        def same_mac(a: Any) -> bool:
+            return bool(mac) and _normalize_mac(getattr(a, "mac", None)) == mac
+
+        def same_index(a: Any) -> bool:
+            return bool(index) and getattr(a, "index", None) == index
+
+        rules = (
+            lambda a: bool(guid) and str(getattr(a, "guid", "") or "").lower() == guid,
+            lambda a: same_index(a) and same_name(a),
+            lambda a: same_mac(a) and same_name(a),
+            same_name, same_mac, same_index,
+        )
+        for rule in rules:
+            for a in pool:
+                if rule(a):
+                    return a
+        return None
+
+    @classmethod
+    def _serving_problem(cls, adapter: Any, server_ip: str, pool: Sequence[Any]) -> Optional[str]:
+        """Why the server can no longer serve from *adapter* / *server_ip* (plain text), else ``None``."""
+        name = str(getattr(adapter, "name", "") or "") or "the adapter"
+        current = cls._same_nic(adapter, pool)
+        if current is None:
+            return f"{name} is no longer present"
+        if not bool(getattr(current, "is_up", True)):
+            return f"{name} went down"
+        if server_ip not in [ip for ip, _p in _adapter_ipv4s(current)]:
+            return f"{name} no longer has {server_ip}"
+        return None
+
+    def _stop_for_network(self, problem: str, gone: bool = False) -> None:
+        """Stop because of *problem*.  An adapter that is *gone* (a USB NIC pulled out) is not put
+        back on DHCP: its temporary address was set with ``store=active``, which went away with the
+        interface, so there is nothing to restore (netsh would only fail) and no start-time restore
+        is left behind for it."""
+        with self._lock:
+            if not self._running:
+                return
+            self._error = f"stopped: {problem}"
+            name = str(getattr(self._adapter, "name", "") or "") or "The adapter"
+            changed = self._nic_changed
+        self._db_event("warning", f"DHCP server stopped: {problem}")
+        try:
+            self.stop(restore_nic=not gone)
+            if gone and changed:
+                try:
+                    self._nic.clear_record()
+                except Exception:  # noqa: BLE001
+                    log.exception("could not clear %s", NIC_CHANGED_META)
+                with self._lock:
+                    self._nic_changed = False
+                    self._warning = f"{name} was removed; its temporary address went with it"
+                self._publish_state()
+        except Exception:  # noqa: BLE001
+            log.exception("stopping the DHCP server after a network change failed")
 
     def _load_leases(self) -> None:
         if self._db is None:

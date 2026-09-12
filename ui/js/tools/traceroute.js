@@ -3,6 +3,9 @@
    a sticker path map (This PC -> one node per hop -> destination) that fills in live from the
    trace.hop events, a compact hop table and a summary line. The last trace is restored from
    GET /api/tools/traceroute/last on mount. Cancel is client-side only: the service keeps tracing.
+   The table has a Location column (city from the IP location data or the router's name, marked
+   "router name"), the DB-IP attribution under the table, and a note when IP location is off or
+   has no data.
    Loaded before app.js: TNT.util / TNT.ui are only touched inside functions. */
 (function () {
   'use strict';
@@ -61,6 +64,37 @@
     return { text, cls: trace.complete ? 'ok' : 'warn' };
   }
 
+  /** Pure: a place name for comparing (case- and accent-insensitive: "Düsseldorf" equals "Dusseldorf"). */
+  function placeKey(s) { return String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase(); }
+  /** { text, title, src, label } for a hop's Location cell (text null -> a dash with the title), or null (a plain dash).
+   *  src is 'router name' when the text comes from the hop's name; label is the screen-reader sentence. */
+  function hopLocation(hop) {
+    const loc = hop && hop.location;
+    if (!hop || !hop.ip || !loc || typeof loc !== 'object') return null;
+    const as = loc.asn != null ? 'AS' + loc.asn + (loc.as_org ? ' ' + loc.as_org : '') : (loc.as_org || '');
+    let why;
+    if (loc.source === 'hostname') {
+      why = 'From the router name' + (loc.hint ? ' "' + loc.hint + '"' : '');
+      if (loc.db_text) why += placeKey(loc.db_text) === placeKey(loc.text) ? ' (the IP location database agrees)' : ' (IP location database: ' + loc.db_text + ')';
+    } else if (loc.source === 'database') why = 'From the IP location database';
+    else why = 'No city known for this address';
+    const text = loc.text || null;
+    const title = [why, as].filter(Boolean).join(' · ');
+    return { text, title, src: text && loc.source === 'hostname' ? 'router name' : null, label: (text || 'No location') + '. ' + title };
+  }
+  /** Whether the DB-IP attribution shows under the table: any hop whose location has a text or an AS number. */
+  function hasLocations(hops) { return (hops || []).some((hp) => { const l = hp && hp.ip && hp.location; return !!(l && typeof l === 'object' && (l.text || l.asn != null)); }); }
+  /** Whether any shown location comes from a router name (the attribution line then explains the marker). */
+  function hasRouterNames(hops) { return (hops || []).some((hp) => { const l = hopLocation(hp); return !!(l && l.src); }); }
+  /** Pure: the note under the table when locations cannot show; null when they can, or for an older service. */
+  function locationNote(geoip) {
+    if (!geoip || typeof geoip !== 'object') return null;
+    if (!geoip.enabled) return 'Location is off (Settings › IP location)';
+    if (geoip.available) return null;
+    if (geoip.state === 'downloading') return 'Location: downloading the IP location data…';
+    return 'Location: no IP location data yet (Settings › IP location)';
+  }
+
   /* ------------------------------------------------------------- card */
   function create() {
     const { h } = TNT.util;
@@ -109,9 +143,13 @@
     const th = (t, cls) => h('th', { class: cls || null }, t);
     els.tableWrap = h('div', { class: 'table-wrap', hidden: true },
       h('table', { class: 'table tr-table' },
-        h('thead', null, h('tr', null, th('Hop', 'num'), th('IP'), th('Hostname'), th('Min', 'num'), th('Avg', 'num'), th('Max', 'num'), th('Loss', 'num'), th('Kind'))),
+        h('thead', null, h('tr', null, th('Hop', 'num'), th('IP'), th('Hostname'), th('Location'), th('Min', 'num'), th('Avg', 'num'), th('Max', 'num'), th('Loss', 'num'), th('Kind'))),
         els.tbody));
-    const body = h('div', { class: 'tool-body' }, form, els.options, els.summary, els.map, els.tableWrap);
+    // why the Location column is empty (IP location off or no data yet), and the DB-IP credit under the table
+    els.note = h('div', { class: 'tr-note muted', hidden: true });
+    els.attribNote = h('span', { class: 'muted', hidden: true }, ' · locations marked “router name” come from the hop’s name, not from DB-IP');
+    els.attrib = h('div', { class: 'tr-attrib', hidden: true }, TNT.ui.geoAttribution ? TNT.ui.geoAttribution() : null, els.attribNote);
+    const body = h('div', { class: 'tool-body' }, form, els.options, els.summary, els.map, els.tableWrap, els.note, els.attrib);
 
     function toggleOptions() {
       const open = els.options.hidden;
@@ -194,11 +232,29 @@
           h('td', { class: 'num strong' }, String(hop.ttl)),
           h('td', null, hop.ip ? copyCode(hop.ip) : h('span', { class: 'muted' }, '* * *')),
           h('td', { class: 'wrap' }, hop.hostname ? h('span', { class: 'muted', title: hop.hostname }, hop.hostname) : h('span', { class: 'muted' }, '—')),
+          (() => { const l = hopLocation(hop);
+            if (!l || !l.text) return h('td', { class: 'tr-loc', title: l ? l.title : null },
+              h('span', { class: 'muted', 'aria-hidden': 'true' }, '—'), h('span', { class: 'sr-only' }, l ? l.label : 'No location'));
+            return h('td', { class: 'tr-loc', title: l.title },
+              h('span', null, l.text),
+              l.src ? h('span', { class: 'tr-loc-src muted', 'aria-hidden': 'true' }, l.src) : null,
+              h('span', { class: 'sr-only' }, '. ' + l.title)); })(),
           num(hop.min_ms), h('td', { class: 'num strong ' + rttClass(hop.avg_ms) }, hop.avg_ms == null ? '—' : fmtMs(hop.avg_ms)), num(hop.max_ms),
           h('td', { class: 'num' + (hop.loss ? ' strong red' : '') }, (hop.loss || 0) + '/' + probes),
           h('td', null, h('span', { class: 'badge ' + (hop.ip ? (KIND_BADGE[hop.kind] || 'grey') : 'grey') }, hopLabel(hop))));
         els.tbody.appendChild(tr);
       }
+      renderGeoNote();
+    }
+    // the note follows status.geoip (update() calls this); the attribution depends only on the hops
+    function renderGeoNote() {
+      const hops = (trace && trace.hops) || [];
+      const geoip = TNT.state && TNT.state.status ? TNT.state.status.geoip : null;
+      const note = hops.length ? locationNote(geoip) : null;
+      if (els.note.hidden !== !note) els.note.hidden = !note;
+      if (els.note.textContent !== (note || '')) els.note.textContent = note || '';
+      els.attrib.hidden = !(hops.length && hasLocations(hops));
+      els.attribNote.hidden = !hasRouterNames(hops);
     }
     function render() {
       if (!mounted) return;
@@ -314,7 +370,7 @@
         unsubs.push(TNT.api.events.on('trace.done', onDone));
         unsubs.push(TNT.api.events.on('hello', () => { if (mounted && !ownRun) loadLast(); }));
       },
-      update() { /* nothing follows the status snapshot */ },
+      update() { if (mounted) renderGeoNote(); },   // IP location switched on/off or its data arrived
       unmount() {
         mounted = false;
         for (const u of unsubs) { try { u(); } catch (e) { /* ignore */ } }
@@ -325,5 +381,6 @@
     };
   }
 
-  TNT.tools.traceroute = { create, rttClass, hopIcon, hopLabel, mergeHop, summaryText, RTT_WARN_MS, RTT_BAD_MS };
+  TNT.tools.traceroute = { create, rttClass, hopIcon, hopLabel, mergeHop, summaryText, hopLocation, hasLocations,
+    hasRouterNames, locationNote, RTT_WARN_MS, RTT_BAD_MS };
 })();

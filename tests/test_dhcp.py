@@ -61,7 +61,7 @@ class FakePinger:
 
 
 #: ``IP_DAD_STATE`` values: 1 = tentative (duplicate-address detection running), 3 = duplicate, 4 = preferred
-DAD_TENTATIVE, DAD_DUPLICATE, DAD_PREFERRED = 1, 3, 4
+DAD_TENTATIVE, DAD_DUPLICATE, DAD_DEPRECATED, DAD_PREFERRED = 1, 2, 3, 4
 
 
 def ipaddr(address: str, prefix: int, dad_state: int = DAD_PREFERRED) -> IpAddr:
@@ -2018,3 +2018,134 @@ def test_loopback_end_to_end(tmp_path, monkeypatch):
         client.close()
         srv.stop()
         db.close()
+
+
+# =========================================================================================
+# network changes: TNT's own NIC moves, and a serving NIC that goes away
+# =========================================================================================
+def test_own_change_marker_through_start_and_stop(tmp_path, fast_scan):
+    sim = NicSim([adapter()])
+    srv, events, factory, db, cfg, clock = make_server(tmp_path, sim)
+    phases: List[Tuple[str, Optional[str]]] = []
+    real = sim.__call__
+
+    def recording(argv, **kw):
+        if argv[1:5] == ["interface", "ipv4", "set", "address"]:
+            phases.append((argv[6], (srv.own_change() or {}).get("phase")))
+        return real(argv, **kw)
+
+    srv._nic._runner = recording
+    try:
+        assert srv.own_change() is None
+        srv.start(force=True)
+        assert phases == [("source=static", "applying")]
+        assert srv.own_change() == {"adapter": "Ethernet", "index": 12, "mac": NIC_MAC, "guid": "",
+                                    "static_ip": "172.16.4.100", "phase": "serving"}
+        srv.stop()
+        assert phases[-1] == ("source=dhcp", "restoring") and srv.own_change()["phase"] == "restored"
+        clock.t += dhcp.OWN_CHANGE_GRACE_S + 1                  # the lease is back: no longer TNT's own
+        assert srv.own_change() is None
+    finally:
+        srv.stop()
+        db.close()
+    # a static adapter serves from its own address: TNT changes nothing, so there is no marker
+    (tmp_path / "static").mkdir()
+    sim2 = NicSim([adapter(dhcp_enabled=False)])
+    srv2, _events2, _factory2, db2, _cfg2, _clock2 = make_server(tmp_path / "static", sim2)
+    try:
+        srv2.start(force=True)
+        assert srv2.running and srv2.own_change() is None
+        srv2.stop()
+        assert srv2.own_change() is None
+    finally:
+        srv2.stop()
+        db2.close()
+
+
+def test_serving_nic_going_down_stops_the_server_and_says_why(tmp_path, fast_scan):
+    sim = NicSim([adapter()])
+    srv, events, factory, db, cfg, clock = make_server(tmp_path, sim)
+    try:
+        srv.start(force=True)
+        eth = sim.find("Ethernet")
+        eth.status, eth.ipv4 = "down", []                       # the cable was pulled while serving
+        events.clear()
+        srv.on_network_change({"changes": [{"adapter": "Ethernet", "kind": "down", "old": "up", "new": "down"}]})
+        assert wait_for(lambda: not srv.running and srv.status()["error"], 5.0)
+        # stop() runs on its own thread and publishes dhcp.state once it has restored the NIC and joined
+        assert wait_for(lambda: not any(t.name == "tnt-dhcp-netstop" and t.is_alive() for t in threading.enumerate()), 5.0)
+        st = srv.status()
+        assert st["running"] is False and st["error"] == "stopped: Ethernet went down"
+        assert srv.summary()["error"] == "stopped: Ethernet went down"
+        assert any(c[5:7] == ["name=Ethernet", "source=dhcp"] for c in sim.commands), "the NIC went back on DHCP"
+        assert not db.get_meta("dhcp.nic_changed")
+        assert any(e["type"] == "dhcp.state" and e["data"]["running"] is False and e["data"]["error"] for e in events)
+        assert any(e["category"] == "dhcp" and "Ethernet went down" in e["message"] for e in db.list_events(10))
+        eth.status = "up"                                       # plugged back in: the next start clears the reason
+        assert srv.start(force=True)["error"] is None
+    finally:
+        srv.stop()
+        db.close()
+
+
+def test_losing_the_server_address_or_the_nic_stops_the_server(tmp_path, fast_scan):
+    sim = NicSim([adapter()])
+    srv, events, factory, db, cfg, clock = make_server(tmp_path, sim)
+    try:
+        srv.start(force=True)
+        sim.find("Ethernet").ipv4 = [ipaddr("192.168.50.23", 24)]      # re-addressed by hand
+        srv.on_network_change({})
+        assert wait_for(lambda: not srv.running, 5.0)
+        assert srv.status()["error"] == "stopped: Ethernet no longer has 172.16.4.100"
+    finally:
+        srv.stop()
+        db.close()
+    (tmp_path / "usb").mkdir()
+    sim2 = NicSim([adapter(name="USB Ethernet", mac="02:00:5E:10:00:1F", index=31)])
+    srv2, _events2, _factory2, db2, _cfg2, _clock2 = make_server(tmp_path / "usb", sim2)
+    try:
+        srv2.start(force=True)
+        assert json.loads(db2.get_meta("dhcp.nic_changed"))["adapter"] == "USB Ethernet"
+        sim2.adapters.clear()                                           # the USB adapter was pulled out
+        commands = len(sim2.commands)
+        srv2.on_network_change({})
+        assert wait_for(lambda: not srv2.running, 5.0)
+        assert wait_for(lambda: not any(t.name == "tnt-dhcp-netstop" and t.is_alive() for t in threading.enumerate()), 5.0)
+        st = srv2.status()
+        assert st["error"] == "stopped: USB Ethernet is no longer present"
+        # its temporary address was set with store=active and went away with the adapter: no netsh restore that can only
+        # fail, no misleading "could not be put back" warning and no record left for the next service start
+        assert not any("source=dhcp" in c for c in sim2.commands[commands:])
+        assert st["warning"] == "USB Ethernet was removed; its temporary address went with it"
+        assert not db2.get_meta("dhcp.nic_changed")
+    finally:
+        srv2.stop()
+        db2.close()
+
+
+def test_a_network_change_that_keeps_the_serving_nic_is_harmless(tmp_path, fast_scan):
+    sim = NicSim([adapter()])
+    srv, events, factory, db, cfg, clock = make_server(tmp_path, sim)
+    try:
+        srv.on_network_change({})                                       # not running: nothing to look at
+        srv.start(force=True)
+        sim.adapters.append(adapter(name="Wi-Fi", ip="192.168.50.23", mac="02:00:5E:10:00:07", index=7, if_type=71,
+                                    gateway="192.168.50.1"))
+        srv.on_network_change({"changes": [{"adapter": "Wi-Fi", "kind": "up", "old": "down", "new": "up"}]})
+        time.sleep(0.2)
+        assert srv.running and srv.status()["error"] is None
+        assert "192.168.50.23" in srv._own_ips and "02:00:5E:10:00:07" in srv._own_macs
+    finally:
+        srv.stop()
+        db.close()
+
+
+def test_same_nic_follows_guid_index_and_name_before_a_cloned_mac():
+    eth = adapter(index=12)
+    replugged = adapter(index=19)                                       # same name and MAC, new IfIndex
+    vswitch = adapter(name="vEthernet (External)", index=40)            # a virtual switch cloning the MAC
+    assert dhcp.DhcpServer._same_nic(eth, [vswitch, replugged]) is replugged
+    renamed = adapter(name="Office LAN", index=12)
+    eth.guid = renamed.guid = "{0D7C1A00-0000-4000-8000-00000000B002}"
+    assert dhcp.DhcpServer._same_nic(eth, [vswitch, renamed]) is renamed
+    assert dhcp.DhcpServer._same_nic(eth, []) is None

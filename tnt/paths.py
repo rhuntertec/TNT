@@ -38,6 +38,10 @@ def exports_dir() -> Path:
     return data_dir() / "exports"
 
 
+def geoip_dir() -> Path:
+    return data_dir() / "geoip"
+
+
 def config_path() -> Path:
     return data_dir() / "config.json"
 

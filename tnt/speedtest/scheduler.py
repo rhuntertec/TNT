@@ -65,12 +65,20 @@ Scheduler behaviour
   ``speedtest.progress`` ``{"phase","pct"}`` and ``speedtest.done``
   ``{"result": <SpeedResult dict + "id">, "trigger"}``; the result is persisted
   via ``db.add_speedtest`` and a ``warning`` event row is written on failure.
-  The one exception is a run cut short by :meth:`SpeedScheduler.stop` (error
-  ``"cancelled"``): it is not a measurement, so it is neither persisted nor
-  counted as a failure (``speedtest.done`` is still published so the UI resets).
+  The one exception is a run cut short by :meth:`SpeedScheduler.stop` or
+  :meth:`SpeedScheduler.cancel_current` (error ``"cancelled"``): it is not a
+  measurement, so it is neither persisted nor counted as a failure
+  (``speedtest.done`` is still published so the UI resets).
+* :meth:`cancel_current` cuts only the run in progress short and leaves the
+  scheduler running (a cancelled Full Scan stops the test it started itself,
+  ``tnt.reports``).
 * ``clock`` is injectable; the loop polls the clock every ``poll_s`` (1 s by
   default) so a fake clock can drive tests. The cooldown registry keeps its
   own clock (``base.cooldown_clock``); tests patch both to the same fake.
+* networks (ARCHITECTURE 3.20): ``SpeedScheduler(..., network_fn=)`` gives the
+  network this PC is on; a run reads it when it starts (with ``ts``) and the
+  stored row carries it (``add_speedtest`` ``network_id``). The published
+  result dict is unchanged. Without *network_fn* nothing is tagged.
 """
 from __future__ import annotations
 
@@ -271,12 +279,14 @@ class SpeedScheduler:
     IDLE_PROGRESS: Dict[str, Any] = {"phase": "idle", "pct": 0.0}
 
     def __init__(self, db: Any, config: Any, bus: Any, clock: Callable[[], float] = time.time,
-                 internet_down: Optional[Callable[[], bool]] = None, poll_s: float = 1.0) -> None:
+                 internet_down: Optional[Callable[[], bool]] = None, poll_s: float = 1.0,
+                 network_fn: Optional[Callable[[], Optional[int]]] = None) -> None:
         self._db = db
         self._config = config
         self._bus = bus
         self._clock = clock
         self._internet_down = internet_down
+        self._network_fn = network_fn       # the current network id (tnt.networks); None: results are not tagged
         self._poll_s = max(0.005, float(poll_s))
         self._lock = threading.RLock()
         self._stop = threading.Event()
@@ -548,6 +558,18 @@ class SpeedScheduler:
             raise
         return True
 
+    def cancel_current(self) -> bool:
+        """Cut the run in progress short; True when one was running.  Unlike :meth:`stop` the scheduler
+        keeps going.  The run ends with error ``"cancelled"``, is not persisted and still publishes
+        ``speedtest.done``."""
+        with self._lock:
+            cancel = self._cancel if self._running else None
+        if cancel is None:
+            return False
+        cancel.set()
+        log.info("speed test cancel requested")
+        return True
+
     def _on_progress(self, phase: str, frac: float) -> None:
         try:
             pct = max(0.0, min(1.0, float(frac)))
@@ -574,9 +596,21 @@ class SpeedScheduler:
         return {"backend": result.backend, "error": result.error, "retry_after_s": raw.get("retry_after_s"),
                 "http_status": raw.get("http_status")}
 
+    def _network_id(self) -> Optional[int]:
+        fn = self._network_fn
+        if fn is None:
+            return None
+        try:
+            nid = fn()
+        except Exception:  # noqa: BLE001
+            log.debug("the current network id could not be read", exc_info=True)
+            return None
+        return nid if isinstance(nid, int) and not isinstance(nid, bool) and nid > 0 else None
+
     def _execute(self, trigger: str) -> None:
         """Run one test (the running flag must already be claimed via ``_begin``)."""
         ts = float(self._clock())
+        network_id = self._network_id()     # the network the test starts on
         with self._lock:
             cancel = self._cancel if self._cancel is not None else threading.Event()
             self._cancel = cancel
@@ -622,7 +656,7 @@ class SpeedScheduler:
                 self._rate_limited_outcome(trigger, ts, refused or [self._refusal(result)])
             else:
                 try:
-                    d["id"] = self._db.add_speedtest(d)
+                    d["id"] = self._db.add_speedtest(d if network_id is None else {**d, "network_id": network_id})
                 except Exception:  # noqa: BLE001
                     log.exception("failed to persist speed test result")
             if d.get("ok"):

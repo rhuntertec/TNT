@@ -188,9 +188,11 @@
           title: 'Run a ' + seconds + ' s upload and download test with ' + peerName(p), on: { click: () => test(p) } },
           TNT.ui.icon(testing ? 'spark' : 'speed'), testing ? 'Testing…' : 'Test');
         const seen = h('span', { class: 'peer-seen', data: { ts: p.last_seen_ts != null ? String(p.last_seen_ts) : '' } }, seenText(p.last_seen_ts, now, p.age_s));
+        const away = peerAway(p);
         const meta = h('div', { class: 'peer-meta' }, p.ip ? copyCode(p.ip) : null,
           p.version ? h('span', { class: 'badge grey' }, 'v' + p.version) : null,
-          p.adapter ? h('span', null, 'via ' + p.adapter) : null, seen);
+          p.adapter ? h('span', null, 'via ' + p.adapter) : null,
+          away ? h('span', { class: 'badge grey', title: away.title }, away.text) : null, seen);
         els.list.appendChild(h('li', { class: 'peer-item' + (testing ? ' testing' : '') },
           h('span', { class: 'peer-icon' }, TNT.ui.icon('computer')),
           h('div', { class: 'peer-text' }, h('div', { class: 'peer-name', title: peerName(p) }, peerName(p)), meta),
@@ -254,8 +256,10 @@
     }
 
     // ---- actions
+    let loadAgain = false;     // a reload asked for while one was in flight (a network change) runs after it
     async function loadPeers() {
-      if (loading || !mounted) return;
+      if (!mounted) return;
+      if (loading) { loadAgain = true; return; }
       loading = true;
       TNT.ui.busy(els.refreshBtn, true);
       try {
@@ -268,7 +272,11 @@
         if (err.status === 404 || err.status === 503) peersData = { self: {}, peers: [], listening: false, error: 'LAN peer discovery is not available on this service' };
         else peersData = Object.assign({}, peersData || { self: {}, peers: [] }, { error: 'Could not list peers: ' + err.message });
         render();
-      } finally { loading = false; if (mounted) TNT.ui.busy(els.refreshBtn, false); }
+      } finally {
+        loading = false;
+        if (mounted) TNT.ui.busy(els.refreshBtn, false);
+        if (loadAgain && mounted) { loadAgain = false; loadPeers(); }
+      }
     }
     async function setEnabled(on) {
       if (!mounted || switching) return;
@@ -363,6 +371,8 @@
         tickTimer = setInterval(() => { if (mounted) refreshSeen(); }, 1000);
       },
       update() { /* nothing follows the status snapshot */ },
+      // this PC changed networks: its own address, and the peers the service keeps, change with it
+      netChanged() { if (mounted) loadPeers(); },
       unmount() {
         mounted = false;
         for (const u of unsubs) { try { u(); } catch (e) { /* ignore */ } }
@@ -374,5 +384,12 @@
     };
   }
 
-  TNT.tools.lan = { create, seenText, phaseStates, volumeText, movedText, PHASES, SECONDS, DEFAULT_SECONDS, EMPTY_TEXT };
+  /** Pure: a peer the service heard but places on none of this PC's subnets (its adapter is null, as
+   *  after this PC moved to another network) -> { text, title }; null for every other peer. */
+  function peerAway(p) {
+    if (!p || typeof p !== 'object' || !('adapter' in p) || p.adapter) return null;
+    return { text: 'other subnet', title: "Not on any of this PC's subnets right now: a test may not connect" };
+  }
+
+  TNT.tools.lan = { create, seenText, phaseStates, volumeText, movedText, peerAway, PHASES, SECONDS, DEFAULT_SECONDS, EMPTY_TEXT };
 })();

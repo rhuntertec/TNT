@@ -13,7 +13,8 @@
 * Static files come from ``paths.ui_dir()`` with proper MIME types and
   ``Cache-Control: no-cache``; ``/`` -> ``index.html``; ``..`` segments,
   backslashes and anything resolving outside the UI directory are rejected.
-* JSON bodies are capped at 1 MB (413).  Requests are logged at DEBUG only.
+* JSON bodies are capped at 1 MB (413), except on the paths in :data:`BODY_LIMITS` (the Full Scan's
+  Wi-Fi survey post, up to 1000 access points, may be 2 MB).  Requests are logged at DEBUG only.
   Every response carries ``Server: TNT/<version>``.  Errors raised by the stdlib
   request parser itself (bad request line, 414, 431, 501, 505) are rendered in
   the same JSON error shape as route errors.
@@ -49,6 +50,8 @@ from .sse import HEARTBEAT_S, STOP, SseHub, event_payload, format_comment, forma
 log = logging.getLogger(__name__)
 
 MAX_BODY_BYTES = 1024 * 1024
+#: Request body caps above MAX_BODY_BYTES, by exact API path (a trailing slash is ignored).
+BODY_LIMITS: Dict[str, int] = {"/api/reports/scan/wifi": 2 * 1024 * 1024}
 SSE_POLL_S = 1.0  # how often an idle SSE handler checks whether its client is still there
 SERVER_HEADER = f"TNT/{__version__}"
 #: How to move the API off a busy port (the overrides are applied by tnt.config; a plain PORT
@@ -146,6 +149,11 @@ def is_loopback(ip: str) -> bool:
     if addr.version == 6 and addr.ipv4_mapped is not None:
         addr = addr.ipv4_mapped
     return bool(addr.is_loopback)
+
+
+def body_limit(path: str) -> int:
+    """The largest request body accepted on *path* (:data:`BODY_LIMITS`, else :data:`MAX_BODY_BYTES`)."""
+    return BODY_LIMITS.get(path.rstrip("/") or "/", MAX_BODY_BYTES)
 
 
 def mime_for(path: Path) -> str:
@@ -353,7 +361,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             parts = urlsplit(self.path)
             path = unquote(parts.path or "/")
             query = {k: v for k, v in parse_qsl(parts.query, keep_blank_values=True)}
-            body = self._read_body()
+            body = self._read_body(body_limit(path))
             if path == "/api" or path.startswith("/api/"):
                 handler, params = api.router.match(method, path)
                 peer_addr = local_addr = None
@@ -367,7 +375,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     pass
                 req = Request(method=method, path=path, query=query, params=params,
                               headers={k.lower(): v for k, v in self.headers.items()}, body=body,
-                              client=client_ip, peer=peer_addr, local=local_addr)
+                              client=client_ip, peer=peer_addr, local=local_addr, raw_query=parts.query)
                 result = handler(req)
                 if isinstance(result, StreamResponse):
                     status = 200
@@ -397,7 +405,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             log.debug("%s %s %s -> %s in %.1f ms", self.client_address[0] if self.client_address else "?",
                       self.command, self.path, status, (time.perf_counter() - started) * 1000.0)
 
-    def _read_body(self) -> bytes:
+    def _read_body(self, limit: int = MAX_BODY_BYTES) -> bytes:
         raw_len = self.headers.get("Content-Length")
         if not raw_len:
             if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
@@ -410,9 +418,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise ApiError(400, "bad_request", "invalid Content-Length") from None
         if length < 0:
             raise ApiError(400, "bad_request", "invalid Content-Length")
-        if length > MAX_BODY_BYTES:
+        if length > limit:
             self.close_connection = True
-            raise ApiError(413, "payload_too_large", f"request body exceeds {MAX_BODY_BYTES} bytes")
+            raise ApiError(413, "payload_too_large", f"request body exceeds {limit} bytes")
         if length == 0:
             return b""
         data = self.rfile.read(length)
@@ -658,7 +666,9 @@ __all__ = [
     "ApiHandler",
     "ApiHTTPServer",
     "ApiServer",
+    "BODY_LIMITS",
     "MAX_BODY_BYTES",
+    "body_limit",
     "describe_port_owner",
     "is_loopback",
     "mime_for",

@@ -260,6 +260,39 @@ def test_config_section_that_is_not_an_object_falls_back_alone(data_dir, monkeyp
     assert c.update({"future_section": 1}) == {"future_section"}      # unknown top-level keys are still kept
 
 
+def test_config_network_poll_interval_default_and_clamps(data_dir):
+    c = config.Config().load()
+    assert c.get("network.poll_s") == 5 and config.DEFAULTS["network"] == {"poll_s": 5}
+    assert config.validate({"network": {"poll_s": 1}})["network"]["poll_s"] == 2
+    assert config.validate({"network": {"poll_s": 3600}})["network"]["poll_s"] == 60
+    assert config.validate({"network": {"poll_s": "fast"}})["network"]["poll_s"] == 5
+    assert c.update({"network": {"poll_s": 10}}) == {"network.poll_s"}
+    assert config.Config().load().get("network.poll_s") == 10
+
+
+def test_config_geoip_enabled_default_and_bool(data_dir):
+    import pytest
+
+    assert config.DEFAULTS["geoip"] == {"enabled": True}
+    c = config.Config().load()
+    assert c.get("geoip.enabled") is True
+    assert config.validate({"geoip": {"enabled": 0}})["geoip"]["enabled"] is False
+    assert config.validate({"geoip": {"enabled": "yes"}})["geoip"]["enabled"] is True
+    assert config.validate({})["geoip"] == {"enabled": True}          # a 1.11 config gains the key in memory
+    assert c.update({"geoip": {"enabled": False}}) == {"geoip.enabled"}
+    assert config.Config().load().get("geoip.enabled") is False
+    with pytest.raises(ValueError, match="must be an object"):
+        c.update({"geoip": "x"})
+    assert c.get("geoip.enabled") is False
+
+
+def test_paths_geoip_dir_follows_data_dir(data_dir):
+    from tnt import paths
+
+    assert paths.geoip_dir() == data_dir / "geoip"
+    assert not paths.geoip_dir().exists()      # ensure_dirs() leaves it alone: the IP location manager creates it lazily
+
+
 def test_db_roundtrip(data_dir):
     d = db.Database(data_dir / "t.db")
     t = d.add_target("1.1.1.1")

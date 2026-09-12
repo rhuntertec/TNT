@@ -990,3 +990,214 @@ def test_removal_of_never_sampled_target_checks_both_groups(env):
     env.pm.remove(2)                                   # tracker never saw a sample from 2: group unknown
     total = env.tracker.status()["total_active"]
     assert total is not None and total["kind"] == "total_internet" and total["start_ts"] == T0 + 5
+
+
+# --------------------------------------------------------------------------- network changes
+def test_network_change_closes_the_outage_about_the_old_address(env):
+    env.pm.add(1, "gateway", kind="local")
+    env.pm.views[1]["ip"] = "192.168.10.1"
+    env.run(1, T0, "xxx")                                  # the old router stopped answering
+    st = env.tracker.status()
+    target = next(o for o in st["active"] if o["kind"] == "target")
+    assert target["host"] == "gateway (192.168.10.1)" and st["total_active"]["kind"] == "total_local"
+    assert env.db.get_outage(target["id"])["host"] == "gateway (192.168.10.1)"
+    env.clock.t = T0 + 4
+    env.pm.views[1]["ip"] = "10.20.30.1"                   # the alias followed the new default gateway
+    env.tracker.on_target_ip_changed(env.pm.targets()[0], "192.168.10.1", "10.20.30.1", "network changed")
+    assert env.db.open_outages() == []
+    row = env.db.get_outage(target["id"])
+    assert row["end_ts"] == T0 + 4 and row["note"] == "network changed" and row["missed"] == 3
+    total = env.db.get_outage(st["total_active"]["id"])
+    assert total["end_ts"] == T0 + 4 and total["note"] == "network changed"
+    assert (1, False) in env.pm.calls
+    assert [e["type"] for e in env.events][-2:] == ["outage.end", "outage.end"]
+    # the next run starts fresh against the new router and is named after it
+    env.run(1, T0 + 5, "xxx")
+    reopened = next(o for o in env.tracker.status()["active"] if o["kind"] == "target")
+    assert reopened["host"] == "gateway (10.20.30.1)" and reopened["start_ts"] == T0 + 5
+
+
+def test_an_address_change_without_a_network_change_keeps_the_outage(env):
+    env.pm.add(1, "cdn.example")
+    env.pm.views[1]["ip"] = "203.0.113.10"
+    env.run(1, T0, "xxx")
+    oid = next(o for o in env.db.open_outages() if o["kind"] == "target")["id"]
+    assert env.db.get_outage(oid)["host"] == "cdn.example (203.0.113.10)"
+    env.pm.views[1]["ip"] = "203.0.113.11"                 # the periodic lookup rotated to another address
+    env.tracker.on_target_ip_changed(env.pm.targets()[0], "203.0.113.10", "203.0.113.11", None)
+    assert env.db.get_outage(oid)["end_ts"] is None
+    env.tracker.on_target_ip_changed({"id": 99}, "203.0.113.1", "203.0.113.2", "network changed")   # unknown target
+    env.tracker.on_target_ip_changed({"nope": 1}, "203.0.113.1", "203.0.113.2", "network changed")  # malformed
+    assert env.db.get_outage(oid)["end_ts"] is None
+    # an IP target is named by its address alone
+    env.pm.add(2, "198.51.100.7")
+    env.run(2, T0 + 10, "xxx")
+    assert next(o for o in env.db.open_outages() if o["target_id"] == 2)["host"] == "198.51.100.7"
+
+
+def test_tracker_subscribes_to_address_changes(env):
+    registered: List[Callable] = []
+    pm = FakePingManager()
+
+    def add_ip_listener(fn):
+        registered.append(fn)
+        return lambda: registered.remove(fn)
+
+    pm.add_ip_listener = add_ip_listener
+    tracker = outages.OutageTracker(env.db, env.config, env.bus, pm, clock=env.clock)
+    tracker.start()
+    assert registered == [tracker.on_target_ip_changed]
+    tracker.stop()
+    assert registered == []
+
+
+def _ended(db, kinds=None) -> Dict[tuple, tuple]:
+    return {(r["kind"], r["target_id"], r["start_ts"]): (r["end_ts"], r["note"])
+            for r in db.list_outages(T0 - 3600, T0 + 3600, kinds=kinds) if r["end_ts"] is not None}
+
+
+def test_moving_to_another_network_closes_every_open_outage_with_the_note(env):
+    env.pm.add(1, "1.1.1.1")
+    env.pm.add(2, "gateway", kind="local")
+    env.pm.views[2]["ip"] = "192.168.10.1"
+    env.tracker.on_network_change({"ts": T0 - 60, "default_gateway": "192.168.10.1", "previous_gateway": None,
+                                   "internet_nic": {"name": "Wi-Fi"}})
+    env.run(1, T0, "xxx")
+    env.run(2, T0, "xxx")
+    assert len(env.db.open_outages()) == 4
+    # the cable is pulled on the way to another building: that closes nothing (this PC is still cut off)
+    env.tracker.on_network_change({"ts": T0 + 5, "default_gateway": None, "previous_gateway": "192.168.10.1", "internet_nic": None})
+    assert len(env.db.open_outages()) == 4
+    env.clock.t = T0 + 40
+    env.events.clear()
+    env.tracker.on_network_change({"ts": T0 + 40, "default_gateway": "10.20.30.1", "previous_gateway": None,
+                                   "internet_nic": {"name": "Ethernet"}})
+    assert env.db.open_outages() == []
+    assert _ended(env.db) == {("target", 1, T0): (T0 + 40, "network changed"), ("target", 2, T0): (T0 + 40, "network changed"),
+                              ("total_internet", None, T0): (T0 + 40, "network changed"),
+                              ("total_local", None, T0): (T0 + 40, "network changed")}
+    assert (1, False) in env.pm.calls and (2, False) in env.pm.calls
+    assert [e["type"] for e in env.events] == ["outage.end"] * 4
+    # the miss runs start afresh on the new network: two more misses are not an outage yet, a third is
+    env.run(1, T0 + 41, "xx")
+    assert env.db.open_outages() == []
+    env.run(1, T0 + 43, "x")
+    # the same network reported again (a DNS change, say) closes nothing
+    env.tracker.on_network_change({"ts": T0 + 50, "default_gateway": "10.20.30.1", "previous_gateway": "10.20.30.1",
+                                   "internet_nic": {"name": "Ethernet"}})
+    assert sorted(o["kind"] for o in env.db.open_outages()) == ["target", "total_internet"]
+    for bad in (None, {}, {"ts": "garbage"}, {"ts": float("nan"), "internet_nic": []}):
+        env.tracker.on_network_change(bad)                  # never raises
+
+
+def test_an_outage_while_this_pc_had_no_network_connection_keeps_counting_and_says_so(env):
+    """A Wi-Fi drop is still a local outage (the pinger keeps pinging the gateway it lost); the note tells it apart
+    from an outage of a network this PC was connected to."""
+    env.pm.add(1, "gateway", kind="local")
+    env.run(1, T0, "xxx")
+    env.tracker.on_network_change({"ts": T0 + 4, "default_gateway": None, "previous_gateway": "192.168.10.1", "internet_nic": None})
+    env.run(1, T0 + 4, "xxxx")
+    env.run(1, T0 + 60, "...")                              # back on the same network, before or without its event
+    rows = sorted(env.db.list_outages(T0 - 1, T0 + 70), key=lambda r: r["kind"])
+    assert [(r["kind"], r["start_ts"], r["end_ts"], r["note"], r["missed"]) for r in rows] == [
+        ("target", T0, T0 + 60, "no network connection", 7), ("total_local", T0, T0 + 60, "no network connection", 0)]
+    env.tracker.on_network_change({"ts": T0 + 64, "default_gateway": "192.168.10.1", "previous_gateway": None,
+                                   "internet_nic": {"name": "Wi-Fi"}})
+    assert env.db.open_outages() == []
+    env.run(1, T0 + 100, "xxx...")                          # connected: an ordinary outage
+    env.tracker.on_network_change({"ts": T0 + 200, "default_gateway": None, "previous_gateway": "192.168.10.1", "internet_nic": None})
+    env.run(1, T0 + 201, "xxx...")                          # one that begins while cut off is labelled as well
+    later = sorted((r for r in env.db.list_outages(T0 + 90, T0 + 300, kinds=("target",))), key=lambda r: r["start_ts"])
+    assert [r["note"] for r in later] == [None, "no network connection"]
+
+
+def test_an_outage_that_recovers_on_another_network_before_the_event_says_so(env):
+    live: Dict[str, Optional[str]] = {"gw": "192.168.10.1"}
+    pm = FakePingManager()
+    tracker = outages.OutageTracker(env.db, env.config, env.bus, pm, clock=env.clock, gateway_fn=lambda: live["gw"])
+    tracker.start()
+
+    def run(t0: float, pattern: str) -> None:
+        for i, ch in enumerate(pattern):
+            env.clock.t = max(env.clock.t, t0 + i)
+            pm.feed(1, t0 + i, ch == ".")
+
+    try:
+        pm.add(1, "1.1.1.1")
+        run(T0, "xxx")
+        live["gw"] = "10.20.30.1"                           # plugged in elsewhere: 1.1.1.1 answers before net.changed
+        run(T0 + 30, "...")
+        run(T0 + 40, "xxx...")                              # an outage of that network, still before the event
+        tracker.on_network_change({"ts": T0 + 50, "default_gateway": "10.20.30.1", "previous_gateway": None,
+                                   "internet_nic": {"name": "Ethernet"}})
+        run(T0 + 60, "xxx...")
+        live["gw"] = None                                   # a lookup that finds nothing never invents a note
+        run(T0 + 80, "xxx...")
+        ended = _ended(env.db)
+        assert [ended[("target", 1, T0 + s)][1] for s in (0, 40, 60, 80)] == ["network changed", None, None, None]
+        assert [ended[("total_internet", None, T0 + s)][1] for s in (0, 40, 60, 80)] == ["network changed", None, None, None]
+        assert ended[("target", 1, T0)][0] == T0 + 30
+    finally:
+        tracker.stop()
+
+
+def test_rows_carry_the_network_they_opened_on_and_an_id_change_closes_what_opened_before(env):
+    """tnt.networks: target, total and gap rows are tagged with the network current when they opened.  A move the gateway address
+    cannot show (two sites behind 192.168.1.1, told apart by the router's MAC) closes the outages of the network left behind at
+    the change; a late merge, dated back, leaves what opened since then alone (it is the new network's)."""
+    current = {"id": 7}
+    pm = FakePingManager()
+    tracker = outages.OutageTracker(env.db, env.config, env.bus, pm, clock=env.clock, network_fn=lambda: current["id"])
+    tracker.start()
+
+    def run(tid: int, t0: float, pattern: str) -> None:
+        for i, ch in enumerate(pattern):
+            env.clock.t = max(env.clock.t, t0 + i)
+            pm.feed(tid, t0 + i, ch == ".")
+
+    try:
+        pm.add(1, "198.51.100.1")
+        pm.add(2, "gateway", kind="local")
+        pm.views[2]["ip"] = "192.168.1.1"
+        run(1, T0, "xxx")
+        run(2, T0, "xxx")
+        opened = {(r["kind"], r["target_id"]): r["network_id"] for r in env.db.open_outages()}
+        assert opened == {("target", 1): 7, ("target", 2): 7, ("total_internet", None): 7, ("total_local", None): 7}
+        # an immediate switch at T0+50: everything open began before it and ends then; the miss runs start afresh
+        current["id"] = 9
+        tracker.on_network_id_change({"old_id": 7, "new_id": 9, "ts": T0 + 50, "late": False, "reason": "network change"})
+        assert env.db.open_outages() == []
+        assert {(r["end_ts"], r["note"]) for r in env.db.list_outages(T0 - 1, T0 + 60)} == {(T0 + 50, "network changed")}
+        run(1, T0 + 100, "xx.")
+        assert env.db.open_outages() == []
+        # a late merge dated back to T0+200: the outage that opened before closes then, the one that opened after stays open
+        run(2, T0 + 150, "xxx")
+        run(1, T0 + 210, "xxx")
+        tracker.on_network_id_change({"old_id": 9, "new_id": 11, "ts": T0 + 200, "late": True, "reason": "router identified"})
+        assert sorted((r["kind"], r["target_id"], r["start_ts"], r["network_id"]) for r in env.db.open_outages()) == [
+            ("target", 1, T0 + 210, 9), ("total_internet", None, T0 + 210, 9)]
+        closed = {(r["kind"], r["target_id"]): (r["end_ts"], r["note"]) for r in env.db.list_outages(T0 + 140, T0 + 205)
+                  if r["end_ts"] is not None and r["start_ts"] >= T0 + 140}
+        assert closed == {("target", 2): (T0 + 200, "network changed"), ("total_local", None): (T0 + 200, "network changed")}
+        # a monitoring gap is listed under the network it began on (its time is never an outage of that network)
+        info = tracker.on_monitoring_gap(T0 + 300, T0 + 900, "system sleep")
+        assert env.db.get_outage(info["gap_id"])["network_id"] == 9
+        for bad in (None, {}, {"ts": "garbage"}):
+            tracker.on_network_id_change(bad)       # never raises
+    finally:
+        tracker.stop()
+
+
+def test_without_a_network_function_nothing_is_tagged_and_the_stale_gap_takes_the_previous_network(env, data_dir):
+    env.pm.add(1, "198.51.100.1")
+    env.run(1, T0, "xxx")
+    assert [r["network_id"] for r in env.db.open_outages()] == [None, None]
+    database = tnt_db.Database(data_dir / "stale.db")
+    try:
+        database.set_meta("last_heartbeat", str(T0))
+        info = outages.close_stale_outages(database, T0 + 600, network_id=4)
+        assert database.get_outage(info["gap_id"])["network_id"] == 4
+        assert outages.close_stale_outages(database, T0 + 600, network_id=4)["gap_id"] is None, "the heartbeat was refreshed"
+        assert len(database.list_outages(T0 - 1, T0 + 601, kinds=("gap",))) == 1, "idempotent: one gap row"
+    finally:
+        database.close()

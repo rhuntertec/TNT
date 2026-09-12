@@ -1,9 +1,11 @@
 """client.tray helpers that need no GUI: the ssh launcher script, the self-healing window (quit
 when Windows ends the session, relaunch when the embedded WebView2 browser dies), the window
-geometry that fits any screen, the .NET / WebView2 startup checks and --remote-debugging-port."""
+geometry that fits any screen, the .NET / WebView2 startup checks, --remote-debugging-port and the
+Wi-Fi survey bridge (its origin guard, session start, client.json switch and shutdown)."""
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -19,9 +21,41 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from client import tray  # noqa: E402
+from client import wifi_survey  # noqa: E402
 
 DESIGN = (1280, 860, 1024, 700)
 DESIGN_GEOMETRY = {"width": 1280, "height": 860, "min_size": (1024, 700)}
+SERVICE = "http://127.0.0.1:7130"
+
+
+class NoAdapterApi:
+    """The Wlan API stand-in every ClientApp in this file gets: no Wi-Fi interface, no real call."""
+
+    calls: list = []
+
+    def open(self):
+        NoAdapterApi.calls.append("open")
+
+    def close(self):
+        pass
+
+    def interfaces(self):
+        return []
+
+
+@pytest.fixture(autouse=True)
+def _no_real_wifi_survey(monkeypatch):
+    """No test may touch this PC's Wi-Fi adapter: every ClientApp's survey runs without its scanner
+    thread, on a native layer that reports no adapter."""
+    real = wifi_survey.WifiSurvey
+
+    def factory(*args, **kwargs):
+        kwargs.setdefault("threaded", False)
+        kwargs.setdefault("api_factory", NoAdapterApi)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(tray.wifi_survey, "WifiSurvey", factory)
+    monkeypatch.setattr(tray.wifi_survey, "WlanSurveyApi", NoAdapterApi)
 
 
 def test_ssh_prompt_script_asks_for_a_user_name():
@@ -272,6 +306,7 @@ class _FakeEvent:
 class _FakeCore:
     def __init__(self, pid, version="152.0.4191.66"):
         self.ProcessFailed = _FakeEvent()
+        self.NavigationStarting = _FakeEvent()
         self.BrowserProcessId = pid
         self.Environment = SimpleNamespace(BrowserVersionString=version)
 
@@ -288,6 +323,7 @@ def test_hook_on_ui_records_the_browser_pid_and_watches_a_new_core(app, monkeypa
     app._hook_on_ui()
     assert app._hooks_installed and app._browser_pid == 1234 and app._webview_ready.is_set()
     assert len(wv.CoreWebView2.ProcessFailed.handlers) == 1
+    assert wv.CoreWebView2.NavigationStarting.handlers == [app._on_navigation_starting], "the single-origin guard"
     (on_ready,) = wv.CoreWebView2InitializationCompleted.handlers    # attached although the core existed
     on_ready(wv, SimpleNamespace(IsSuccess=True))
     assert len(wv.CoreWebView2.ProcessFailed.handlers) == 1, "the same core is not hooked twice"
@@ -296,6 +332,7 @@ def test_hook_on_ui_records_the_browser_pid_and_watches_a_new_core(app, monkeypa
     wv.CoreWebView2 = new_core               # the control re-initialised with a new browser
     on_ready(wv, SimpleNamespace(IsSuccess=True))
     assert app._browser_pid == 5678 and len(new_core.ProcessFailed.handlers) == 1
+    assert len(new_core.NavigationStarting.handlers) == 1
     on_ready(wv, SimpleNamespace(IsSuccess=False, InitializationException="0x8007139F"))   # logged, never raises
 
     deadline = time.monotonic() + 2.0
@@ -730,3 +767,269 @@ def test_webview_init_watchdog_is_quiet_when_the_webview_started(app, monkeypatc
     started = time.monotonic()
     assert stopping.webview_init_watchdog(timeout=30) is False and time.monotonic() - started < 5, "quitting"
     assert notes == []
+
+
+# --------------------------------------------------------------------------- Wi-Fi survey bridge
+WIFI_BRIDGE_METHODS = ("wifi_survey", "wifi_scan_now", "wifi_clear", "wifi_set_enabled", "open_location_settings")
+
+
+def _page(url):
+    """A pywebview window stand-in whose WinForms backend reports *url* as the page on show."""
+    return SimpleNamespace(uid="master", gui=SimpleNamespace(get_current_url=lambda uid: url),
+                           show=lambda: None, destroy=lambda: None)
+
+
+@pytest.mark.parametrize("url, ok", [
+    (SERVICE, True), (SERVICE + "/", True), (SERVICE + "/#wifi", True), ("HTTP://127.0.0.1:7130/index.html?x=1", True),
+    ("http://127.0.0.1:7131/", False), ("http://localhost:7130/", False), ("https://127.0.0.1:7130/", False),
+    ("http://127.0.0.1:7130@example.com/", False), ("http://example.com/?next=http://127.0.0.1:7130", False),
+    ("file:///C:/TNT/ui/index.html", False), ("data:text/html,x", False), ("about:blank", False),
+    ("http://127.0.0.1:99999/", False), ("", False), (None, False), (42, False),
+])
+def test_same_origin(url, ok):
+    assert tray.same_origin(url, SERVICE) is ok
+
+
+def test_same_origin_default_ports():
+    assert tray.same_origin("http://127.0.0.1/", "http://127.0.0.1:80")
+    assert tray.same_origin("https://tnt.test:443/x", "https://tnt.test")
+    assert not tray.same_origin(SERVICE, None)
+
+
+def test_page_url_reads_pywebviews_record_without_waiting(app):
+    assert app.page_url() is None and not app.showing_service_page(), "no window yet"
+    app.window = _page(SERVICE + "/#wifi")
+    assert app.page_url() == SERVICE + "/#wifi" and app.showing_service_page()
+    app.window = _page(None)                                   # the inline starting / error page
+    assert app.page_url() is None and not app.showing_service_page()
+    app.window = SimpleNamespace(uid="master", gui=None)       # before webview.start
+    assert app.page_url() is None
+
+    def boom(uid):
+        raise RuntimeError("form disposed")
+
+    app.window = SimpleNamespace(uid="master", gui=SimpleNamespace(get_current_url=boom))
+    assert app.page_url() is None and not app.showing_service_page()
+
+
+@pytest.mark.parametrize("url", [None, "http://127.0.0.1:7131/", "https://example.com/wifi", "about:blank"])
+def test_wifi_bridge_refuses_any_other_page(app, monkeypatch, url):
+    opened, touched = [], []
+    monkeypatch.setattr(tray.os, "startfile", opened.append, raising=False)
+    for name in ("survey", "scan_now", "clear", "set_enabled"):
+        monkeypatch.setattr(app.wifi, name, lambda *a, _n=name, **k: touched.append(_n))
+    app.window = _page(url)
+    assert app.bridge.wifi_survey({"active": True}) == wifi_survey.blank_view("error", tray.WIFI_BRIDGE_REFUSED)
+    assert app.bridge.wifi_scan_now() == {"ok": False, "error": tray.WIFI_BRIDGE_REFUSED}
+    assert app.bridge.wifi_clear() == {"ok": False, "error": tray.WIFI_BRIDGE_REFUSED}
+    assert app.bridge.wifi_set_enabled(False) == {"ok": False, "enabled": True, "error": tray.WIFI_BRIDGE_REFUSED}
+    assert app.bridge.open_location_settings() == {"ok": False, "error": tray.WIFI_BRIDGE_REFUSED}
+    assert touched == [] and opened == [] and not app.wifi.session_started
+    app.window = None
+    assert app.bridge.wifi_survey()["state"] == "error"
+
+
+def test_wifi_bridge_answers_the_dashboard(app, monkeypatch):
+    opened = []
+    monkeypatch.setattr(tray.os, "startfile", opened.append, raising=False)
+    monkeypatch.setattr(tray, "_window_visible", lambda title=tray.TITLE: True)
+    app.window = _page(SERVICE + "/#wifi")
+    view = app.bridge.wifi_survey({"active": True, "history_s": 300})
+    assert set(view) == set(wifi_survey.blank_view()) and view["enabled"] is True and view["active"] is True
+    assert app.wifi.session_started and view["started_ts"] is not None
+    json.dumps(view, allow_nan=False)
+    app.wifi.tick()                                            # the fake native layer: no Wi-Fi interface
+    assert app.bridge.wifi_survey({})["state"] == "no_adapter"
+    assert app.bridge.wifi_scan_now() == {"ok": True, "error": None}, "taken although a scan was just attempted"
+    assert app.bridge.wifi_scan_now() == {"ok": False, "error": wifi_survey.SCAN_TOO_SOON_TEXT}, "one request per 5 s"
+    assert app.bridge.wifi_clear() == {"ok": True}
+    assert app.bridge.open_location_settings() == {"ok": True} and opened == ["ms-settings:privacy-location"]
+    assert tray.LOCATION_SETTINGS_URI == "ms-settings:privacy-location"
+
+
+def test_wifi_survey_call_from_a_hidden_window_does_not_start_the_session(app, monkeypatch):
+    app.window = _page(SERVICE)
+    monkeypatch.setattr(tray, "_window_visible", lambda title=tray.TITLE: False)
+    view = app.bridge.wifi_survey({"active": False})
+    assert (view["state"], view["started_ts"]) == ("starting", None) and not app.wifi.session_started
+    monkeypatch.setattr(tray, "_window_visible", lambda title=tray.TITLE: True)
+    app.bridge.wifi_survey({})
+    assert app.wifi.session_started, "the window is on screen"
+    hidden_but_active = tray.ClientApp(_args())
+    hidden_but_active.window = _page(SERVICE)
+    monkeypatch.setattr(tray, "_window_visible", lambda title=tray.TITLE: False)
+    hidden_but_active.bridge.wifi_survey({"active": True})
+    assert hidden_but_active.wifi.session_started, "the WiFi page says it is on screen"
+
+
+def test_wifi_bridge_is_exception_safe(app, monkeypatch, caplog):
+    app.window = _page(SERVICE)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("survey exploded")
+
+    for name in ("survey", "scan_now", "clear", "set_enabled"):
+        monkeypatch.setattr(app.wifi, name, boom)
+    monkeypatch.setattr(tray.os, "startfile", boom, raising=False)
+    with caplog.at_level(logging.ERROR, logger="client.tray"):
+        assert app.bridge.wifi_survey({}) == wifi_survey.blank_view("error", tray.WIFI_BRIDGE_FAILED, enabled=True)
+        assert app.bridge.wifi_scan_now() == {"ok": False, "error": tray.WIFI_BRIDGE_FAILED}
+        assert app.bridge.wifi_clear() == {"ok": False, "error": tray.WIFI_BRIDGE_FAILED}
+        assert app.bridge.wifi_set_enabled(True) == {"ok": False, "enabled": True, "error": tray.WIFI_BRIDGE_FAILED}
+        assert app.bridge.open_location_settings()["ok"] is False
+    assert len([r for r in caplog.records if r.levelno >= logging.ERROR]) == 5
+    monkeypatch.setattr(app, "showing_service_page", boom)
+    assert app.bridge.wifi_scan_now() == {"ok": False, "error": tray.WIFI_BRIDGE_REFUSED}, "an unreadable page is refused"
+    monkeypatch.setattr(type(app.wifi), "enabled", property(boom))
+    assert app.bridge.wifi_set_enabled(True) == {"ok": False, "enabled": False, "error": tray.WIFI_BRIDGE_REFUSED}
+
+
+def test_wifi_set_enabled_is_remembered_in_client_json(app):
+    app.window = _page(SERVICE)
+    for junk in ("false", 0, 1, None, {}, []):
+        assert app.bridge.wifi_set_enabled(junk) == {"ok": False, "enabled": True, "error": "on must be true or false"}
+    assert tray.WIFI_ENABLED_KEY not in tray.load_state(), "nothing saved for junk"
+    assert app.bridge.wifi_set_enabled(False) == {"ok": True, "enabled": False}
+    assert tray.load_state()[tray.WIFI_ENABLED_KEY] is False
+    assert tray.ClientApp(_args()).wifi.enabled is False, "the next TNT.exe remembers it"
+    assert app.bridge.wifi_survey()["state"] == "disabled"
+    assert app.bridge.wifi_set_enabled(True) == {"ok": True, "enabled": True}
+    assert tray.ClientApp(_args()).wifi.enabled is True
+
+
+def test_wifi_switch_reads_client_json_with_a_bom_and_keeps_other_keys(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    p = tray.client_state_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(b"\xef\xbb\xbf" + json.dumps({"theme": "dark", "wifi_survey_enabled": False}).encode("utf-8"))
+    app = tray.ClientApp(_args())
+    assert app.wifi.enabled is False and app.theme == "dark"
+    app.window = _page(SERVICE)
+    assert app.bridge.wifi_set_enabled(True)["enabled"] is True
+    assert tray.load_state() == {"theme": "dark", "wifi_survey_enabled": True}
+    assert [tray.wifi_enabled_setting(s) for s in ({}, {"wifi_survey_enabled": "no"}, {"wifi_survey_enabled": 0},
+                                                   {"wifi_survey_enabled": False}, None)] == [True, True, True, False, True]
+
+
+def test_wifi_session_starts_the_first_time_the_window_is_shown(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setattr(tray, "_create_activate_event", lambda: None)
+    monkeypatch.setattr(tray.threading, "Thread", lambda target, name, daemon: SimpleNamespace(start=lambda: None))
+    at_sign_in = tray.ClientApp(_args(minimized=True))
+    monkeypatch.setattr(at_sign_in.tray, "start", lambda: None)
+    at_sign_in._after_gui_started()
+    assert not at_sign_in.wifi.session_started, "TNT.exe waiting in the tray after sign-in: no survey"
+    opened = tray.ClientApp(_args())
+    monkeypatch.setattr(opened.tray, "start", lambda: None)
+    opened._after_gui_started()
+    assert opened.wifi.session_started, "the window opened on screen"
+    monkeypatch.setattr(tray, "find_window", lambda title=tray.TITLE: 0)
+    at_sign_in.window = SimpleNamespace(show=lambda: None)
+    at_sign_in.show_window()
+    assert at_sign_in.wifi.session_started, "Open TNT from the tray"
+    off = tray.ClientApp(_args())
+    off.wifi.set_enabled(False)
+    off.window = SimpleNamespace(show=lambda: None)
+    off.show_window()
+    assert not off.wifi.session_started, "switched off: nothing starts"
+
+
+def test_quit_and_shutdown_stop_the_wifi_survey(app, monkeypatch):
+    stops = []
+    monkeypatch.setattr(app.wifi, "stop", lambda timeout=2.0: stops.append(timeout))
+    monkeypatch.setattr(app.tray, "stop", lambda: None)
+    monkeypatch.setattr(tray, "release_single_instance", lambda: None)
+    app.window = SimpleNamespace(destroy=lambda: None)
+    app.quit()
+    app._shutdown()
+    assert stops == [1.0, 1.0]
+
+    def boom(timeout=2.0):
+        raise RuntimeError("stuck")
+
+    monkeypatch.setattr(app.wifi, "stop", boom)
+    app.stop_wifi_survey()                                     # logged, never raises
+
+
+def test_bridge_exposes_the_wifi_methods_and_nothing_else_new():
+    public = {n for n in dir(tray.JsBridge) if not n.startswith("_")}
+    assert set(WIFI_BRIDGE_METHODS) <= public
+    assert all(callable(getattr(tray.JsBridge, n)) for n in public), "pywebview would expose a public attribute's contents"
+
+
+def test_bridge_functions_are_exposed_by_name_so_no_attribute_path_reaches_the_app(app, monkeypatch):
+    """pywebview resolves a js_api call name as a dotted attribute path, underscores included, so a page that
+    posted ``_app.wifi.survey`` or ``_app.quit`` used to reach ClientApp past every bridge method's own check.
+    The window gets each public method through window.expose instead (looked up by exact name) and no js_api."""
+    import inspect
+
+    from webview import util as webview_util
+
+    run_src = inspect.getsource(tray.ClientApp.run)
+    assert "js_api" not in run_src.replace("# no js_api", "") and "self.window.expose(*bridge_functions(self.bridge))" in run_src
+    functions = tray.bridge_functions(app.bridge)
+    assert [f.__name__ for f in functions] == sorted(n for n in vars(tray.JsBridge) if not n.startswith("_"))
+    assert all(getattr(f, "__self__", None) is app.bridge for f in functions)
+    quits, results = [], []
+    monkeypatch.setattr(app, "quit", lambda: quits.append(True))
+    monkeypatch.setattr(app.wifi, "survey", lambda *a, **k: quits.append("survey"))
+    app.window = _page(SERVICE)
+    # what Window.expose builds, dispatched by pywebview's own bridge call
+    window = SimpleNamespace(_functions={f.__name__: f for f in functions}, _js_api=None, evaluate_js=results.append)
+    for path in ("_app.quit", "_app.wifi.survey", "_app.wifi._view_locked", "save_file.__func__.__globals__.clear",
+                 "wifi_survey.__self__._app.quit", "_JsBridge__app"):
+        webview_util.js_bridge_call(window, path, [], "probe")
+    webview_util.js_bridge_call(window, "client_info", [], "ok")
+    deadline = time.monotonic() + 5
+    while not results and time.monotonic() < deadline:
+        time.sleep(0.01)
+    time.sleep(0.1)
+    assert quits == [], "nothing but the exposed functions is callable"
+    assert len(results) == 1 and '"version"' in results[0] and "client_info" in results[0]
+
+
+@pytest.mark.parametrize("uri, ok", [
+    (SERVICE, True), (SERVICE + "/#diagnostics", True), (SERVICE + "/index.html?x=1", True),
+    ("data:text/html;charset=utf-8;base64,PGh0bWw+PGJvZHk+", True), ("about:blank", True), ("blob:" + SERVICE + "/5f0c", True),
+    ("http://127.0.0.1:7131/", False), ("https://example.com/", False), ("file:///C:/Windows/", False),
+    ("blob:https://example.com/5f0c", False), ("javascript:alert(1)", False), ("ms-settings:privacy-location", False),
+    ("http://127.0.0.1:7130@example.com/", False), ("about:srcdoc", False), ("", False), (None, False), (7, False),
+])
+def test_navigation_allowed(uri, ok):
+    assert tray.navigation_allowed(uri, SERVICE) is ok
+
+
+def test_navigation_guard_keeps_the_window_on_the_dashboard(app, monkeypatch, caplog):
+    import webbrowser
+
+    opened = []
+    monkeypatch.setattr(webbrowser, "open", lambda url, new=0: opened.append((url, new)))
+
+    def navigate(uri, user=False):
+        args = SimpleNamespace(Uri=uri, IsUserInitiated=user, Cancel=False)
+        app._on_navigation_starting(None, args)
+        return args.Cancel
+
+    with caplog.at_level(logging.INFO, logger="client.tray"):
+        assert navigate(SERVICE + "/#wifi", user=True) is False
+        assert navigate("data:text/html;charset=utf-8;base64,PGh0bWw+", user=False) is False, "the inline starting page"
+        assert navigate("https://example.com/docs?token=secret", user=True) is True
+        assert navigate("http://127.0.0.1:9/", user=False) is True
+        assert navigate("file:///C:/Users/", user=True) is True
+        assert navigate("http://[::1/", user=True) is True, "a malformed URL is cancelled too"
+    deadline = time.monotonic() + 5
+    while not opened and time.monotonic() < deadline:
+        time.sleep(0.01)
+    time.sleep(0.1)
+    assert opened == [("https://example.com/docs?token=secret", 2)], "only a clicked http(s) link opens in the browser"
+    assert "token=secret" not in caplog.text and "https://example.com" in caplog.text, "only the origin is logged"
+    app._on_navigation_starting(None, object())                 # never raises
+
+
+def test_client_bundle_and_selfcheck_include_the_wifi_modules():
+    import inspect
+
+    source = inspect.getsource(tray.client_selfcheck)
+    assert '"client.wifi_ies", "client.wifi_survey"' in source and "wifi_ies.self_test()" in source
+    spec = (ROOT / "installer" / "tnt_client.spec").read_text(encoding="utf-8")
+    assert '"client.wifi_ies", "client.wifi_survey"' in spec

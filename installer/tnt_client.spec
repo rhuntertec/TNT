@@ -23,6 +23,8 @@ What is collected and why
 * ``pystray`` (``collect_all`` so the ``_win32`` backend is present) and PIL
   (icon drawing; ``client.icons``).
 * ``tnt`` is bundled only for ``tnt/__init__.py`` (the version string).
+* ``client.wifi_survey`` + ``client.wifi_ies`` (the WiFi tile's survey, stdlib + ctypes only; it
+  runs in the client because Windows gives BSSID lists only to a user with location access).
 * ``a.datas`` goes through ``pyi_common.without_markdown``: no Markdown file of TNT's ships (the
   same filter as the service spec, which bundles ``ui/``); a package's own licence files are kept.
 * ``pyi_common.NOT_BUNDLED`` (Pillow's AVIF module) is excluded, as in the service spec.
@@ -108,7 +110,7 @@ hiddenimports = [
     "pystray", "pystray._win32",
     "PIL", "PIL.Image", "PIL.ImageDraw", "PIL.ImageFont",
     "PIL.IcoImagePlugin", "PIL.PngImagePlugin", "PIL.BmpImagePlugin",
-    "tnt", "client", "client.icons",
+    "tnt", "client", "client.icons", "client.wifi_ies", "client.wifi_survey",
 ]
 
 for _pkg in ("webview", "clr_loader", "pystray"):

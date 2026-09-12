@@ -821,3 +821,109 @@ def test_vendor_lookup_is_cached_and_fast():
     for i in range(500):
         oui.vendor_for_mac(f"3C:22:FB:00:{i % 256:02X}:03")
     assert time.perf_counter() - t0 < 1.0
+
+
+# =========================================================================================
+# netinfo: adapter warnings, one enumeration, identity fields (synthetic adapters)
+# =========================================================================================
+def _v4(addr: str, prefix: int, dad: int = 4) -> "netinfo.IpAddr":
+    return netinfo._make_ipaddr(addr, 4, prefix, dad, 0)
+
+
+def test_adapter_warnings_rules():
+    def codes(a, *args):
+        return [w["code"] for w in netinfo.adapter_warnings(a, *args)]
+
+    healthy = _fake_adapter()
+    assert netinfo.adapter_warnings(healthy) == [] and healthy.to_dict()["warnings"] == []
+    apipa = _fake_adapter(ipv4=[_v4("169.254.23.45", 16)], gateways=[], dns=[], dhcp_server=None)
+    assert codes(apipa) == ["apipa"] and "169.254.23.45" in netinfo.adapter_warnings(apipa)[0]["message"]
+    both = _fake_adapter(ipv4=[_v4("10.0.0.112", 24), _v4("169.254.7.7", 16, dad=1)])    # a tentative extra next to a lease
+    assert codes(both) == []
+    dup = _fake_adapter(ipv4=[_v4("172.16.20.15", 24, dad=netinfo.IP_DAD_STATE_DUPLICATE)], gateways=["172.16.20.1"])
+    assert codes(dup) == ["duplicate_address"] and "172.16.20.15" in netinfo.adapter_warnings(dup)[0]["message"]
+    typo = _fake_adapter(ipv4=[_v4("10.20.31.45", 24)], gateways=["10.20.30.1"], dns=["10.20.30.53"])
+    w = netinfo.adapter_warnings(typo)
+    assert [x["code"] for x in w] == ["gateway_outside_subnet"]
+    assert "10.20.30.1" in w[0]["message"] and "10.20.31.0/24" in w[0]["message"]
+    assert codes(_fake_adapter(dns=[])) == ["no_dns"]
+    assert codes(_fake_adapter(dns=[], gateways=[])) == [], "without a gateway, no DNS server is expected"
+    temp = _fake_adapter(ipv6=[netinfo._make_ipaddr("2001:db8:10::a1b2:c3d4", 6, 128, netinfo.IP_DAD_STATE_DEPRECATED, 0, 4, 5)])
+    assert codes(temp) == [], "a deprecated IPv6 temporary address is normal, never a duplicate"
+    assert codes(_fake_adapter(status="down", dns=[])) == []
+    # two default gateways: reported on the internet NIC only, and only while the other adapter is up
+    wifi = _fake_adapter(index=7, name="Wi-Fi", mac="02:00:5E:10:00:07", ipv4=[_v4("192.168.10.23", 24)],
+                         gateways=["192.168.10.1"], dns=["192.168.10.1"])
+    eth = _fake_adapter()
+    assert codes(eth, [eth, wifi], 12) == ["multiple_default_gateways"]
+    assert "Wi-Fi" in netinfo.adapter_warnings(eth, [eth, wifi], 12)[0]["message"]
+    assert codes(wifi, [eth, wifi], 12) == [] and codes(eth) == []
+    wifi.status = "down"
+    assert codes(eth, [eth, wifi], 12) == []
+
+
+def test_a_self_assigned_address_is_only_blamed_on_dhcp_when_dhcp_is_to_blame():
+    def codes(a):
+        return [w["code"] for w in netinfo.adapter_warnings(a)]
+
+    # a static address another device already uses: Windows falls back to 169.254.x.x, but no DHCP server was asked
+    dup = _fake_adapter(ipv4=[_v4("192.168.1.10", 24, dad=netinfo.IP_DAD_STATE_DUPLICATE), _v4("169.254.10.20", 16)],
+                        gateways=["192.168.1.1"], dns=["192.168.1.1"], dhcp_enabled=False, dhcp_server=None)
+    assert codes(dup) == ["duplicate_address"]
+    # the same on a DHCP adapter whose lease collided: the duplicate is the problem worth naming
+    assert codes(_fake_adapter(ipv4=[_v4("10.0.0.112", 24, dad=netinfo.IP_DAD_STATE_DUPLICATE), _v4("169.254.7.7", 16)],
+                               dns=["10.0.0.251"])) == ["duplicate_address"]
+    assert codes(_fake_adapter(ipv4=[_v4("169.254.10.20", 16)], gateways=[], dns=[], dhcp_enabled=False, dhcp_server=None)) == []
+    # DHCPv4 unanswered next to working IPv6: still no DHCP server, and the message says the network may be IPv6-only
+    v6only = _fake_adapter(ipv4=[_v4("169.254.30.40", 16)], gateways=["fe80::1"], dns=["2001:db8:77::53"], dhcp_server=None,
+                           ipv6=[netinfo._make_ipaddr("2001:db8:77::1a2b", 6, 64, netinfo.IP_DAD_STATE_PREFERRED, 0, 4, 4)])
+    w = netinfo.adapter_warnings(v6only)
+    assert [x["code"] for x in w] == ["apipa"] and w[0]["message"].endswith("(IPv6 works: this network may be IPv6-only)")
+    plain = netinfo.adapter_warnings(_fake_adapter(ipv4=[_v4("169.254.30.40", 16)], gateways=[], dns=[], dhcp_server=None))
+    assert plain[0]["message"] == "Self-assigned address 169.254.30.40: no DHCP server answered"
+
+
+def test_default_gateway_and_snapshot_come_from_one_enumeration(monkeypatch):
+    wifi = _fake_adapter(index=7, name="Wi-Fi", mac="02:00:5E:10:00:07", ipv4=[_v4("192.168.10.23", 24)],
+                         gateways=["192.168.10.1"], dns=["192.168.10.1"], metric_v4=45)
+    eth = _fake_adapter()
+    tunnel = _fake_adapter(index=30, name="Example VPN", mac="", if_type=53, type_name="Tunnel", is_physical=False,
+                           ipv4=[_v4("10.8.0.2", 32)], gateways=[], dns=["10.8.0.1"], dhcp_enabled=False, dhcp_server=None)
+    assert netinfo.default_gateway_for([wifi, eth], eth) == "10.0.0.251"
+    assert netinfo.default_gateway_for([wifi, eth, tunnel], tunnel) == "10.0.0.251", "tunnel without a gateway: the LAN router"
+    assert netinfo.default_gateway_for([], None) is None
+    v6only = _fake_adapter(ipv4=[], gateways=["fe80::1%12"])
+    assert netinfo.default_gateway_for([v6only], v6only) == "fe80::1%12"
+    calls = []
+
+    def query():
+        calls.append(1)
+        if len(calls) > 1:
+            raise OSError(31, "simulated failure: a second enumeration would see nothing")
+        return [wifi, eth]
+
+    monkeypatch.setattr(netinfo, "_query_adapters", query)
+    monkeypatch.setattr(netinfo, "_route_source_ip", lambda probe=("1.1.1.1", 53): "10.0.0.112")
+    netinfo._invalidate_cache()
+    try:
+        snap = netinfo.netinfo_snapshot()
+        assert calls == [1] and snap["default_gateway"] == "10.0.0.251" and snap["internet_nic_index"] == 12
+        assert [a["name"] for a in snap["adapters"]] == ["Ethernet", "Wi-Fi"]
+        assert [x["code"] for x in snap["adapters"][0]["warnings"]] == ["multiple_default_gateways"]
+        assert snap["adapters"][1]["warnings"] == []
+        assert "guid" not in snap["adapters"][0] and "luid" not in snap["adapters"][0]
+        assert not {"prefix_origin", "suffix_origin"} & set(snap["adapters"][0]["ipv4"][0])
+        netinfo._invalidate_cache()
+        assert netinfo.get_default_gateway([wifi, eth]) == "10.0.0.251" and calls == [1]
+    finally:
+        netinfo._invalidate_cache()
+    temp = netinfo._make_ipaddr("2001:db8:10::a1b2:c3d4", 6, 128, 3, 0, 4, 5)
+    assert (temp.prefix_origin, temp.suffix_origin, temp.preferred) == (4, 5, False)
+    assert "suffix_origin" not in temp.to_dict()
+
+
+def test_adapter_identity_fields_real_machine():
+    adapters = netinfo.get_adapters()
+    assert adapters
+    for a in adapters:
+        assert a.guid.startswith("{") and a.guid.endswith("}") and a.luid > 0, a.name

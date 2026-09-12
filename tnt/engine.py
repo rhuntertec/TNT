@@ -2,9 +2,11 @@
 
 Start order: ``ensure_dirs -> logging -> config -> db -> bus -> close stale outages /
 gap row -> dhcp-restore (undo a NIC re-address left behind by a previous run) ->
-IcmpPinger -> PingManager -> OutageTracker -> SpeedScheduler -> DiscoveryScanner ->
+IcmpPinger -> PingManager -> LinkMap -> GeoIpManager (IP location data: loads the installed
+data, its thread downloads) -> OutageTracker -> SpeedScheduler -> DiscoveryScanner ->
 DhcpServer (constructed, never started by itself) -> LanPeers (beacon + throughput server,
-started) -> ApiServer -> maintenance thread (heartbeat + retention)``.
+started) -> NetWatcher (network-change watcher, started) -> ReportManager (Full Scan site
+reports) -> ApiServer -> maintenance thread (heartbeat + retention)``.
 
 Every sibling module is imported lazily inside :meth:`Engine.start` and wrapped in
 ``try/except``: a missing or broken module disables *that* feature (the attribute
@@ -57,6 +59,43 @@ Contract gaps resolved here (documented deviations):
   path as the DHCP tool.  It does not need the database (its peer id then lives in memory
   only), so it is not part of the db retry.  ``stop()`` stops it right after the DHCP
   server, before the pinger goes (a latency ping may be in flight).
+* The network watcher (``tnt.netwatch.NetWatcher``, ``engine.netwatch``) starts after every
+  component it notifies and after dhcp-restore, so its reference state already includes an
+  adapter that step put back on DHCP (the lease returning for it is labelled as TNT's own).
+  For each ``net.changed``, :meth:`Engine._on_net_changed` runs on the watcher thread *before*
+  the bus gets the event: it drops the 10 s status netinfo cache and the 30 s discovery
+  default-range cache, calls ``on_network_change(data)`` on the ping manager, outage tracker,
+  link map, LAN peers and DHCP server, marks a running discovery scan (``network_changed`` in
+  ``discovery.done``) and writes an ``info``/``network`` events row "network changed:
+  <summary>" stamped with the event's ``ts`` on a helper thread (a locked database never holds
+  the event back).  A network that keeps flapping writes at most one row per
+  :data:`Engine.NET_EVENT_ROW_GAP_S` (60 s): the changes in between become one row "network
+  changed N more times, now: <summary>" at the end of that minute.  The outage tracker gets a
+  live default-gateway lookup (``gateway_fn``) for the notes of outages that cross a change.  A
+  ``system sleep`` monitoring gap makes the watcher look at once and every second for a
+  minute.  ``stop()`` stops the watcher first, before anything it notifies.  It needs no
+  database; a failure to start is ``errors["netwatch"]`` and ``/api/status`` then reports
+  generation 0.
+* The site reports manager (``tnt.reports.ReportManager``, ``engine.reports``) starts after the
+  network watcher (it compares the network with the "joined this network" marker it keeps in db
+  meta ``net.joined``) and before the API.  It needs the database: without one it is
+  ``errors["reports"] = "database unavailable"`` and the db retry loop brings it up.  It gets
+  ``net.changed`` after the other consumers, drives ``engine.speed`` and :meth:`discovery_start`
+  for a Full Scan (:meth:`discovery_running` tells it whether a scan it waits for still runs) and
+  is stopped first in ``stop()`` (a running Full Scan is cancelled and saves nothing).
+* The network tracker (``tnt.networks.NetworkTracker``, ``engine.networks``, ARCHITECTURE 3.20) starts right after the bus,
+  before the stale-outage housekeeping and every writer: it identifies the network synchronously, so the first ping minute is
+  tagged.  The gap of the time the service was stopped is tagged with the network the previous run was on
+  (``NetworkTracker.previous_id``); a start on another network records that time as a spell of the previous network ending on
+  the new one (travel), so the gap is left out of the previous site's report.  ``PingManager``, ``OutageTracker`` and ``SpeedScheduler`` get ``network_fn`` (an
+  attribute read of the current id); :meth:`discovery_start` captures it for the run; the outage tracker and the report
+  manager listen for id changes.  ``_on_net_changed`` tells the tracker first, before any other consumer; the heartbeat calls
+  ``touch()``; ``stop()`` stops it after the network watcher.  Without a database (or when the networks migration did not
+  run) nothing is tagged: ``errors["networks"]`` / the tracker idles, and the db retry loop starts it.
+* The IP location manager (``tnt.geoip.GeoIpManager``, ``engine.geoip``) starts right after the link map.  It needs no
+  database, is not part of the db retry, and its ``start()`` only starts the ``tnt-geoip`` thread (the first download
+  check waits ``FIRST_CHECK_DELAY_S``).  ``stop()`` stops it right after the link map.  A failure leaves ``engine.geoip``
+  None with ``errors["geoip"]``; ``status.geoip`` is then null and ``/api/geoip`` answers 503.
 """
 from __future__ import annotations
 
@@ -137,6 +176,7 @@ class Engine:
         self.bus: Any = None
         self.pinger: Any = None
         self.linkmap: Any = None
+        self.geoip: Any = None
         self.raw_log: Any = None
         self.ping: Any = None
         self.outages: Any = None
@@ -144,6 +184,9 @@ class Engine:
         self.discovery: Any = None
         self.dhcp: Any = None
         self.lan: Any = None
+        self.netwatch: Any = None
+        self.reports: Any = None
+        self.networks: Any = None
         self.api: Any = None
 
         self.started_ts: Optional[float] = None
@@ -168,6 +211,17 @@ class Engine:
         self._last_discovery: Optional[Dict[str, Any]] = None
         self._disc_defaults: Dict[str, Any] = {}
         self._disc_defaults_ts = 0.0
+        self._disc_net_changed = False          # the network changed while the running scan ran
+        self._disc_network_id: Optional[int] = None   # the network the running scan started on (tnt.networks)
+
+        # the adapter dhcp-restore put back on DHCP at start (its returning lease is TNT's own change)
+        self._restored_nic: Optional[Dict[str, Any]] = None
+        # "network changed" events rows: when the last one was written (monotonic), the changes held
+        # back since then (count, newest payload) and the timer that writes them
+        self._net_row_lock = threading.Lock()
+        self._net_row_last: Optional[float] = None
+        self._net_row_pending: Optional[tuple] = None
+        self._net_row_timer: Optional[threading.Timer] = None
 
         # monitoring-gap bookkeeping (sleep detection, pause spans) and the db retry thread
         self._last_hb_ts: Optional[float] = None
@@ -211,16 +265,20 @@ class Engine:
         self._start_config()
         self._start_db()
         self._start_bus()
+        self._start_networks()
         self._close_stale_outages()
         self._step("dhcp-restore", self._restore_dhcp_nic)
         self._start_pinger()
         self._start_ping_manager()
         self._start_linkmap()
+        self._start_geoip()
         self._start_outages()
         self._start_speed()
         self._start_discovery()
         self._start_dhcp()
         self._start_lan()
+        self._start_netwatch()
+        self._start_reports()
         self._start_api()
         self._start_maintenance()
         self._db_event("info", "service", f"started v{self.version} ({self.mode} mode)")
@@ -239,12 +297,21 @@ class Engine:
         deadline = t0 + STOP_BUDGET_S
         self._stop.set()
         log.info("engine stopping")
+        if getattr(self, "reports", None) is not None:
+            # a running Full Scan is cancelled (its own speed test and discovery scan with it)
+            self._bounded("reports", self.reports.stop, deadline, 1.5)
         try:
             self.discovery_cancel()
         except Exception:  # noqa: BLE001
             log.exception("discovery cancel failed")
         self._join(self._api_retry_thread, deadline, 1.0)
         self._join(self._maint_thread, deadline, 2.0)
+        if getattr(self, "netwatch", None) is not None:
+            # first: nothing may be told about a network change while it is being torn down
+            self._bounded("netwatch", self.netwatch.stop, deadline, 1.0)
+        if getattr(self, "networks", None) is not None:
+            self._bounded("networks", self.networks.stop, deadline, 1.0)     # a router MAC still being looked for
+        self._bounded("net-rows", self._flush_net_rows, deadline, 1.0)     # a held-back "network changed" row
         if self.api is not None:
             self._bounded("api", lambda: self.api.stop(timeout=min(3.0, max(0.5, deadline - time.monotonic()))), deadline, 3.5)
         if self.dhcp is not None:
@@ -261,6 +328,8 @@ class Engine:
             self._bounded("outages", self.outages.stop, deadline, 2.0)
         if getattr(self, "linkmap", None) is not None:
             self._bounded("linkmap", self.linkmap.stop, deadline, 2.0)
+        if getattr(self, "geoip", None) is not None:
+            self._bounded("geoip", self.geoip.stop, deadline, 1.0)
         if self.ping is not None:
             self._bounded("ping", self.ping.stop, deadline, 4.0)
         if self.raw_log is not None:
@@ -348,6 +417,8 @@ class Engine:
 
     DB_RETRY_S = 30.0
     MONITORING_GAP_S = 90.0
+    #: At most one "network changed" events row this often; the changes in between are summed up in one row.
+    NET_EVENT_ROW_GAP_S = 60.0
 
     def _start_db_retry(self) -> None:
         """The database could not be opened (locked by a backup tool, disk full, permissions).
@@ -376,9 +447,11 @@ class Engine:
                 continue
             log.info("database opened after retry; starting the monitoring components")
             self.errors.pop("db", None)
-            for name in ("ping", "outages", "speedtest", "dhcp", "dhcp-restore"):
+            for name in ("networks", "ping", "outages", "speedtest", "dhcp", "dhcp-restore", "reports"):
                 self.errors.pop(name, None)
             try:
+                if getattr(self, "networks", None) is None:
+                    self._start_networks()
                 self._close_stale_outages()
                 if self.dhcp is None:
                     self._step("dhcp-restore", self._restore_dhcp_nic)
@@ -390,6 +463,8 @@ class Engine:
                     self._start_speed()
                 if self.dhcp is None:
                     self._start_dhcp()
+                if getattr(self, "reports", None) is None:
+                    self._start_reports()
                 self._db_event("warning", "service", "database became available after a failed start; monitoring resumed")
             except Exception:  # noqa: BLE001
                 log.exception("starting components after the database retry failed")
@@ -417,6 +492,11 @@ class Engine:
                 info = {"closed": closed, "gap_id": gid}
         except Exception:  # noqa: BLE001
             log.exception("recording the monitoring gap failed")
+        if note == "system sleep" and getattr(self, "netwatch", None) is not None:
+            try:
+                self.netwatch.poll_soon()       # the machine may have woken up on another network
+            except Exception:  # noqa: BLE001
+                log.exception("waking the network watcher failed")
         log.warning("monitoring gap: %s for %.0f s (%s)", note, end_ts - start_ts, info)
         self._db_event("warning", "monitoring", f"{note}: not monitoring for {end_ts - start_ts:.0f} s")
         self._publish("monitoring.gap", {"start_ts": start_ts, "end_ts": end_ts, "note": note, **info})
@@ -437,7 +517,8 @@ class Engine:
             except Exception:  # noqa: BLE001 - module missing/broken: minimal fallback
                 close_stale_outages = None
             if close_stale_outages is not None:
-                info = close_stale_outages(self.db, now)
+                # the time the service was stopped belongs to the network the previous run was on
+                info = close_stale_outages(self.db, now, network_id=getattr(getattr(self, "networks", None), "previous_id", None))
                 if info.get("closed") or info.get("gap_id"):
                     log.info("startup housekeeping: %s", info)
                 return
@@ -478,7 +559,7 @@ class Engine:
             self.raw_log = None
             self._fail("raw_log", exc)
         try:
-            pm = PingManager(self.db, self.config, self.bus, pinger=self.pinger, raw_log=self.raw_log)
+            pm = PingManager(self.db, self.config, self.bus, pinger=self.pinger, raw_log=self.raw_log, network_fn=self._network_id)
             pm.start()
             self.ping = pm
         except Exception as exc:  # noqa: BLE001
@@ -503,12 +584,35 @@ class Engine:
         try:
             from .linkmap import LinkMap
 
-            lm = LinkMap(self.config, self.bus, pinger=self.pinger)
+            lm = LinkMap(self.config, self.bus, pinger=self.pinger, geo_lookup=self._geo_lookup)
             lm.start()
             self.linkmap = lm
         except Exception as exc:  # noqa: BLE001
             self.linkmap = None
             self._fail("linkmap", exc)
+
+    def _start_geoip(self) -> None:
+        """IP location + ISP data (DB-IP Lite): loads what is installed, downloads on its own thread."""
+        try:
+            from .geoip import GeoIpManager
+
+            gm = GeoIpManager(self.config, self.bus, public_ip_fn=self._public_ip)
+            gm.start()
+            self.geoip = gm
+        except Exception as exc:  # noqa: BLE001
+            self.geoip = None
+            self._fail("geoip", exc)
+
+    def _public_ip(self) -> Optional[str]:
+        lm = getattr(self, "linkmap", None)
+        try:
+            return lm.public_ip() if lm is not None else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _geo_lookup(self, ip: str) -> Optional[Dict[str, Any]]:
+        gm = getattr(self, "geoip", None)
+        return gm.lookup(ip) if gm is not None else None
 
     def _start_outages(self) -> None:
         if self.ping is None:
@@ -519,9 +623,11 @@ class Engine:
             from .outages import OutageTracker
 
             tracker = OutageTracker(self.db, self.config, self.bus, self.ping,
-                                    suppress_new=self._speedtest_running)
+                                    suppress_new=self._speedtest_running, gateway_fn=self._live_gateway,
+                                    network_fn=self._network_id)
             tracker.start()
             self.outages = tracker
+            self._listen_to_networks(getattr(tracker, "on_network_id_change", None))
         except Exception as exc:  # noqa: BLE001
             self.outages = None
             self._fail("outages", exc)
@@ -533,7 +639,7 @@ class Engine:
         try:
             from .speedtest import SpeedScheduler
 
-            sched = SpeedScheduler(self.db, self.config, self.bus)
+            sched = SpeedScheduler(self.db, self.config, self.bus, network_fn=self._network_id)
             sched.start()
             self.speed = sched
         except Exception as exc:  # noqa: BLE001
@@ -596,6 +702,9 @@ class Engine:
             log.warning("startup: restored adapter %s to DHCP after a previous DHCP server run (%s)",
                         info.get("adapter"), info)
             self._db_event("warning", "dhcp", f"restored adapter {info.get('adapter')} to DHCP at start")
+            if info.get("restored") and info.get("adapter"):
+                self._restored_nic = {"adapter": info.get("adapter"), "static_ip": info.get("static_ip"),
+                                      "phase": "restored"}
         return info
 
     def _start_dhcp(self) -> None:
@@ -631,6 +740,151 @@ class Engine:
         except Exception as exc:  # noqa: BLE001
             self.lan = None
             self._fail("lan", exc)
+
+    # ------------------------------------------------------------ network changes
+    def _start_netwatch(self) -> None:
+        """The network-change watcher (``tnt.netwatch.NetWatcher``, ``engine.netwatch``); see the
+        module docstring.  Started after the components it notifies; works without the database."""
+        try:
+            from .netwatch import NetWatcher
+
+            nw = NetWatcher(self.config, self.bus, own_change=self._dhcp_own_change)
+            nw.add_listener(self._on_net_changed)
+            if self._restored_nic:
+                nw.note_own_change(self._restored_nic)
+            nw.start()
+            self.netwatch = nw
+        except Exception as exc:  # noqa: BLE001
+            self.netwatch = None
+            self._fail("netwatch", exc)
+
+    def _start_reports(self) -> None:
+        """Full Scan site reports (``tnt.reports.ReportManager``, ``engine.reports``); see the module docstring."""
+        if self.db is None:
+            self.errors["reports"] = "database unavailable"
+            return
+        try:
+            from .reports import ReportManager
+
+            mgr = ReportManager(self.db, self.config, self.bus, self)
+            mgr.start()
+            self.reports = mgr
+            self._listen_to_networks(getattr(mgr, "on_network_id_change", None))
+        except Exception as exc:  # noqa: BLE001
+            self.reports = None
+            self._fail("reports", exc)
+
+    # ------------------------------------------------------------ networks
+    def _start_networks(self) -> None:
+        """The network tracker (``tnt.networks.NetworkTracker``, ``engine.networks``); see the module docstring."""
+        if getattr(self, "networks", None) is not None:
+            return
+        if self.db is None:
+            self.errors["networks"] = "database unavailable"
+            return
+        try:
+            from .networks import NetworkTracker
+
+            tracker = NetworkTracker(self.db)
+            tracker.start()
+            self.networks = tracker
+        except Exception as exc:  # noqa: BLE001
+            self.networks = None
+            self._fail("networks", exc)
+
+    def _network_id(self) -> Optional[int]:
+        """The id of the network this PC is on (None: unknown, or no tracker): what every writer tags its rows with."""
+        tracker = getattr(self, "networks", None)
+        if tracker is None:
+            return None
+        try:
+            return tracker.current_network_id()
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _listen_to_networks(self, fn: Any) -> None:
+        tracker = getattr(self, "networks", None)
+        if tracker is None or not callable(fn):
+            return
+        try:
+            tracker.add_listener(fn)
+        except Exception:  # noqa: BLE001
+            log.exception("listening to network id changes failed")
+
+    def _dhcp_own_change(self) -> Optional[Dict[str, Any]]:
+        fn = getattr(self.dhcp, "own_change", None)
+        return fn() if callable(fn) else None
+
+    @staticmethod
+    def _live_gateway() -> Optional[str]:
+        """This PC's default gateway right now (netinfo's one-second adapter cache), for the outage tracker."""
+        from . import netinfo  # lazy: optional at runtime
+
+        return netinfo.get_default_gateway()
+
+    def _on_net_changed(self, data: Dict[str, Any]) -> None:
+        """``net.changed`` listener (watcher thread, before the bus): drop the caches that describe
+        the old network, let every consumer react, record the change in the events table."""
+        with self._netinfo_lock:
+            self._netinfo_cache = None
+            self._netinfo_cache_ts = 0.0
+        with self._lock:
+            self._disc_defaults = {}
+            self._disc_defaults_ts = 0.0
+            if self._disc_thread is not None and self._disc_thread.is_alive():
+                self._disc_net_changed = True
+        for name in ("networks", "ping", "outages", "linkmap", "lan", "dhcp", "reports"):
+            # networks first: the samples, outages and reports that follow are tagged with the network identified now
+            fn = getattr(getattr(self, name, None), "on_network_change", None)
+            if not callable(fn):
+                continue
+            try:
+                fn(data)
+            except Exception:  # noqa: BLE001
+                log.exception("%s: handling the network change failed", name)
+        self._record_net_change(data)
+
+    def _record_net_change(self, data: Dict[str, Any]) -> None:
+        """The "network changed" events row: written at once (on a helper thread: a database locked by a
+        backup tool must not hold the event back) unless one went in less than NET_EVENT_ROW_GAP_S ago; then
+        this change is held back and a timer writes one row for everything held back when that time is up."""
+        if self.db is None:
+            return
+        now = time.monotonic()
+        with self._net_row_lock:
+            last, gap = self._net_row_last, float(self.NET_EVENT_ROW_GAP_S)
+            if last is not None and 0.0 <= now - last < gap:
+                count = (self._net_row_pending[0] if self._net_row_pending else 0) + 1
+                self._net_row_pending = (count, data)
+                if self._net_row_timer is None:
+                    timer = threading.Timer(max(0.0, last + gap - now), self._flush_net_rows)
+                    timer.name, timer.daemon = "tnt-net-rows", True
+                    self._net_row_timer = timer
+                    timer.start()
+                return
+            self._net_row_last = now
+        threading.Thread(target=self._write_net_row, args=(data, 1), name="tnt-net-event", daemon=True).start()
+
+    def _flush_net_rows(self) -> None:
+        """Write the row for the changes held back (the timer, or stop()); nothing when there are none."""
+        with self._net_row_lock:
+            pending, self._net_row_pending = self._net_row_pending, None
+            timer, self._net_row_timer = self._net_row_timer, None
+            if pending is not None:
+                self._net_row_last = time.monotonic()
+        if timer is not None and timer is not threading.current_thread():
+            timer.cancel()
+        if pending is not None:
+            self._write_net_row(pending[1], pending[0])
+
+    def _write_net_row(self, data: Dict[str, Any], count: int) -> None:
+        summary = str(data.get("summary") or "")
+        message = f"network changed: {summary}" if count <= 1 else f"network changed {count} more times, now: {summary}"
+        ts = data.get("ts")
+        try:
+            self.db.add_event("info", "network", message.strip(), ts=float(ts) if isinstance(ts, (int, float)) else None)
+        except Exception:  # noqa: BLE001
+            log.exception("db event write failed")
 
     def _api_address(self) -> tuple[str, int]:
         host = "127.0.0.1"
@@ -734,6 +988,12 @@ class Engine:
             self.db.set_meta("last_heartbeat", str(now))
         except Exception:  # noqa: BLE001
             log.exception("heartbeat write failed")
+        tracker = getattr(self, "networks", None)
+        if tracker is not None:
+            try:
+                tracker.touch(now)          # last_seen (once a minute) and a router swapped behind the same address
+            except Exception:  # noqa: BLE001
+                log.exception("network tracker heartbeat failed")
 
     def _run_retention(self, now: float, scheduled: bool) -> None:
         days = 365
@@ -876,12 +1136,16 @@ class Engine:
         return ok
 
     def netinfo_summary(self) -> Dict[str, Any]:
-        """``{"internet_nic": {...}|None, "adapter_count": int}`` for /api/status (cached 10 s)."""
+        """``{"internet_nic": {...}|None, "local_nic": {...}|None, "adapter_count": int}`` for /api/status
+        (cached 10 s).  Both adapter dicts carry ``warnings`` (the codes of ``netinfo.adapter_warnings``);
+        ``local_nic`` is the adapter the dashboard shows when none faces the internet: the first up
+        physical one with an IPv4 address, a real address before a self-assigned one (a bench cable, the
+        DHCP server tool, no DHCP server answering)."""
         now = time.time()
         with self._netinfo_lock:
             if self._netinfo_cache is not None and now - self._netinfo_cache_ts < NETINFO_CACHE_S:
                 return dict(self._netinfo_cache)
-        summary: Dict[str, Any] = {"internet_nic": None, "adapter_count": 0}
+        summary: Dict[str, Any] = {"internet_nic": None, "local_nic": None, "adapter_count": 0}
         try:
             from . import netinfo  # lazy: optional at runtime
 
@@ -889,24 +1153,13 @@ class Engine:
             summary["adapter_count"] = len(adapters)
             nic = netinfo.get_internet_nic(adapters)
             if nic is not None:
-                v4 = list(getattr(nic, "ipv4", None) or [])
-                # prefer the preferred (non-tentative, non-APIPA) address the NIC reports as primary
-                primary = getattr(nic, "primary_ipv4", None)
-                first = next((a for a in v4 if getattr(a, "address", None) == primary), None) or (v4[0] if v4 else None)
-                gws = [g for g in (getattr(nic, "gateways", None) or []) if ":" not in str(g)] or list(getattr(nic, "gateways", None) or [])
-                v4gw = getattr(nic, "ipv4_gateway", None)
-                if v4gw:
-                    gws = [v4gw] + [g for g in gws if g != v4gw]
-                summary["internet_nic"] = {
-                    "index": getattr(nic, "index", None),
-                    "name": getattr(nic, "name", None),
-                    "description": getattr(nic, "description", None),
-                    "type_name": getattr(nic, "type_name", None),
-                    "ipv4": getattr(first, "address", None) if first is not None else None,
-                    "network": getattr(first, "network", None) if first is not None else None,
-                    "gateway": gws[0] if gws else None,
-                    "mac": getattr(nic, "mac", None),
-                }
+                summary["internet_nic"] = self._nic_brief(netinfo, nic, adapters, getattr(nic, "index", None))
+            else:
+                bench = [a for a in adapters if getattr(a, "is_up", False) and getattr(a, "is_physical", False)
+                         and getattr(a, "primary_ipv4", None)]
+                bench.sort(key=lambda a: 1 if str(a.primary_ipv4).startswith("169.254.") else 0)
+                if bench:
+                    summary["local_nic"] = self._nic_brief(netinfo, bench[0], adapters, None)
         except Exception as exc:  # noqa: BLE001
             log.debug("netinfo summary unavailable: %s", exc)
             summary["error"] = f"{type(exc).__name__}: {exc}"
@@ -914,6 +1167,32 @@ class Engine:
             self._netinfo_cache = dict(summary)
             self._netinfo_cache_ts = now
         return summary
+
+    @staticmethod
+    def _nic_brief(netinfo: Any, nic: Any, adapters: List[Any], internet_index: Optional[int]) -> Dict[str, Any]:
+        """One adapter for status.netinfo: its primary IPv4 address with the network, the gateway and the
+        codes of ``netinfo.adapter_warnings`` (*internet_index* adds the one that compares adapters)."""
+        v4 = list(getattr(nic, "ipv4", None) or [])
+        # prefer the preferred (non-tentative, non-APIPA) address the NIC reports as primary
+        primary = getattr(nic, "primary_ipv4", None)
+        first = next((a for a in v4 if getattr(a, "address", None) == primary), None) or (v4[0] if v4 else None)
+        gws = [g for g in (getattr(nic, "gateways", None) or []) if ":" not in str(g)] or list(getattr(nic, "gateways", None) or [])
+        v4gw = getattr(nic, "ipv4_gateway", None)
+        if v4gw:
+            gws = [v4gw] + [g for g in gws if g != v4gw]
+        warn = getattr(netinfo, "adapter_warnings", None)
+        found = warn(nic, adapters, internet_index) if callable(warn) else []
+        return {
+            "index": getattr(nic, "index", None),
+            "name": getattr(nic, "name", None),
+            "description": getattr(nic, "description", None),
+            "type_name": getattr(nic, "type_name", None),
+            "ipv4": getattr(first, "address", None) if first is not None else None,
+            "network": getattr(first, "network", None) if first is not None else None,
+            "gateway": gws[0] if gws else None,
+            "mac": getattr(nic, "mac", None),
+            "warnings": [str(w["code"]) for w in found or [] if isinstance(w, dict) and w.get("code")],
+        }
 
     # ------------------------------------------------------------- discovery
     @staticmethod
@@ -977,6 +1256,8 @@ class Engine:
             self._disc_ports = ps
             self._disc_started_ts = time.time()
             self._disc_progress = None
+            self._disc_net_changed = False
+            self._disc_network_id = self._network_id()      # the run is stored with the network it started on
             t = threading.Thread(target=self._discovery_run, args=(disc, rt, ps, cancel), name="tnt-discovery", daemon=True)
             self._disc_thread = t
             # announce before the worker runs so discovery.start always precedes discovery.progress
@@ -1014,6 +1295,10 @@ class Engine:
                 run["ports"] = run.get("ports") or ports
                 if run.get("ts") is None:
                     run["ts"] = time.time()
+                with self._lock:
+                    network_id = self._disc_network_id
+                if network_id is not None:
+                    run["network_id"] = network_id
                 if self.db is not None:
                     run_id = int(self.db.add_discovery_run(run, hosts))
                 summary.update({
@@ -1036,11 +1321,20 @@ class Engine:
                 log.exception("persisting the discovery run failed")
         with self._lock:
             self._disc_cancel = None
+            # a scan that ran across a network change swept (part of) the network this PC left
+            summary["network_changed"] = bool(self._disc_net_changed)
+            self._disc_net_changed = False
         state = "cancelled" if summary["cancelled"] else ("finished" if summary["ok"] else "failed")
         log.info("discovery scan %s: %s found=%s run_id=%s error=%s", state, summary["cidr"], summary["found"], run_id, summary["error"])
         self._db_event("info" if summary["ok"] else "warning", "discovery",
-                       f"scan {state}: {summary['cidr']} found {summary['found']}" + (f" ({summary['error']})" if summary["error"] else ""))
+                       f"scan {state}: {summary['cidr']} found {summary['found']}" + (f" ({summary['error']})" if summary["error"] else "")
+                       + (" - the network changed during the scan" if summary["network_changed"] else ""))
         self._publish("discovery.done", summary)
+
+    def discovery_running(self) -> bool:
+        """True while a scan thread is alive (unlike :meth:`discovery_status`, no adapter or config access)."""
+        with self._lock:
+            return self._disc_thread is not None and self._disc_thread.is_alive()
 
     def discovery_cancel(self) -> bool:
         """Cancel the running scan; True if one was running."""

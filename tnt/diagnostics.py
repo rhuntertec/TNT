@@ -18,6 +18,12 @@ Contract notes / small gaps resolved here:
 * ``logs.ping_log_files`` is the number of files in ``logs/pings``.
 * ``cpu_pct`` is the process CPU percentage since the previous call (psutil
   semantics); the first call after import measures since import time.
+* ``network`` - ``engine.netwatch.state()`` (generation, changed_ts, default
+  gateway, internet NIC, summary, poll interval, poll/failure counters) plus
+  ``last_change`` (the last ``net.changed`` payload) and ``available``;
+  ``{"available": false}`` without a watcher.
+* ``geoip`` - ``{"available", "status", "files"}`` (``tnt.geoip.DIAG_KEYS``): the IP location manager's
+  ``status()`` and ``files()``; ``{"available": false, "status": null, "files": []}`` without one.
 """
 from __future__ import annotations
 
@@ -375,6 +381,25 @@ def _cpu_pct() -> float:
     return float(_PROC.cpu_percent(None))
 
 
+def _network(engine: Any) -> Dict[str, Any]:
+    """The network watcher's state plus the last ``net.changed`` it published."""
+    watch = getattr(engine, "netwatch", None)
+    if watch is None:
+        return {"available": False}
+    out = dict(watch.state())
+    out["available"] = True
+    last = getattr(watch, "last_event", None)
+    out["last_change"] = last() if callable(last) else None
+    return out
+
+
+def _geoip(engine: Any) -> Dict[str, Any]:
+    comp = getattr(engine, "geoip", None)
+    if comp is None:
+        return {"available": False, "status": None, "files": []}
+    return {"available": True, "status": comp.status(), "files": comp.files()}
+
+
 def _recent_events(engine: Any) -> List[Dict[str, Any]]:
     db = getattr(engine, "db", None)
     if db is None:
@@ -404,6 +429,8 @@ def collect(engine: Any) -> Dict[str, Any]:
         "outages": _safe(lambda: _outages(engine)),
         "speedtest": _safe(lambda: _speedtest(engine)),
         "discovery": _safe(lambda: _discovery(engine)),
+        "network": _safe(lambda: _network(engine)),
+        "geoip": _safe(lambda: _geoip(engine)),
         "threads": _safe(_threads),
         "memory_mb": _safe(_memory_mb),
         "cpu_pct": _safe(_cpu_pct),

@@ -69,7 +69,7 @@ def _resolve(host: str) -> Optional[str]:
 
 
 def make(script: Dict[int, List[Tuple[Any, ...]]], gateway: Optional[str] = GATEWAY, names: Optional[Dict[str, str]] = None,
-         resolver: Callable[[str], Optional[str]] = _resolve, local: Any = "10.0.0.112"):
+         resolver: Callable[[str], Optional[str]] = _resolve, local: Any = "10.0.0.112", geo: Optional[Callable[[], Any]] = None):
     bus = EventBus()
     events: List[Dict[str, Any]] = []
     bus.subscribe(lambda e: events.append(e))
@@ -84,7 +84,7 @@ def make(script: Dict[int, List[Tuple[Any, ...]]], gateway: Optional[str] = GATE
 
     local_fn = local if callable(local) else (lambda: local)
     tracer = Tracer(pinger, bus, clock=lambda: clock["now"], resolver=resolver, reverse=reverse,
-                    gateway_fn=lambda: gateway, local_fn=local_fn)
+                    gateway_fn=lambda: gateway, local_fn=local_fn, geo=geo)
     return tracer, pinger, events, clock, reverse_calls
 
 
@@ -104,7 +104,8 @@ def test_full_path_classification_stats_and_events():
     assert [h["ttl"] for h in hops] == [1, 2, 3, 4, 5]
     for h in hops:
         assert set(h) == {"ttl", "ip", "alt_ips", "hostname", "rtts", "avg_ms", "min_ms", "max_ms", "loss",
-                          "responder_status", "kind", "label"}
+                          "responder_status", "kind", "label", "location"}
+        assert list(h)[-1] == "location" and h["location"] is None      # no geo provider
     assert [h["kind"] for h in hops] == ["gateway", "lan", "unknown", "public", "destination"]
     assert [h["label"] for h in hops] == ["Gateway", "LAN", "No reply", "Internet", "Destination"]
 
@@ -322,3 +323,170 @@ def test_lan_address_and_hop_classification():
     assert classify_hop(CGNAT, GATEWAY) == ("lan", "LAN")
     assert classify_hop(PUBLIC, GATEWAY) == ("public", "Internet")
     assert set(tr.KIND_LABELS) == {"gateway", "lan", "public", "destination", "unknown"}
+
+
+# -- hop locations (tnt.geoip) ---------------------------------------------------------------------------------
+# a router name with a generic Dallas code on the public hop; the fixture data (tests/mmdb_writer.py) places
+# PUBLIC in Anytown, TX, TARGET in Richardson, TX and this PC's public address 203.0.113.200 in Dallas
+GEO_NAMES = {PUBLIC: "ae-1.cr1.dllstx.example.net", TARGET: "www.example"}
+GEO_PATH: Dict[int, List[Tuple[Any, ...]]] = {
+    1: [(GATEWAY, 0.8)],
+    2: [(CGNAT, 5.0)],
+    3: [(None, None)],
+    4: [(PUBLIC, 12.0), (PUBLIC, 12.4), (PUBLIC, 12.1)],
+    5: [(TARGET, 20.0), (TARGET, 22.0), (TARGET, 21.0)],
+}
+PUBLIC_DB = {"text": "Anytown, TX", "source": "database", "hint": None, "db_text": "Anytown, TX", "asn": 64500,
+             "as_org": "Example Broadband"}
+TARGET_DB = {"text": "Richardson, TX", "source": "database", "hint": None, "db_text": "Richardson, TX", "asn": 64510,
+             "as_org": "Example Transit, Inc."}
+
+
+@pytest.fixture
+def geo_mgr(tmp_path):
+    """A real IP location manager with the fixture data installed in a tmp_path folder (never the data folder)."""
+    from geoip_helpers import installed_manager
+
+    mgr = installed_manager(tmp_path, public_ip="203.0.113.200")
+    yield mgr
+    mgr.stop()
+
+
+def test_hop_locations_from_database_and_router_names(geo_mgr, tmp_path):
+    tracer, pinger, events, clock, reverse_calls = make(GEO_PATH, names=GEO_NAMES, geo=lambda: geo_mgr)
+    res = tracer.trace("www.example")
+    assert res["complete"] is True and tracer.last is res
+    gw, cg, silent, pub, dst = res["hops"]
+    assert gw["location"] is None and cg["location"] is None and silent["location"] is None
+    # the router name wins: the speed-of-light guard runs with origin Dallas and min_ms 12.0
+    assert pub["hostname"] == "ae-1.cr1.dllstx.example.net" and pub["min_ms"] == 12.0
+    assert pub["location"] == {"text": "Dallas, TX", "source": "hostname", "hint": "dllstx", "db_text": "Anytown, TX",
+                               "asn": 64500, "as_org": "Example Broadband"}
+    assert dst["hostname"] == "www.example" and dst["location"] == TARGET_DB
+    assert all(list(h)[-1] == "location" for h in res["hops"])
+
+    # the live events carry the hop-completion value: the database, or the name if the reverse lookup was back
+    live = {e["data"]["hop"]["ttl"]: e["data"]["hop"] for e in events if e["type"] == "trace.hop"}
+    assert live[1]["location"] is None and live[3]["location"] is None
+    assert live[4]["location"]["source"] in ("database", "hostname") and live[4]["location"]["db_text"] == "Anytown, TX"
+    assert live[4]["location"] is not pub["location"]           # refined into a new dict, never mutated in place
+    assert live[5]["location"]["db_text"] == "Richardson, TX"
+
+    # origin() is really used: seen from a public address in London the Dallas name is 12 ms too far away
+    from geoip_helpers import installed_manager
+
+    far = installed_manager(tmp_path / "far", public_ip="2001:db8::5")
+    try:
+        tracer, *_ = make(GEO_PATH, names=GEO_NAMES, geo=lambda: far)
+        assert tracer.trace("www.example")["hops"][3]["location"] == PUBLIC_DB
+    finally:
+        far.stop()
+
+
+def test_destination_hop_ignores_generic_router_names(geo_mgr):
+    tracer, *_ = make(GEO_PATH, names={TARGET: "ae-1.cr1.dllstx.example.net"}, geo=lambda: geo_mgr)
+    res = tracer.trace("www.example")
+    dst = res["hops"][-1]
+    assert dst["kind"] == "destination" and dst["hostname"] == "ae-1.cr1.dllstx.example.net"
+    assert dst["location"] == TARGET_DB
+    assert res["hops"][3]["hostname"] is None and res["hops"][3]["location"] == PUBLIC_DB
+
+
+def test_hop_locations_without_names_are_database_only(geo_mgr):
+    tracer, pinger, events, clock, reverse_calls = make(GEO_PATH, names=GEO_NAMES, geo=lambda: geo_mgr)
+    res = tracer.trace("www.example", resolve_names=False)
+    assert res["complete"] is True and reverse_calls == []
+    assert [h["location"] for h in res["hops"]] == [None, None, None, PUBLIC_DB, TARGET_DB]
+    live = [e["data"]["hop"] for e in events if e["type"] == "trace.hop"]
+    assert [h["location"] for h in live] == [None, None, None, PUBLIC_DB, TARGET_DB]
+
+
+def test_abandoned_reverse_lookup_keeps_database_location(geo_mgr, monkeypatch):
+    monkeypatch.setattr(tr, "REVERSE_DNS_DEADLINE_S", 0.2)
+    release = threading.Event()
+
+    def slow_reverse(ip: str) -> Optional[str]:
+        if ip == PUBLIC:
+            release.wait(5)
+            return "ae-1.cr1.dllstx.example.net"
+        return None
+
+    tracer = Tracer(ScriptedPinger({1: [(GATEWAY, 1.0)], 2: [(PUBLIC, 12.0)], 3: [(TARGET, 20.0)]}), EventBus(),
+                    resolver=lambda h: TARGET, reverse=slow_reverse, gateway_fn=lambda: GATEWAY, local_fn=lambda: None,
+                    geo=lambda: geo_mgr)
+    try:
+        res = tracer.trace(TARGET, probes=1)
+    finally:
+        release.set()
+    assert res["complete"] is True
+    pub = res["hops"][1]
+    assert pub["hostname"] is None and pub["location"] == PUBLIC_DB
+    threading.Event().wait(0.1)                  # the abandoned lookup finishing later changes nothing
+    assert tracer.last["hops"][1]["hostname"] is None and tracer.last["hops"][1]["location"] == PUBLIC_DB
+
+
+def test_lan_destination_and_disabled_geo_give_none(geo_mgr):
+    lan_target = "192.168.1.20"
+    tracer, *_ = make({1: [(lan_target, 0.5)]}, gateway="192.168.1.1", resolver=lambda h: lan_target, geo=lambda: geo_mgr)
+    res = tracer.trace(lan_target)
+    assert res["complete"] is True and res["hops"][0]["kind"] == "destination" and res["hops"][0]["location"] is None
+
+    tracer, *_ = make(GEO_PATH, names=GEO_NAMES, geo=lambda: None)
+    res = tracer.trace("www.example")
+    assert res["complete"] is True and all(h["location"] is None for h in res["hops"])
+
+    def broken() -> Any:
+        raise RuntimeError("no IP location")
+
+    tracer, *_ = make(GEO_PATH, names=GEO_NAMES, geo=broken)
+    res = tracer.trace("www.example")
+    assert res["complete"] is True and res["error"] is None and all(h["location"] is None for h in res["hops"])
+
+    # the setting switched off: the manager answers None for every hop
+    geo_mgr.config.update({"geoip": {"enabled": False}}, persist=False)
+    tracer, *_ = make(GEO_PATH, names=GEO_NAMES, geo=lambda: geo_mgr)
+    res = tracer.trace("www.example")
+    assert res["complete"] is True and all(h["location"] is None for h in res["hops"])
+
+
+def test_geo_locate_raising_is_contained():
+    class BrokenGeo:
+        def __init__(self) -> None:
+            self.calls: List[Tuple[Any, ...]] = []
+
+        def origin(self) -> Any:
+            raise RuntimeError("origin failed")
+
+        def locate_hop(self, ip, hostname=None, min_ms=None, origin=None, kind=None):
+            self.calls.append((ip, hostname, min_ms, origin, kind))
+            raise RuntimeError("lookup failed")
+
+    geo = BrokenGeo()
+    tracer, *_ = make(GEO_PATH, names=GEO_NAMES, geo=lambda: geo)
+    res = tracer.trace("www.example")
+    assert res["complete"] is True and res["error"] is None and all(h["location"] is None for h in res["hops"])
+    assert {c[0] for c in geo.calls} == {PUBLIC, TARGET}         # never asked about LAN, CGNAT or silent hops
+    assert all(c[3] is None for c in geo.calls)                  # origin() raising gives no origin
+    assert ("public", "destination") == (geo.calls[0][4], [c for c in geo.calls if c[0] == TARGET][0][4])
+
+    class OddGeo:
+        def origin(self) -> Any:
+            return None
+
+        def locate_hop(self, *args: Any, **kwargs: Any) -> Any:
+            return ["not", "a", "location"]
+
+    tracer, *_ = make(GEO_PATH, names=GEO_NAMES, geo=lambda: OddGeo())
+    res = tracer.trace("www.example")
+    assert res["complete"] is True and all(h["location"] is None for h in res["hops"])
+
+
+def test_ipv6_public_hop_location(geo_mgr):
+    v6 = "2001:db8::1"
+    tracer, *_ = make({1: [(GATEWAY, 0.5)], 2: [(v6, 30.0)]}, names={}, resolver=lambda h: v6, geo=lambda: geo_mgr)
+    res = tracer.trace(v6)
+    assert res["complete"] is True
+    hop = res["hops"][-1]
+    assert hop["kind"] == "destination" and hop["location"] == {
+        "text": "London, United Kingdom", "source": "database", "hint": None, "db_text": "London, United Kingdom",
+        "asn": 64511, "as_org": "Example Hosting LLC"}

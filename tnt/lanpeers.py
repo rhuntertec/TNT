@@ -42,6 +42,13 @@ both rules.
 ``lan.enabled`` (config, default on) switches the whole feature off: ``start()`` then does
 nothing and ``peers_view()`` reports ``listening: false`` with ``error: "disabled"``.
 
+Network changes (:meth:`LanPeers.on_network_change`, called by the Engine for ``net.changed``):
+the adapter and self-address caches are dropped, the next beacon leaves at once from the new
+addresses, every peer is matched to the current adapters again and a peer that sat on a subnet
+this PC has left is dropped straight away instead of 20 s later (a peer that never matched a
+subnet, heard through the limited broadcast, stays); ``lan.peers`` follows when the table
+changed and ``lan.state`` carries the new ``self`` address.
+
 Every worker thread is wrapped so a malformed datagram, a hostile client or a dead socket
 can never kill a thread or the service.  Injectable seams (keyword arguments, defaulting
 to the real thing): ``socket_factory``, ``adapters_fn``, ``runner`` (netsh), ``clock``,
@@ -286,6 +293,20 @@ def _adapter_ipv4s(adapter: Any) -> List[Tuple[str, int]]:
     return out
 
 
+def _bench_ipv4(adapters: Sequence[Any]) -> Optional[str]:
+    """The address "This PC" shows without an internet-facing adapter (a bench cable with static or self-assigned
+    addresses, no default route): the first up adapter's address the beacons go out from, a physical adapter's
+    before a virtual one and a routable address before a 169.254.x.x one; ``/32`` tunnel endpoints never."""
+    ranked = []
+    for pos, a in enumerate(adapters or []):
+        if not _adapter_up(a):
+            continue
+        for ip, prefix in _adapter_ipv4s(a):
+            if 1 <= prefix < 32 and not ip.startswith("127."):
+                ranked.append((0 if getattr(a, "is_physical", False) else 1, 1 if ip.startswith("169.254.") else 0, pos, ip))
+    return min(ranked)[3] if ranked else None
+
+
 def _adapter_up(adapter: Any) -> bool:
     try:
         return bool(getattr(adapter, "is_up", True)) and not bool(getattr(adapter, "is_loopback", False))
@@ -360,6 +381,8 @@ class LanPeers:
         self._op_lock = threading.RLock()       # start / stop serialised
         self._tp_lock = threading.Lock()        # one client-side throughput test at a time
         self._stop_evt = threading.Event()
+        self._beacon_wake = threading.Event()   # set to send the next beacon now (network change, stop)
+        self._rematch_pending = False           # a network change could not read the adapters: re-match at the next beacon
         self._running = False
         self._listening = False
         self._errors: Dict[str, str] = {}       # component -> problem (listener, server, firewall)
@@ -485,13 +508,14 @@ class LanPeers:
         self._adapter_cache = (now, out)
         return out
 
-    def _adapter_for(self, ip: str) -> Optional[str]:
-        """Name of the up adapter whose subnet contains *ip* (``None`` when none does)."""
+    def _adapter_for(self, ip: str, adapters: Optional[Sequence[Any]] = None) -> Optional[str]:
+        """Name of the up adapter (of *adapters*, default the cached list) whose subnet contains
+        *ip* (``None`` when none does)."""
         try:
             addr = ipaddress.IPv4Address(ip)
         except ValueError:
             return None
-        for a in self._adapters():
+        for a in (self._adapters() if adapters is None else adapters):
             for own, prefix in _adapter_ipv4s(a):
                 try:
                     if addr in ipaddress.IPv4Interface(f"{own}/{prefix}").network:
@@ -501,7 +525,7 @@ class LanPeers:
         return None
 
     def _self_ip(self) -> Optional[str]:
-        """Primary IPv4 of the internet-facing NIC (cached 5 s); ``None`` when unknown."""
+        """Primary IPv4 of the internet-facing NIC, else :func:`_bench_ipv4` (cached 5 s); ``None`` when unknown."""
         now = time.monotonic()
         ts, cached = self._self_cache
         if ts > 0 and now - ts < SELF_INFO_CACHE_S:
@@ -521,6 +545,8 @@ class LanPeers:
                 if not ip:
                     ips = _adapter_ipv4s(nic)
                     ip = ips[0][0] if ips else None
+            if not ip:
+                ip = _bench_ipv4(adapters)
         except Exception:  # noqa: BLE001
             log.debug("internet NIC lookup failed", exc_info=True)
         self._self_cache = (now, ip)
@@ -582,11 +608,18 @@ class LanPeers:
 
     def _beacon_loop(self, stop_evt: threading.Event) -> None:
         while not stop_evt.is_set():
+            self._beacon_wake.clear()
             try:
+                if self._rematch_pending:
+                    self.refresh_peer_adapters()
                 self.send_beacon()
             except Exception:  # noqa: BLE001 - the beacon thread must never die
                 log.exception("beacon loop error")
-            self._wait(BEACON_INTERVAL_S, stop_evt)
+            if self._sleep is not None:
+                self._wait(BEACON_INTERVAL_S, stop_evt)
+            else:
+                # an early wake: the network changed (announce the new addresses now) or stop()
+                self._beacon_wake.wait(BEACON_INTERVAL_S)
 
     # -- peer table ----------------------------------------------------------------------
     def handle_datagram(self, raw: Any, src: Any) -> Optional[Dict[str, Any]]:
@@ -628,6 +661,69 @@ class LanPeers:
             log.info("LAN peer(s) expired: %s", ", ".join(gone))
             self._publish_peers()
         return gone
+
+    def _read_adapters(self) -> Optional[List[Any]]:
+        """Up, non-loopback adapters read afresh (the seam, else ``netinfo._query_adapters``); ``None``
+        when the enumeration failed, which :meth:`_adapters` cannot tell apart from no adapters."""
+        try:
+            if self._adapters_fn is not None:
+                return [a for a in (self._adapters_fn() or []) if _adapter_up(a)]
+            netinfo = importlib.import_module("tnt.netinfo")
+            query = getattr(netinfo, "_query_adapters", None)
+            if not callable(query):
+                return list(netinfo.get_adapters(include_down=False, include_loopback=False) or [])
+            return [a for a in (query() or []) if _adapter_up(a)]
+        except Exception:  # noqa: BLE001
+            log.warning("LAN peers: reading the adapters failed; the peers are matched again at the next beacon", exc_info=True)
+            return None
+
+    def refresh_peer_adapters(self) -> List[str]:
+        """Match every peer to the current adapters again (after a network change).  A peer that
+        sat on one of this PC's subnets and no longer does is dropped at once; one that never
+        matched a subnet (heard through the limited broadcast) is kept.  Publishes ``lan.peers``
+        when the table changed; returns the dropped ids.  When the adapters cannot be read nothing
+        is dropped (a failed enumeration is not "no subnets") and the beacon thread tries again."""
+        adapters = self._read_adapters()
+        if adapters is None:
+            self._rematch_pending = True
+            return []
+        self._rematch_pending = False
+        self._adapter_cache = (time.monotonic(), adapters)
+        with self._lock:
+            recs = [(pid, rec.get("ip"), rec.get("adapter")) for pid, rec in self._peers.items()]
+        verdicts = [(pid, ip, old, self._adapter_for(str(ip or ""), adapters)) for pid, ip, old in recs]
+        gone: List[str] = []
+        changed = False
+        with self._lock:
+            for pid, ip, old, new in verdicts:
+                rec = self._peers.get(pid)
+                if rec is None or rec.get("ip") != ip:
+                    continue                    # a beacon moved it meanwhile: that one is current
+                if old and new is None:
+                    self._peers.pop(pid, None)
+                    gone.append(pid)
+                    changed = True
+                elif new != old:
+                    rec["adapter"] = new
+                    changed = True
+        if gone:
+            log.info("LAN peer(s) no longer on a local subnet: %s", ", ".join(gone))
+        if changed:
+            self._publish_peers()
+        return gone
+
+    def on_network_change(self, data: Optional[Dict[str, Any]] = None) -> None:
+        """``net.changed`` (network watcher thread; quick, never raises): fresh adapters and self
+        address, the next beacon from the new addresses right away, peers re-matched
+        (:meth:`refresh_peer_adapters`) and ``lan.state`` with the new view."""
+        try:
+            self._adapter_cache = (0.0, [])
+            self._self_cache = (0.0, None)
+            self._beacon_wake.set()
+            self.refresh_peer_adapters()
+            self._publish("lan.state", self.peers_view())
+        except Exception:  # noqa: BLE001
+            log.exception("handling a network change in LAN peers failed")
 
     def _peer_rows(self, now: Optional[float] = None) -> List[Dict[str, Any]]:
         now = float(self._clock() if now is None else now)
@@ -841,6 +937,7 @@ class LanPeers:
                 return
             self._running = False
             self._stop_evt.set()
+            self._beacon_wake.set()
             with self._lock:
                 socks = [self._listen_sock, self._server_sock] + list(self._server_conns)
                 self._listen_sock = self._server_sock = None

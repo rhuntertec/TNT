@@ -20,6 +20,10 @@ Contract gaps filled here (documented as required):
   discovery scanner may ask for hundreds of vendors per run.
 * ``netaddr`` is imported lazily; if it is missing or broken the lookup degrades to
   the randomised-MAC rule only (logged once) instead of raising.
+* :func:`normalize_oui` / :func:`vendor_for_oui` answer ``GET /api/oui`` for the WiFi tile,
+  which only ever sends 24-bit prefixes (never a whole BSSID) to the service: the MA-L (OUI)
+  registration alone, since an IAB/MA-M/MA-S owner cannot be told from 24 bits, and ``None``
+  for an unregistered, multicast or locally administered prefix.
 """
 from __future__ import annotations
 
@@ -30,7 +34,8 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
-__all__ = ["normalize_mac", "vendor_for_mac", "is_randomized_mac", "RANDOMIZED_TEXT", "NULL_MAC"]
+__all__ = ["normalize_mac", "vendor_for_mac", "is_randomized_mac", "normalize_oui", "vendor_for_oui",
+           "RANDOMIZED_TEXT", "NULL_MAC"]
 
 RANDOMIZED_TEXT = "Locally administered (randomized)"
 BROADCAST_MAC = "FF:FF:FF:FF:FF:FF"
@@ -39,6 +44,8 @@ NULL_MAC = "00:00:00:00:00:00"       # placeholder, never a device (the registry
 # Only hex digits and the usual separators may appear in a MAC string.
 _ALLOWED_RE = re.compile(r"^[0-9A-Fa-f:\-.\s]+$")
 _SEPARATORS_RE = re.compile(r"[:\-.\s]")
+# A 24-bit prefix: three hex pairs joined by one separator style (":", "-" or none).
+_OUI_RE = re.compile(r"^([0-9A-Fa-f]{2})([:-]?)([0-9A-Fa-f]{2})\2([0-9A-Fa-f]{2})$")
 _netaddr_warned = False
 
 
@@ -95,6 +102,48 @@ def _registered_org(prefix36: str) -> Optional[str]:
             log.debug("netaddr %s lookup failed for %s", attr, prefix36, exc_info=True)
             continue
     return None
+
+
+def normalize_oui(prefix: str) -> Optional[str]:
+    """``aa-bb-cc`` / ``aabbcc`` / ``AA:BB:CC`` (surrounding whitespace allowed) -> ``"AA:BB:CC"``, else None."""
+    if not isinstance(prefix, str):
+        return None
+    m = _OUI_RE.match(prefix.strip())
+    if m is None:
+        return None
+    return f"{m.group(1)}:{m.group(3)}:{m.group(4)}".upper()
+
+
+@functools.lru_cache(maxsize=4096)
+def _registered_oui(prefix: str) -> Optional[str]:
+    global _netaddr_warned
+    try:
+        from netaddr import OUI, NotRegisteredError  # noqa: WPS433 - lazy on purpose
+    except Exception:  # noqa: BLE001 - keep working without the package
+        if not _netaddr_warned:
+            _netaddr_warned = True
+            log.warning("netaddr is not importable; vendor lookups disabled")
+        return None
+    try:
+        org = str(getattr(OUI(prefix.replace(":", "-")).registration(), "org", "") or "").strip()
+        return org or None
+    except NotRegisteredError:
+        return None
+    except Exception:  # noqa: BLE001 - a corrupt registry entry must not break the lookup
+        log.debug("netaddr OUI lookup failed for %s", prefix, exc_info=True)
+        return None
+
+
+def vendor_for_oui(prefix: str) -> Optional[str]:
+    """Organisation registered for a 24-bit OUI (MA-L), or None when *prefix* is not an OUI, is not
+    registered, or has the multicast or locally-administered bit set."""
+    norm = normalize_oui(prefix)
+    if norm is None:
+        return None
+    first = int(norm[:2], 16)
+    if first & 0x03:
+        return None
+    return _registered_oui(norm)
 
 
 def vendor_for_mac(mac: str) -> Optional[str]:

@@ -54,6 +54,34 @@
     return h('span', { class: 'badge ' + (kind === 'local' ? 'green' : 'blue') }, kind);
   }
 
+  // the host names that follow this PC's current default gateway (tnt/pinger.py GATEWAY_HOSTS)
+  const GATEWAY_HOSTS = ['gateway', 'default-gateway', 'default gateway'];
+  const DEFAULT_HOSTS = ['1.1.1.1', 'totalelectronics.com'];
+  function isGatewayAlias(host) { return typeof host === 'string' && GATEWAY_HOSTS.includes(host.trim().toLowerCase()); }
+
+  /** Pure: the address row of a tile -> { ip, stale, badge: { cls, text, title } | null, note }.
+   *  An address the service could not resolve this time is the last known one, shown muted; the
+   *  gateway tile on a PC with no default gateway says "no gateway" in grey rather than a red error. */
+  function hostState(t) {
+    t = t || {};
+    const unresolved = t.resolved === false;
+    const noGateway = unresolved && isGatewayAlias(t.host);
+    const out = { ip: t.ip || null, stale: unresolved && !!t.ip, badge: null, note: null };
+    if (noGateway) out.badge = { cls: 'grey', text: 'no gateway', title: t.resolve_error || 'This PC has no default gateway right now' };
+    else if (unresolved) out.badge = { cls: 'red', text: 'unresolved', title: t.resolve_error || '' };
+    if (t.resolve_error && !noGateway) out.note = t.resolve_error;
+    return out;
+  }
+
+  /** Pure: the toast after Load Default Tiles, naming the gateway the service resolved just now. */
+  function defaultsToast(list) {
+    const rows = Array.isArray(list) ? list : null;
+    const gw = rows ? rows.find((t) => t && isGatewayAlias(t.host)) : null;
+    let text = 'Default tiles loaded (' + (rows ? rows.length : '?') + ' targets)';
+    if (gw) text += gw.ip && gw.resolved !== false ? ' · Gateway ' + gw.ip : ' · no default gateway right now';
+    return { text, kind: gw && !(gw.ip && gw.resolved !== false) ? 'warn' : 'ok' };
+  }
+
   function createTile(t) {
     const { h, copyCode } = TNT.util;
     const ui = TNT.ui;
@@ -228,12 +256,17 @@
     const key = [t.ip, t.host, t.label, t.resolved, t.resolve_error, t.enabled].join('|');
     if (rec.hostKey !== key) {
       rec.hostKey = key;
+      const hs = hostState(t);
       rec.sub.innerHTML = '';
       rec.sub.appendChild(rec.badge);
-      if (t.ip) rec.sub.appendChild(copyCode(t.ip));
+      if (hs.ip) {
+        const chip = copyCode(hs.ip, hs.stale ? 'stale' : '');
+        if (hs.stale) chip.title = 'The last address it had, not resolved right now (click to copy)';
+        rec.sub.appendChild(chip);
+      }
       if (t.label && t.host !== t.ip) rec.sub.appendChild(copyCode(t.host));
-      if (t.resolved === false) rec.sub.appendChild(h('span', { class: 'badge red' }, 'unresolved'));
-      if (t.resolve_error) rec.sub.appendChild(h('span', { class: 'ongoing small', title: t.resolve_error }, t.resolve_error));
+      if (hs.badge) rec.sub.appendChild(h('span', { class: 'badge ' + hs.badge.cls, title: hs.badge.title || null }, hs.badge.text));
+      if (hs.note) rec.sub.appendChild(h('span', { class: 'ongoing small', title: hs.note }, hs.note));
       if (t.enabled === false) rec.sub.appendChild(h('span', { class: 'badge grey' }, 'disabled'));
       rec.el.classList.toggle('unresolved', t.resolved === false);
     }
@@ -389,7 +422,7 @@
 
   async function loadDefaults(btn) {
     const current = (lastState && lastState.targets) || [];
-    const extras = current.filter((t) => !['gateway', '1.1.1.1', 'totalelectronics.com'].includes(String(t.host).toLowerCase()));
+    const extras = current.filter((t) => !isGatewayAlias(t.host) && !DEFAULT_HOSTS.includes(String(t.host).toLowerCase()));
     if (extras.length) {
       const ok = await TNT.ui.confirm({ title: 'Load the default tiles?',
         message: 'The tiles reset to Gateway, 1.1.1.1 and totalelectronics.com. ' + extras.length + (extras.length === 1 ? ' other tile is' : ' other tiles are') + ' removed (history stays in the database).',
@@ -398,8 +431,11 @@
     }
     TNT.ui.busy(btn, true);
     try {
+      // the service resolves the gateway afresh for this: show the tiles, and the gateway it found, at once
       const list = await TNT.api.loadDefaultTargets();
-      TNT.ui.toast('Default tiles loaded (' + (Array.isArray(list) ? list.length : '?') + ' targets)', 'ok');
+      if (Array.isArray(list)) TNT.app.setTargets(list);
+      const msg = defaultsToast(list);
+      TNT.ui.toast(msg.text, msg.kind, 4500);
       TNT.app.refreshStatus();
     } catch (err) { TNT.ui.toast('Could not load defaults: ' + err.message, 'error'); }
     finally { TNT.ui.busy(btn, false); }
@@ -452,5 +488,9 @@
       dragRec = null; localOrder = null;
       root = null; gridEl = null; emptyEl = null; addInput = null; addBtn = null;
     },
+    // exposed for tests
+    hostState,
+    defaultsToast,
+    isGatewayAlias,
   };
 })();

@@ -24,6 +24,7 @@
   --blue: #6FA8FF;
   --purple: #B48CFF;
   --orange: #FFA45C;
+  --teal: #4FD1C5;
   --grey: var(--ink-soft);
   --shadow: var(--ink);
   --accent: var(--blue);
@@ -49,6 +50,7 @@
   --blue: #7DB2FF;
   --purple: #BDA0FF;
   --orange: #FFB070;
+  --teal: #67DCD1;
   --shadow: #0F0D1A;
   --outline-25: rgba(243, 238, 255, 0.25);
   --outline-12: rgba(243, 238, 255, 0.12);
@@ -146,10 +148,24 @@ svg.icon { width: 1.25em; height: 1.25em; stroke: currentColor; fill: none; stro
 .live-badge.offline { background: color-mix(in srgb, var(--red) 30%, var(--paper)); }
 .live-badge.offline .live-spark { color: var(--ink-soft); }
 .live-badge.connecting .live-spark { color: var(--ink-soft); }
+/* Full Scan, left of the status pill: an ordinary top bar .btn (flex: none) whose fill runs like a progress bar while a
+   scan runs; tabular figures and a minimum width keep "Discovery 57%" from nudging the pill at every percent */
+.topbar-scan { --pct: 0%; min-width: 132px; padding: 0 16px 0 12px; font-variant-numeric: tabular-nums; }
+.topbar-scan.running { background: linear-gradient(90deg, color-mix(in srgb, var(--green) 45%, var(--paper)) var(--pct), var(--paper) var(--pct)); }
 
 /* ---------- layout ---------- */
 .page { max-width: 1440px; margin: 0 auto; padding: 24px; display: flex; flex-direction: column; gap: 20px; min-width: 0; }
-.tiles { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 20px; }
+/* The tiles: every tile in every row has the same width, whatever their number. One row while each
+   tile still gets room for its head, otherwise balanced rows of equal columns; never a span. A wrapping
+   flex row whose tiles take 1/N of the width minus the gaps; the rules in the responsive section pick
+   N from the window width and the number of tiles (counted with :first-child:nth-last-child):
+     1440 px and up   up to 7 tiles in one row (7: 180 px each); 8 or more in rows of 4 (8 -> 4 + 4)
+     900 - 1439 px    up to 4 in one row; 5 or 6 in rows of 3; 7 or more in rows of 4 (7 -> 4 + 3)
+     701 - 899 px     up to 3 in one row; 4 in rows of 2; 5 or more in rows of 3 (7 -> 3 + 3 + 1)
+     700 px and less  rows of 2
+   Tiles narrower than the normal head needs (209 px with a scrollbar) get the tight head (--tile-tight: 1). */
+.tiles { --tile-gap: 20px; display: flex; flex-wrap: wrap; gap: var(--tile-gap); }
+.tiles > .tile { --tile-cols: 4; flex: 0 0 calc((100% - (var(--tile-cols) - 1) * var(--tile-gap)) / var(--tile-cols)); }
 .view { min-width: 0; }
 .section-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin: 4px 0 18px; }
 .section-head .actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
@@ -177,8 +193,9 @@ svg.icon { width: 1.25em; height: 1.25em; stroke: currentColor; fill: none; stro
 .card-title .badge { margin-left: auto; }
 
 .tile {
+  --tile-tight: 0;   /* 1 on a tile too narrow for the normal head (the tile grid rules in the responsive section) */
   display: flex; flex-direction: column; gap: 10px;
-  min-height: 150px; padding: 16px 18px;
+  min-height: 150px; padding: 16px calc(18px - 6px * var(--tile-tight)) 16px calc(18px - 2px * var(--tile-tight));
   color: inherit; text-decoration: none; user-select: none;
   background: var(--paper);
   border: 3px solid var(--ink); border-radius: var(--radius);
@@ -189,14 +206,19 @@ svg.icon { width: 1.25em; height: 1.25em; stroke: currentColor; fill: none; stro
 .tile::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 9px; background: var(--accent); border-right: 3px solid var(--ink); }
 .tile:hover { transform: translate(-2px, -2px); box-shadow: 8px 8px 0 var(--shadow); }
 .tile.active { transform: translate(2px, 2px); box-shadow: 3px 3px 0 var(--shadow); background: color-mix(in srgb, var(--accent) 18%, var(--paper)); }
-.tile-head { display: flex; align-items: center; gap: 10px; padding-left: 4px; }
-.tile-icon { display: inline-flex; width: 34px; height: 34px; align-items: center; justify-content: center; border: 3px solid var(--ink); border-radius: 12px; background: color-mix(in srgb, var(--accent) 45%, var(--paper)); color: var(--ink-on-accent); flex: none; }
-.tile-icon svg { width: 20px; height: 20px; }
-.tile-title { font-size: 19px; font-weight: 900; letter-spacing: -0.01em; }
+/* the tight head (--tile-tight: 1): a 30 px icon, an 8 px gap and a 16 px title, so "Network info" (100 px in
+   Nunito 900 at 16 px; 119 px at 19 px, which needs a 205 px tile) stays on one line down to a 176 px tile */
+.tile-head { display: flex; align-items: center; gap: calc(10px - 2px * var(--tile-tight)); padding-left: 4px; }
+.tile-icon { display: inline-flex; width: calc(34px - 4px * var(--tile-tight)); height: calc(34px - 4px * var(--tile-tight)); align-items: center; justify-content: center; border: 3px solid var(--ink); border-radius: calc(12px - 1px * var(--tile-tight)); background: color-mix(in srgb, var(--accent) 45%, var(--paper)); color: var(--ink-on-accent); flex: none; }
+.tile-icon svg { width: calc(20px - 2px * var(--tile-tight)); height: calc(20px - 2px * var(--tile-tight)); }
+.tile-title { font-size: calc(19px - 3px * var(--tile-tight)); font-weight: 900; letter-spacing: -0.01em; }
 .tile-body { display: flex; flex-direction: column; gap: 3px; padding-left: 4px; font-size: 14px; min-width: 0; }
 /* lines wrap instead of clipping: a badge or a long host name drops to the next line on narrow windows */
 .tile-line { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; row-gap: 2px; min-width: 0; overflow-wrap: anywhere; }
 .tile-line .badge { flex: none; }
+/* the tool names on the Tools tile: two columns once the tile body has room for two of the longest name
+   (102 px, "LAN throughput"), else one; the row gap matches .tile-body's line gap */
+.tile-tools { display: grid; grid-template-columns: repeat(auto-fill, minmax(112px, 1fr)); column-gap: 10px; row-gap: 3px; }
 .tile-line .strong { font-weight: 800; }
 .tile-line .num { font-weight: 900; font-size: 20px; }
 .tile-line code { font-size: 13px; }
@@ -282,10 +304,13 @@ input[type="datetime-local"].input { font-family: var(--font); }
 }
 .badge.green { background: color-mix(in srgb, var(--green) 45%, var(--paper)); }
 .badge.yellow { background: color-mix(in srgb, var(--yellow) 55%, var(--paper)); }
+/* dark theme: light ink on half-mixed yellow is 3.1:1; dark ink on a brighter yellow is 6.5:1 (small bold text needs 4.5:1) */
+[data-theme="dark"] .badge.yellow { background: color-mix(in srgb, var(--yellow) 75%, var(--paper)); color: var(--ink-on-accent); }
 .badge.red { background: color-mix(in srgb, var(--red) 40%, var(--paper)); }
 .badge.blue { background: color-mix(in srgb, var(--blue) 40%, var(--paper)); }
 .badge.purple { background: color-mix(in srgb, var(--purple) 40%, var(--paper)); }
 .badge.orange { background: color-mix(in srgb, var(--orange) 45%, var(--paper)); }
+.badge.teal { background: color-mix(in srgb, var(--teal) 42%, var(--paper)); }
 .badge.grey { background: var(--paper-2); color: var(--ink-soft); }
 .badge.pulse { animation: pulse 1.6s ease-in-out infinite; }
 
@@ -413,6 +438,8 @@ table.table { border-collapse: collapse; width: 100%; font-size: 15px; }
 .stat-grid .v { text-align: right; font-weight: 800; white-space: nowrap; }
 .stat-grid .v.warn { color: var(--red); }
 .ptile.unresolved { border-style: dashed; }
+/* the last address of a target that did not resolve this time: still copyable, not presented as current */
+code.copy.stale { color: var(--ink-soft); border-style: dashed; }
 .ptile-lights-row { display: flex; align-items: center; gap: 12px; }
 
 /* ---------- outages ---------- */
@@ -495,6 +522,13 @@ table.table { border-collapse: collapse; width: 100%; font-size: 15px; }
 .adapter-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .adapter-head .name { font-size: 19px; font-weight: 900; }
 .adapter-desc { color: var(--ink-soft); font-size: 14px; font-weight: 700; margin-top: -8px; }
+/* adapter warnings: short badges in the head, one callout per warning under it (red: the adapter is
+   misconfigured, yellow: something it needs is missing, grey: worth knowing) */
+.adapter-warnings { display: flex; flex-direction: column; gap: 8px; }
+.adapter-warn { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border: 2px solid var(--ink); border-radius: 14px; font-size: 14px; font-weight: 700; line-height: 1.45; color: var(--ink); background: color-mix(in srgb, var(--yellow) 40%, var(--paper)); }
+.adapter-warn.red { background: color-mix(in srgb, var(--red) 22%, var(--paper)); }
+.adapter-warn.grey { border-color: var(--outline-25); background: var(--paper-2); color: var(--ink-soft); }
+.adapter-warn svg.icon { flex: none; width: 18px; height: 18px; margin-top: 1px; }
 .subnet { display: flex; flex-direction: column; gap: 8px; }
 .subnet-title { display: flex; align-items: center; gap: 8px; font-weight: 800; font-size: 14px; }
 
@@ -539,6 +573,8 @@ table.table { border-collapse: collapse; width: 100%; font-size: 15px; }
 .setting .desc .s { color: var(--ink-soft); font-size: 13px; font-weight: 700; }
 .setting-group { display: flex; flex-direction: column; gap: 14px; }
 .setting-group h3 { display: flex; align-items: center; gap: 8px; font-size: 14px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-soft); }
+/* Settings › IP location: the live status line, Retry now and the DB-IP / licence links */
+.geo-status { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; font-size: 13px; font-weight: 700; color: var(--ink-soft); }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; }
 
 /* ---------- toasts ---------- */
@@ -614,6 +650,15 @@ table.table { border-collapse: collapse; width: 100%; font-size: 15px; }
 /* 76 px fits the widest tag, HOSTNAME (72.1 px measured in Nunito 900 at 11 px with the
    letter-spacing); every tag uses it so the values form one column */
 .lm-tag { flex: none; width: 76px; font-weight: 900; letter-spacing: 0.08em; text-transform: uppercase; font-size: 11px; }
+/* IP location: the Internet node's ISP / Location values ellipsize (full text on hover) and the DB-IP credit sits
+   under the map while they show */
+.lm-sub > span.muted { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* the values match the address chips' 12.5 px (not the 16 px body) so provider names fit the chip column; the tags
+   keep their 11 px */
+.lm-geo > span.muted:not(.lm-tag) { font-size: 12.5px; font-weight: 700; }
+.lm-attrib { display: flex; justify-content: flex-end; padding: 6px 2px 0; font-size: 12px; font-weight: 700; }
+.geo-attrib { color: var(--ink-soft); text-decoration: underline; text-underline-offset: 2px; }
+.geo-attrib:hover { color: var(--blue); }
 
 /* ---------- tools: traceroute, LAN throughput, subnet calculator, saved Wi-Fi ----------
    the four cards under the DHCP server (js/tools/*.js); tokens only, no literal colours */
@@ -674,6 +719,11 @@ table.table { border-collapse: collapse; width: 100%; font-size: 15px; }
 .tr-table td.red { color: var(--red); }
 .tr-table tr.silent td { color: var(--ink-soft); }
 .tr-table .badge { font-size: 11px; height: 22px; }
+/* the Location column ("router name" marks a city taken from the hop's name), the note and the DB-IP credit */
+.tr-table td.tr-loc { white-space: nowrap; }
+.tr-loc-src { margin-left: 6px; font-size: 11px; font-weight: 700; }
+.tr-note { padding: 6px 2px 0; font-size: 12px; font-weight: 700; }
+.tr-attrib { display: flex; flex-wrap: wrap; justify-content: flex-end; padding: 6px 2px 0; font-size: 12px; font-weight: 700; }
 
 /* LAN throughput: peers as stickers, a fuse per phase, two big numbers */
 .lan-self { display: flex; align-items: center; gap: 6px 12px; flex-wrap: wrap; font-size: 15px; font-weight: 700; color: var(--ink-soft); margin: 4px 0 12px; }
@@ -737,6 +787,143 @@ table.table { border-collapse: collapse; width: 100%; font-size: 15px; }
 /* the mask keeps the cell the same width whether the keys are shown or hidden */
 code.copy.wifi-key { font-size: 14px; letter-spacing: 0.04em; min-width: 92px; display: inline-block; text-align: left; }
 .wifi-err { color: var(--red); font-weight: 700; line-height: 1.35; white-space: normal; margin-top: 3px; }
+
+/* ---------- WiFi survey page (js/views/wifi.js, js/wifichart.js) ----------
+   tokens only: every network colour is a color-mix() of the accents (TNT.wifichart.paletteCss),
+   so a swatch follows the theme exactly like the canvas shapes do */
+.survey-switch { display: inline-flex; align-items: center; gap: 10px; }
+.survey-switch > .label { font-size: 12px; }
+.survey-page { gap: 16px; }
+.survey-status-wrap { display: flex; flex-direction: column; gap: 2px; margin-top: -10px; min-width: 0; }
+.survey-status-wrap:empty { display: none; }
+.survey-status { display: flex; align-items: center; gap: 2px 8px; flex-wrap: wrap; font-size: 14px; font-weight: 700; color: var(--ink-soft); line-height: 1.5; min-width: 0; }
+.survey-status strong, .survey-status .survey-live { color: var(--ink); }
+.survey-live { display: inline-flex; align-items: center; gap: 5px; }
+.survey-live .spark-icon svg { width: 16px; height: 16px; animation: blink 2s ease-in-out infinite; }
+.survey-dot { opacity: 0.6; }
+/* red text: the accent itself is 3:1 on white, so the light theme darkens it with ink (5.2:1); dark keeps it */
+.survey-callerr { color: color-mix(in srgb, var(--red) 65%, var(--ink)); }
+[data-theme="dark"] .survey-callerr { color: var(--red); }
+.tool-note.survey-note { margin: 0; }
+/* the "instead of data" card: no bridge, location denied, survey off, no adapter, radio off, error */
+.survey-state { display: flex; align-items: flex-start; gap: 18px; }
+.survey-state-icon { display: inline-flex; align-items: center; justify-content: center; width: 56px; height: 56px; flex: none;
+  border: 3px solid var(--ink); border-radius: 18px; background: color-mix(in srgb, var(--teal) 38%, var(--paper)); color: var(--ink); box-shadow: 3px 3px 0 var(--shadow); }
+.survey-state-icon svg.icon { width: 30px; height: 30px; }
+.survey-state-icon.spark-icon { color: var(--orange); background: var(--paper-2); }
+.survey-state-icon.spark-icon svg { fill: currentColor; stroke: var(--ink); stroke-width: 1.5; animation: sparkle 0.5s ease-in-out infinite alternate; }
+.survey-state[data-kind="location_denied"] .survey-state-icon, .survey-state[data-kind="radio_off"] .survey-state-icon { background: color-mix(in srgb, var(--yellow) 55%, var(--paper)); }
+.survey-state[data-kind="error"] .survey-state-icon, .survey-state[data-kind="no_adapter"] .survey-state-icon { background: color-mix(in srgb, var(--red) 35%, var(--paper)); }
+.survey-state[data-kind="disabled"] .survey-state-icon, .survey-state[data-kind="outdated"] .survey-state-icon { background: var(--paper-2); }
+.survey-state-body { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.survey-state-body h3 { font-size: 21px; font-weight: 900; }
+.survey-state-body p { color: var(--ink-soft); font-size: 15px; font-weight: 700; line-height: 1.45; max-width: 76ch; }
+.survey-state-body p.survey-state-detail { font-family: var(--mono); font-size: 13px; font-weight: 400; }
+/* top row: the network list beside the signal chart (stacked below 1100 px). The list scrolls
+   inside a box that takes the chart card's height, so a long list never stretches the row. */
+.survey-top { display: grid; grid-template-columns: minmax(260px, 340px) minmax(0, 1fr); gap: 20px; align-items: stretch; }
+.survey-nets, .survey-aps { display: flex; flex-direction: column; min-height: 0; }
+.survey-nets > .input { flex: none; width: 100%; margin-bottom: 10px; }
+.survey-net-scroll { position: relative; flex: 1 1 auto; min-height: 240px; }
+.survey-net-list { position: absolute; inset: 0; display: flex; flex-direction: column; gap: 6px; overflow-y: auto; margin: -4px -10px -8px; padding: 4px 10px 8px; }
+.survey-net { display: grid; grid-template-columns: 14px minmax(0, 1fr) auto; align-items: center; gap: 10px; min-width: 0; padding: 7px 10px;
+  border: 2px solid var(--outline-25); border-radius: 14px; background: var(--paper); cursor: pointer; user-select: none;
+  transition: background 0.15s, border-color 0.15s, box-shadow 0.12s ease-out; }
+.survey-net:hover { border-color: var(--ink); background: color-mix(in srgb, var(--teal) 10%, var(--paper)); }
+.survey-net.selected { border-color: var(--ink); background: color-mix(in srgb, var(--teal) 28%, var(--paper)); box-shadow: inset 0 0 0 1px var(--ink), 3px 3px 0 var(--shadow); }
+.survey-net:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.survey-net.stale .survey-net-name { color: var(--ink-soft); }
+.survey-net-main { display: flex; flex-direction: column; min-width: 0; }
+.survey-net-name { font-weight: 800; font-size: 15px; line-height: 1.25; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* a hidden network's name is its BSSID (the "hidden" badge sits in the sub line, where no ellipsis cuts it) */
+.survey-net.hidden-net .survey-net-name { font-family: var(--mono); font-size: 12.5px; font-weight: 700; }
+.survey-net-sub { display: flex; align-items: center; gap: 6px; min-width: 0; font-size: 12px; font-weight: 700; color: var(--ink-soft); }
+.survey-net-sub .badge { flex: none; height: 18px; padding: 0 6px; font-size: 9.5px; border-width: 2px; }
+.survey-net-meta { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.survey-net-side { display: flex; align-items: center; gap: 6px; }
+.survey-net-dbm { min-width: 58px; text-align: right; font-size: 13px; font-weight: 900; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.survey-net-dbm.green { color: color-mix(in srgb, var(--green) 45%, var(--ink)); }
+.survey-net-dbm.yellow { color: color-mix(in srgb, var(--yellow) 45%, var(--ink)); }
+.survey-net-dbm.red { color: color-mix(in srgb, var(--red) 65%, var(--ink)); }
+[data-theme="dark"] .survey-net-dbm.red { color: var(--red); }
+.survey-net-dbm.grey { color: var(--ink-soft); }
+.survey-net-empty { padding: 18px 8px; text-align: center; color: var(--ink-soft); font-weight: 700; font-size: 14px; }
+/* the network colour swatch (list, table, legend); out of range = hatched grey */
+.survey-sw { display: inline-block; width: 14px; height: 14px; flex: none; border: 2px solid var(--ink); border-radius: 4px; background: var(--paper-2); }
+.survey-sw.stale { border-style: dashed; border-color: var(--ink-soft); background: repeating-linear-gradient(135deg, var(--paper-2) 0 3px, var(--outline-25) 3px 5px); }
+/* four signal bars */
+.survey-bars { display: inline-flex; align-items: flex-end; gap: 2px; height: 14px; flex: none; vertical-align: -2px; }
+.survey-bars span { width: 4px; border-radius: 2px; background: var(--outline-25); }
+.survey-bars span:nth-child(1) { height: 5px; }
+.survey-bars span:nth-child(2) { height: 8px; }
+.survey-bars span:nth-child(3) { height: 11px; }
+.survey-bars span:nth-child(4) { height: 14px; }
+.survey-bars span.on { background: var(--ink); }
+.survey-bars.green span.on { background: color-mix(in srgb, var(--green) 70%, var(--ink)); }
+.survey-bars.yellow span.on { background: color-mix(in srgb, var(--yellow) 70%, var(--ink)); }
+.survey-bars.red span.on { background: var(--red); }
+.survey-bars.grey span.on { background: var(--ink-soft); }
+/* the radio table: the shared host table, capped in height with a sticky header */
+.survey-table-wrap { max-height: 470px; overflow: auto; }
+.survey-table-wrap thead th { position: sticky; top: 0; z-index: 2; }
+.table.survey-table { font-size: 14px; }
+/* 8 px cell padding and capped Network / Vendor cells: all nine columns fit the 1325 px card at 1920 x 1080 */
+.survey-table td { padding: 7px 8px; }
+.survey-table th .th-sort { padding: 10px 8px; }
+.survey-table tbody tr { cursor: pointer; }
+.survey-table tbody tr:hover td { background: color-mix(in srgb, var(--teal) 10%, var(--paper)); }
+.survey-table tbody tr.is-selected td { background: color-mix(in srgb, var(--teal) 26%, var(--paper)); }
+.survey-table tbody tr.is-selected td:first-child { box-shadow: inset 5px 0 0 var(--ink); }
+.survey-table tbody tr.is-stale td { color: var(--ink-soft); }
+.survey-netcell-in { display: inline-flex; align-items: center; gap: 8px; max-width: 210px; min-width: 0; vertical-align: middle; }
+.survey-ssid { font-weight: 800; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+/* the network name in the table is a button (Tab + Enter selects the network), dressed as plain text */
+.survey-pick { display: inline-block; max-width: 100%; margin: 0; padding: 0 2px; border: 0; border-radius: 6px; background: none;
+  font: inherit; font-weight: 800; color: inherit; text-align: left; cursor: pointer; }
+.survey-pick:focus-visible { outline: 3px solid var(--accent); outline-offset: 1px; }
+.survey-netcell .badge { height: 20px; padding: 0 7px; font-size: 10px; }
+code.copy.survey-mac { font-size: 13px; padding: 1px 6px; white-space: nowrap; overflow-wrap: normal; }
+.survey-sub { display: block; font-size: 12px; font-weight: 700; color: var(--ink-soft); line-height: 1.2; }
+.survey-table td.survey-signal { white-space: nowrap; }
+.survey-dbm { display: inline-flex; align-items: center; height: 22px; padding: 0 8px; margin-left: 6px; vertical-align: middle;
+  border: 2px solid var(--ink); border-radius: 999px; background: var(--paper-2); color: var(--ink);
+  font-size: 12.5px; font-weight: 900; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.survey-dbm.green { background: color-mix(in srgb, var(--green) 50%, var(--paper)); }
+.survey-dbm.yellow { background: color-mix(in srgb, var(--yellow) 60%, var(--paper)); }
+.survey-dbm.red { background: color-mix(in srgb, var(--red) 45%, var(--paper)); }
+.survey-dbm.grey { color: var(--ink-soft); border-style: dashed; }
+/* "Wi-Fi 6E" as the Wi-Fi Alliance writes it, like the normal-case Security badge beside it */
+.badge.survey-gen { height: 20px; padding: 0 6px; margin-left: 6px; font-size: 11px; text-transform: none; letter-spacing: 0; }
+.badge.survey-sec { height: 22px; text-transform: none; letter-spacing: 0; font-size: 12.5px; }
+.survey-vendor-in { display: inline-block; max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: middle; }
+/* charts: signal strength over time, then the three bands */
+.survey-signal-card .card-title { flex-wrap: wrap; row-gap: 6px; }
+.survey-legend { font-size: 13px; }
+.survey-legend-chip { display: inline-flex; align-items: center; gap: 8px; min-width: 0; color: var(--ink); }
+.survey-legend-chip strong { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 320px; }
+canvas.survey-signal-canvas { height: 320px; }
+canvas.survey-band-canvas { height: 240px; }
+/* 2.4 GHz is the crowded band: it gets half the row, not the narrow side */
+.survey-bands { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; }
+.survey-band .card-title { margin-bottom: 8px; }
+.survey-band-count { font-weight: 700; white-space: nowrap; }
+/* nothing on 6 GHz: one line in place of an empty full-width chart */
+.survey-band.is-empty .chart-wrap { display: none; }
+.survey-band.is-empty .card-title { margin-bottom: 2px; }
+.survey-band-empty { margin: 0; color: var(--ink-soft); font-size: 14px; font-weight: 700; }
+.tile-line .tile-ellipsis { flex: 0 1 auto; min-width: 0; max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tile-line .survey-bars { margin-right: 2px; }
+@media (max-width: 1100px) {
+  .survey-top { grid-template-columns: minmax(0, 1fr); }
+  .survey-net-scroll { min-height: 0; }
+  .survey-net-list { position: static; display: grid; grid-template-columns: repeat(auto-fill, minmax(270px, 1fr)); align-content: start; max-height: 330px; }
+  .survey-bands { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 700px) {
+  canvas.survey-signal-canvas { height: 250px; }
+  canvas.survey-band-canvas { height: 210px; }
+  .survey-state { flex-direction: column; gap: 12px; }
+}
 
 @media (max-width: 700px) {
   /* the node keeps its width (a clipped IP address is worse than fewer nodes per row) */
@@ -824,9 +1011,39 @@ body.egg-shake { animation: egg-shake 0.6s ease-out both; }
 @keyframes egg-shake { 0%, 100% { transform: translate(0, 0); } 10% { transform: translate(var(--egg-amp), calc(var(--egg-amp) * -0.6)); } 25% { transform: translate(calc(var(--egg-amp) * -0.9), var(--egg-amp)); } 40% { transform: translate(calc(var(--egg-amp) * 0.7), calc(var(--egg-amp) * 0.4)); } 55% { transform: translate(calc(var(--egg-amp) * -0.5), calc(var(--egg-amp) * -0.7)); } 70% { transform: translate(calc(var(--egg-amp) * 0.3), calc(var(--egg-amp) * 0.2)); } 85% { transform: translate(calc(var(--egg-amp) * -0.15), 0); } }
 
 /* ---------- responsive ---------- */
+/* The tile grid (see .tiles). The rules count the tiles: ".tile:first-child:nth-last-child(-n + 7)" is the
+   first tile of a row of at most seven and "... ~ .tile" the others. `flex: 1 1 0` shares one row equally,
+   --tile-cols sets balanced rows. Below 1440 px every band is a max-width query overriding the wider ones,
+   and the first of them ends at 1439.98 px, so a fractional window width at 125 % or 150 % scaling (1799 px
+   at 125 % is 1439.2 CSS px) always falls in a band. --tile-tight: 1 wherever a tile is narrower than
+   the normal head needs with a few px to spare (it needs 209 px with the 15 px scrollbar): the row of
+   seven at 1440 px and up (176-182 px), rows of four up to 979 px (180-214 px) and rows of three up to
+   739 px (199-212 px). */
+@media (min-width: 1440px) {
+  .tiles > .tile:first-child:nth-last-child(-n + 7), .tiles > .tile:first-child:nth-last-child(-n + 7) ~ .tile { flex: 1 1 0; }
+  .tiles > .tile:first-child:nth-last-child(7), .tiles > .tile:first-child:nth-last-child(7) ~ .tile { --tile-tight: 1; }
+}
+@media (max-width: 1439.98px) {
+  .tiles > .tile:first-child:nth-last-child(-n + 4), .tiles > .tile:first-child:nth-last-child(-n + 4) ~ .tile { flex: 1 1 0; }
+  .tiles > .tile:first-child:nth-last-child(n + 5):nth-last-child(-n + 6),
+  .tiles > .tile:first-child:nth-last-child(n + 5):nth-last-child(-n + 6) ~ .tile { --tile-cols: 3; }
+}
+@media (max-width: 979px) {
+  .tiles > .tile:first-child:nth-last-child(4), .tiles > .tile:first-child:nth-last-child(4) ~ .tile,
+  .tiles > .tile:first-child:nth-last-child(n + 7), .tiles > .tile:first-child:nth-last-child(n + 7) ~ .tile { --tile-tight: 1; }
+}
 @media (max-width: 1100px) {
-  .tiles { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .grid-3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+/* below 900 px four to a row would be 169 px at 800 px, too narrow even for the tight head */
+@media (max-width: 899px) {
+  .tiles > .tile { --tile-cols: 3; }
+  .tiles > .tile:first-child:nth-last-child(4), .tiles > .tile:first-child:nth-last-child(4) ~ .tile { flex: 0 0 calc((100% - var(--tile-gap)) / 2); --tile-tight: 0; }
+  .tiles > .tile:first-child:nth-last-child(n + 7), .tiles > .tile:first-child:nth-last-child(n + 7) ~ .tile { --tile-tight: 0; }
+}
+@media (max-width: 739px) {
+  .tiles > .tile:first-child:nth-last-child(3), .tiles > .tile:first-child:nth-last-child(3) ~ .tile,
+  .tiles > .tile:first-child:nth-last-child(n + 5), .tiles > .tile:first-child:nth-last-child(n + 5) ~ .tile { --tile-tight: 1; }
 }
 @media (max-width: 900px) {
   .grid-2 { grid-template-columns: minmax(0, 1fr); }
@@ -837,7 +1054,10 @@ body.egg-shake { animation: egg-shake 0.6s ease-out both; }
   .page { padding: 16px; gap: 16px; }
   .topbar { padding: 8px 16px; }
   .brand-caption { display: none; }
-  .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+  /* rows of two; the last tile of an odd count keeps the width of the others */
+  .tiles { --tile-gap: 14px; }
+  .tiles > .tile { --tile-cols: 2; }
+  .tiles > .tile:first-child:nth-last-child(n + 3), .tiles > .tile:first-child:nth-last-child(n + 3) ~ .tile { flex: 0 0 calc((100% - var(--tile-gap)) / 2); --tile-tight: 0; }
   .grid-3 { grid-template-columns: minmax(0, 1fr); }
   .ping-grid { grid-template-columns: minmax(0, 1fr); }
   .status-pill .status-text { max-width: 150px; overflow: hidden; text-overflow: ellipsis; }
@@ -916,3 +1136,235 @@ a.pill.port-link:hover, a.pill.port-link:focus-visible { transform: translate(-1
 a.pill.port-link:hover .ext, a.pill.port-link:focus-visible .ext { width: 12px; margin-left: 5px; opacity: 1; }
 a.pill.port-link:active { transform: translate(1px, 1px); box-shadow: 0 0 0 var(--shadow); }
 a.pill.port-link:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+
+/* ---------- site name field with suggestions (js/reportsui.js siteCombo) ----------
+   the Full Scan name modal, the progress card and Rename; the list sits in the flow under the input, so the
+   modal body (which scrolls and clips) never cuts it off */
+.site-combo { display: flex; flex-direction: column; min-width: 0; }
+.site-combo > .input { width: 100%; }
+.site-combo-list { list-style: none; margin: 6px 0 0; padding: 4px; max-height: 232px; overflow-y: auto; border: 2px solid var(--outline-25); border-radius: 12px; background: var(--paper); }
+.site-combo-option { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; padding: 6px 10px; border-radius: 8px; cursor: pointer; }
+.site-combo-option:hover { background: color-mix(in srgb, var(--ink) 6%, var(--paper)); }
+.site-combo-option[aria-selected="true"] { background: color-mix(in srgb, var(--blue) 26%, var(--paper)); box-shadow: inset 3px 0 0 var(--ink); }
+.site-combo-name { font-weight: 800; min-width: 0; overflow-wrap: anywhere; }
+.site-combo-name mark, .rpt-site-name mark { background: color-mix(in srgb, var(--yellow) 60%, var(--paper)); color: inherit; border-radius: 2px; padding: 0 1px; }
+.site-combo-meta { flex: none; font-size: 12px; font-weight: 700; color: var(--ink-soft); }
+.site-modal-body { display: flex; flex-direction: column; gap: 12px; }
+.site-modal-body p { line-height: 1.45; }
+/* "This network was scanned as Acme Dental on ...": the site the field was filled with stands out */
+.site-modal-hint strong { color: var(--ink); font-weight: 800; }
+/* "This network is my own hotspot or travel router": nothing is suggested for it */
+.site-modal-portable:not([hidden]) { display: flex; align-items: center; gap: 8px; font-size: 12.5px; cursor: pointer; }
+.site-modal-portable input { width: 16px; height: 16px; margin: 0; flex: none; accent-color: var(--accent); }
+
+/* ---------- Reports (js/views/reports.js) ----------
+   The one compact page: a technician shows a whole site report on one screen, so the sticker look is turned down
+   inside .rpt: 12-13 px type, 1 px lines, 4-8 px radii, no offset shadows (--shadow is transparent in the scope, so
+   every rule that draws one draws nothing), no hover jumps, tight padding, dense tables without stripes. Tokens only,
+   readable in both themes. */
+.rpt { --shadow: transparent; --radius: 8px; --radius-sm: 6px; --rpt-line: var(--outline-25); --rpt-rule: var(--outline-12);
+  display: flex; flex-direction: column; gap: 10px; min-width: 0; font-size: 13px; line-height: 1.35; }
+.rpt .section-head { margin: 0; gap: 8px 12px; }
+.rpt .section-head .actions { gap: 8px; }
+.rpt h2 { font-size: 20px; gap: 8px; }
+.rpt .section-accent { width: 8px; height: 20px; border-width: 1px; border-radius: 4px; }
+.rpt .card { border: 1px solid var(--rpt-line); border-radius: 8px; padding: 10px 12px; box-shadow: none; scroll-margin-top: 80px; }
+.rpt .card-title { font-size: 14px; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+.rpt .card-title svg.icon { width: 16px; height: 16px; }
+.rpt .btn { height: 28px; padding: 0 10px; gap: 5px; border-width: 1px; border-radius: 6px; font-size: 12.5px; font-weight: 700; box-shadow: none; }
+.rpt .btn:hover { transform: none; box-shadow: none; background: color-mix(in srgb, var(--ink) 7%, var(--paper)); }
+.rpt .btn:active { transform: none; box-shadow: none; background: color-mix(in srgb, var(--ink) 14%, var(--paper)); }
+.rpt .btn:disabled { box-shadow: none; }
+.rpt .btn .icon { width: 14px; height: 14px; }
+/* the page's accent is grey, too dull under ink text (2.7:1): a primary button is solid ink with paper text instead */
+.rpt .btn-primary { background: var(--ink); border-color: var(--ink); color: var(--paper); }
+.rpt .btn-primary:hover { background: color-mix(in srgb, var(--ink) 82%, var(--paper)); }
+.rpt .btn.rpt-danger { color: color-mix(in srgb, var(--red) 65%, var(--ink)); }
+[data-theme="dark"] .rpt .btn.rpt-danger { color: var(--red); }
+.rpt .btn.rpt-icon-btn { width: 28px; padding: 0; }
+.rpt .input { height: 28px; padding: 0 8px; border-width: 1px; border-radius: 6px; font-size: 13px; font-weight: 500; }
+.rpt select.input { padding-right: 26px; background-position: right 7px center; background-size: 12px 12px; }
+.rpt .field { gap: 3px; }
+.rpt .field label { font-size: 10.5px; letter-spacing: 0.05em; }
+.rpt :focus-visible, .rpt .btn:focus-visible, .rpt .input:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
+.rpt .badge { height: 17px; padding: 0 5px; gap: 3px; border-width: 1px; font-size: 10px; letter-spacing: 0.04em; }
+.rpt .pill { padding: 0 5px; margin: 1px 3px 1px 0; border-width: 1px; font-size: 11.5px; font-weight: 700; }
+.rpt code.copy { padding: 0 4px; border-width: 1px; border-radius: 4px; font-size: 12px; }
+.rpt .kv { grid-template-columns: minmax(72px, auto) minmax(0, 1fr); gap: 2px 10px; font-size: 13px; }
+.rpt .kv .k { font-size: 10.5px; letter-spacing: 0.04em; }
+.rpt .table-wrap { border: 1px solid var(--rpt-line); border-radius: 6px; }
+.rpt table.table { font-size: 12.5px; }
+.rpt .table th { padding: 4px 8px; border-bottom: 1px solid var(--rpt-line); font-size: 10.5px; letter-spacing: 0.04em; }
+.rpt .table td { padding: 3px 8px; border-bottom: 1px solid var(--rpt-rule); }
+.rpt .table tbody tr:nth-child(even) td { background: transparent; }
+.rpt .table th.sortable { padding: 0; }
+.rpt .th-sort { padding: 4px 8px; gap: 4px; font-size: 10.5px; letter-spacing: 0.04em; }
+.rpt .th-sort:focus-visible { outline-offset: -2px; }
+.rpt .sort-arrow, .rpt .sort-arrow svg { width: 11px; height: 11px; }
+.rpt .table td.ports { min-width: 110px; }
+.rpt .table td.rpt-wrap { white-space: normal; min-width: 110px; overflow-wrap: anywhere; }
+.rpt .empty { padding: 14px 10px; font-size: 13px; }
+.rpt .survey-dbm { height: 17px; padding: 0 5px; margin-left: 0; border-width: 1px; font-size: 11.5px; }
+.rpt .site-combo-list { margin-top: 3px; padding: 2px; border-width: 1px; border-radius: 6px; max-height: 196px; }
+.rpt .site-combo-option { padding: 3px 6px; border-radius: 4px; font-size: 12.5px; }
+.rpt .site-combo-meta { font-size: 11px; }
+.rpt-count { font-size: 12px; font-weight: 600; }
+.rpt .rpt-search { width: 200px; }
+.rpt-note { margin: 2px 0 0; font-size: 11.5px; color: var(--ink-soft); }
+.rpt-error { color: color-mix(in srgb, var(--red) 65%, var(--ink)); font-weight: 700; }
+[data-theme="dark"] .rpt-error { color: var(--red); }
+.rpt-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.rpt-nowrap { white-space: nowrap; }
+/* the report beside the saved reports browser (which stays in view while the report scrolls); stacked below 1100 px */
+.rpt-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(240px, 300px); gap: 10px; align-items: start; min-width: 0; }
+.rpt-browser { position: sticky; top: 76px; max-height: calc(100vh - 88px); display: flex; flex-direction: column; }
+.rpt-browser-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+.rpt-empty { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; padding: 10px 2px; max-width: 72ch; }
+.rpt-empty h3 { font-size: 16px; }
+.rpt-empty p { color: var(--ink-soft); line-height: 1.45; }
+/* the selected report */
+.rpt-rhead { display: flex; align-items: center; justify-content: space-between; gap: 6px 12px; flex-wrap: wrap; }
+.rpt-rtitle { display: flex; align-items: center; gap: 8px; min-width: 0; flex-wrap: wrap; }
+.rpt-site { font-size: 18px; font-weight: 900; overflow-wrap: anywhere; }
+.rpt-ractions { display: flex; gap: 6px; flex-wrap: wrap; }
+.rpt-meta { margin: 2px 0 8px; font-size: 12px; color: var(--ink-soft); }
+.rpt-partial { display: flex; align-items: flex-start; gap: 6px; margin: 0 0 8px; padding: 4px 8px; border: 1px solid var(--rpt-line); border-radius: 6px;
+  background: color-mix(in srgb, var(--yellow) 22%, var(--paper)); color: var(--ink); font-size: 12px; }
+.rpt-partial svg.icon, .rpt-unavailable svg.icon { width: 14px; height: 14px; flex: none; margin-top: 1px; }
+.rpt-kpis { display: flex; flex-wrap: wrap; margin: 0 0 10px; border-top: 1px solid var(--rpt-line); border-left: 1px solid var(--rpt-line); border-radius: 6px; overflow: hidden; }
+.rpt-kpi { flex: 1 1 110px; display: flex; flex-direction: column; gap: 1px; min-width: 0; padding: 5px 8px; border-right: 1px solid var(--rpt-line); border-bottom: 1px solid var(--rpt-line); }
+.rpt-kpi-label { font-size: 10.5px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink-soft); }
+.rpt-kpi-value { font-size: 16px; font-weight: 900; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.rpt-kpi-sub { font-size: 11.5px; color: var(--ink-soft); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rpt-kpi.lvl-warn { background: color-mix(in srgb, var(--yellow) 20%, var(--paper)); }
+.rpt-kpi.lvl-bad { background: color-mix(in srgb, var(--red) 16%, var(--paper)); }
+.rpt-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr)); gap: 10px 16px; min-width: 0; }
+.rpt-sec { min-width: 0; margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--rpt-rule); }
+.rpt-cols > .rpt-sec { margin-top: 0; }
+.rpt-sec-title { display: flex; align-items: baseline; gap: 4px 8px; flex-wrap: wrap; margin: 0 0 4px; font-size: 12px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.06em; }
+.rpt-sec-meta { font-size: 11.5px; font-weight: 600; text-transform: none; letter-spacing: 0; color: var(--ink-soft); }
+.rpt-sec-body { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.rpt-unavailable { display: flex; align-items: flex-start; gap: 6px; margin: 0; padding: 4px 8px; border: 1px dashed var(--rpt-line); border-radius: 6px; color: var(--ink-soft); font-size: 12px; }
+.rpt-badges, .rpt-chips { display: flex; flex-wrap: wrap; gap: 3px 4px; }
+/* the Network section's router (its MAC and vendor) and the visits to the site's network */
+.rpt-router, .rpt-visits { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 2px 6px; min-width: 0; }
+.rpt-visits .muted { font-size: 11.5px; }
+.rpt-visits-more { flex-basis: 100%; }
+.rpt-speed { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 16px; }
+.rpt-big { font-size: 20px; font-weight: 900; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.rpt-big .unit { font-size: 11.5px; margin-left: 4px; }
+.rpt-arrow { margin-right: 3px; }
+.rpt-arrow.down { color: var(--purple); }
+.rpt-arrow.up { color: var(--blue); }
+.rpt-target { white-space: nowrap; }
+.rpt-target-name { font-weight: 700; margin-right: 6px; }
+.rpt .table td.lvl-warn { color: color-mix(in srgb, var(--yellow) 45%, var(--ink)); font-weight: 800; }
+.rpt .table td.lvl-bad { color: color-mix(in srgb, var(--red) 65%, var(--ink)); font-weight: 800; }
+[data-theme="dark"] .rpt .table td.lvl-warn { color: var(--yellow); }
+[data-theme="dark"] .rpt .table td.lvl-bad { color: var(--red); }
+.rpt-wifi-conn { display: flex; align-items: center; gap: 4px 6px; flex-wrap: wrap; margin: 0; }
+.rpt-out-top { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 6px 28px; min-width: 0; }
+.rpt-out-top > .table-wrap { flex: 0 1 340px; min-width: 0; }
+.rpt-collapse { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
+.rpt-collapse-body { align-self: stretch; min-width: 0; }
+.rpt-collapse-body .table-wrap { max-height: 420px; overflow: auto; }
+.rpt-collapse-body thead th { position: sticky; top: 0; z-index: 1; }
+.rpt-hosts, .rpt-aps { min-width: 640px; }
+.rpt-caret { display: inline-block; width: 0; height: 0; flex: none; border-left: 5px solid currentColor; border-top: 4px solid transparent; border-bottom: 4px solid transparent; transition: transform 0.12s; }
+.rpt-toggle[aria-expanded="true"] .rpt-caret, .rpt-site-btn[aria-expanded="true"] .rpt-caret { transform: rotate(90deg); }
+/* the saved reports browser: sites, a site opens into its reports */
+.rpt-sites, .rpt-site-reports { list-style: none; margin: 0; padding: 0; }
+.rpt-sites { display: flex; flex-direction: column; gap: 2px; }
+.rpt-site-btn { display: grid; grid-template-columns: 10px minmax(0, 1fr) auto; align-items: center; gap: 6px; width: 100%; padding: 4px 6px; border: 0; border-radius: 6px;
+  background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.rpt-site-btn:hover, .rpt-report-btn:hover { background: color-mix(in srgb, var(--ink) 6%, var(--paper)); }
+.rpt-site-item.open > .rpt-site-btn { background: color-mix(in srgb, var(--ink) 9%, var(--paper)); }
+.rpt-site-name { font-weight: 800; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rpt-site-meta { font-size: 11px; color: var(--ink-soft); white-space: nowrap; }
+.rpt-site-reports { display: flex; flex-direction: column; gap: 1px; margin: 2px 0 6px 12px; padding-left: 6px; border-left: 1px solid var(--rpt-line); }
+.rpt-report-btn { display: flex; flex-direction: column; gap: 1px; width: 100%; padding: 3px 6px; border: 0; border-radius: 5px; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.rpt-report-btn[aria-current="true"] { background: color-mix(in srgb, var(--blue) 22%, var(--paper)); box-shadow: inset 3px 0 0 var(--ink); }
+.rpt-report-when { display: flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 700; }
+.rpt-report-nums { font-size: 11px; color: var(--ink-soft); font-variant-numeric: tabular-nums; }
+.rpt-site-loading { margin: 2px 0 6px 22px; font-size: 12px; }
+/* the running full scan */
+.rpt-progress { display: flex; flex-direction: column; gap: 6px; background: color-mix(in srgb, var(--blue) 6%, var(--paper)); }
+.rpt-prog-head { display: flex; align-items: center; gap: 6px 10px; flex-wrap: wrap; }
+.rpt-prog-icon { display: inline-flex; color: var(--orange); }
+.rpt-prog-icon svg.icon { width: 16px; height: 16px; }
+.rpt-prog-icon.is-running svg, .ph-running .ph-icon svg { fill: currentColor; stroke: var(--ink); stroke-width: 1.5; animation: sparkle 0.5s ease-in-out infinite alternate; }
+.rpt-prog-icon.is-saved, .ph-done .ph-icon { color: color-mix(in srgb, var(--green) 45%, var(--ink)); }
+.rpt-prog-icon.is-cancelled, .rpt-prog-icon.is-error, .ph-error .ph-icon, .ph-error .ph-state { color: color-mix(in srgb, var(--red) 65%, var(--ink)); }
+[data-theme="dark"] .rpt-prog-icon.is-saved, [data-theme="dark"] .ph-done .ph-icon { color: var(--green); }
+[data-theme="dark"] .rpt-prog-icon.is-cancelled, [data-theme="dark"] .rpt-prog-icon.is-error, [data-theme="dark"] .ph-error .ph-icon, [data-theme="dark"] .ph-error .ph-state { color: var(--red); }
+.rpt-prog-title { font-size: 14px; }
+.rpt-prog-site { font-weight: 700; overflow-wrap: anywhere; }
+.rpt-prog-site .muted { font-weight: 500; }
+.rpt-prog-pct { min-width: 4ch; text-align: right; font-weight: 900; font-variant-numeric: tabular-nums; }
+.rpt-bar { height: 6px; border: 1px solid var(--rpt-line); border-radius: 3px; background: var(--paper-2); overflow: hidden; }
+.rpt-bar-fill { display: block; width: 0; height: 100%; background: var(--orange); transition: width 0.3s ease-out; }
+.rpt-bar.done .rpt-bar-fill { background: var(--green); }
+.rpt-bar.stopped .rpt-bar-fill { background: var(--ink-soft); }
+.rpt-prog-name { display: flex; align-items: flex-start; gap: 6px 8px; flex-wrap: wrap; }
+.rpt-prog-name > label { font-size: 10.5px; font-weight: 800; line-height: 28px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink-soft); }
+.rpt-prog-name .site-combo { flex: 1 1 240px; max-width: 420px; }
+.rpt-phases { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(250px, 100%), 1fr)); gap: 2px 16px; }
+.rpt-phase { display: grid; grid-template-columns: 14px auto auto minmax(0, 1fr) auto; align-items: center; gap: 6px; min-width: 0; font-size: 12px; }
+.ph-icon { display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px; }
+.ph-icon svg.icon { width: 14px; height: 14px; }
+.ph-pending .ph-icon::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--outline-25); }
+.ph-label { font-weight: 700; white-space: nowrap; }
+.ph-pending .ph-label { font-weight: 600; color: var(--ink-soft); }
+.ph-running .ph-icon { color: var(--orange); }
+.ph-skipped .ph-icon { color: var(--ink-soft); }
+.ph-state { font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink-soft); }
+.ph-msg { min-width: 0; color: var(--ink-soft); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ph-time { color: var(--ink-soft); font-variant-numeric: tabular-nums; white-space: nowrap; }
+/* Compare: A against B, one small table per section */
+.rpt-cmp-pick { display: flex; align-items: flex-end; gap: 8px 10px; flex-wrap: wrap; }
+.rpt-cmp-pick .field { flex: 1 1 260px; min-width: 0; }
+.rpt-cmp-pick select.input { width: 100%; min-width: 0; }
+.rpt-cmp-bpick { display: flex; gap: 6px; min-width: 0; }
+.rpt-cmp-bpick .rpt-cmp-filter { flex: 0 0 160px; min-width: 90px; }
+.rpt-cmp-bpick select.input { flex: 1 1 auto; }
+.rpt-cmp-head { display: flex; align-items: center; gap: 4px 8px; flex-wrap: wrap; margin: 8px 0 6px; font-size: 12.5px; }
+.rpt-cmp-head:empty, .rpt-cmp-notes:empty { display: none; }
+.rpt-cmp-notes { margin: 0 0 6px; }
+.rpt-cmp-side { display: inline-flex; align-items: center; gap: 5px; min-width: 0; overflow-wrap: anywhere; }
+.rpt-cmp-tag { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; flex: none; border-radius: 4px; background: var(--ink); color: var(--paper); font-size: 11px; font-weight: 900; }
+/* columns, not grid rows: a short table (Speed test) no longer sits in a row as tall as the Ping table */
+.rpt-cmp-grid { columns: 420px 3; column-gap: 16px; }
+.rpt-cmp-sec { min-width: 0; margin-bottom: 10px; break-inside: avoid; }
+.rpt-cmp-sec h4 { margin: 0 0 4px; font-size: 12px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.06em; }
+.rpt-cmp-empty { margin: 8px 0 2px; }
+.rpt .rpt-cmp-table td.cmp-metric { white-space: normal; min-width: 120px; }
+.cmp-note { display: block; font-size: 11px; color: var(--ink-soft); }
+.cmp-sec-note { margin: -2px 0 4px; font-size: 11.5px; color: var(--ink-soft); }
+.cmp-arrow { display: inline-block; margin-right: 3px; font-size: 10px; }
+/* a narrow column wraps a difference between the change and its percentage, never inside either */
+.rpt .rpt-cmp-table td.cmp-diff { white-space: normal; }
+.cmp-abs, .cmp-rel { white-space: nowrap; }
+.rpt .table tbody tr td.cmp-val { font-weight: 700; }
+.rpt .table tbody tr td.cmp-better { color: color-mix(in srgb, var(--green) 45%, var(--ink)); background: color-mix(in srgb, var(--green) 12%, var(--paper)); font-weight: 800; }
+.rpt .table tbody tr td.cmp-worse { color: color-mix(in srgb, var(--red) 65%, var(--ink)); background: color-mix(in srgb, var(--red) 9%, var(--paper)); font-weight: 800; }
+[data-theme="dark"] .rpt .table tbody tr td.cmp-better { color: var(--green); }
+[data-theme="dark"] .rpt .table tbody tr td.cmp-worse { color: var(--red); }
+.rpt .table tbody tr td.cmp-same, .rpt .table tbody tr.cmp-info td { color: var(--ink-soft); }
+/* a failure with its Retry, the progress card's window line, a site's "Show older" */
+.rpt-failed { display: flex; align-items: center; justify-content: center; gap: 8px; flex-wrap: wrap; }
+.rpt-prog-window { margin: 0; font-size: 12px; color: var(--ink-soft); }
+.rpt .btn.rpt-older { margin: 0 0 6px 18px; }
+@media (max-width: 1100px) {
+  .rpt-layout { grid-template-columns: minmax(0, 1fr); }
+  /* one column: the saved reports come right under the heading's search box that filters them, in a short scroller */
+  .rpt-browser { position: relative; top: auto; max-height: none; order: -1; }
+  .rpt-browser-body { max-height: 40vh; }
+  .rpt-cmp-bpick { flex-wrap: wrap; }
+  .rpt-cmp-bpick .rpt-cmp-filter { flex: 1 1 100%; }
+}
+@media (max-width: 900px) {
+  .topbar-scan { min-width: 0; padding: 0 12px; }
+}
+@media (max-width: 700px) {
+  .rpt .rpt-search { width: 100%; }
+}

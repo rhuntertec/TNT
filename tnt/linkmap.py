@@ -1,9 +1,8 @@
 """Live link map: this PC -> gateway -> internet, probed continuously.
 
 Two always-on ICMP probes drive the map card at the top of the Network info page: the
-machine's *current* default gateway (the same ``gateway`` alias the Ping tiles use, so it
-follows NIC/subnet changes) and one internet host (``map.internet_host``, default
-totalelectronics.com). They reuse the same ICMP engine, payload size (loaded/unloaded
+machine's *current* default gateway (the same ``gateway`` alias the Ping tiles use) and one
+internet host (``map.internet_host``, default totalelectronics.com). They reuse the same ICMP engine, payload size (loaded/unloaded
 toggle), timeout and one-per-second aligned schedule as the Ping tiles, but they are
 independent of them: they run even when neither host is a ping target, keep a short
 in-memory history only and never write to the database.
@@ -21,9 +20,23 @@ Every sample is published on the event bus as ``map.sample``
 ``{"probe": "gateway"|"internet", "ts", "ok", "rtt_ms", "ip", "state"}``.
 
 The router's public (WAN) address is looked up separately (Cloudflare's trace endpoint,
-thread ``tnt-linkmap-wan``, every 10 minutes and whenever the internet probe comes back
-up) and reported as ``view()["public_ip"]`` / ``view()["gateway"]["public_ip"]`` so the
-map can show it next to the gateway's LAN address.
+thread ``tnt-linkmap-wan``, every 10 minutes, whenever the internet probe comes back up and
+after a network change - at once, but never sooner than 30 s after the last lookup a network change
+asked for, so a flapping network costs one lookup per half minute) and reported as ``view()["public_ip"]`` /
+``view()["gateway"]["public_ip"]`` so the map can show it next to the gateway's LAN address.
+``view()["public_geo"]`` is the IP location + ISP of that address (``geo_lookup``, the engine's
+``tnt.geoip.GeoIpManager.lookup``: a local database read, computed at view time from the stored address;
+None when the feature is off, no data is loaded, there is no address or no record).  It is logged at DEBUG only.
+
+Network changes (:meth:`LinkMap.on_network_change`, called by the Engine for ``net.changed``):
+both probes look their address up again on their next tick (a lookup the change overtook is
+repeated), the PC node's cached address is dropped and the public address is checked again at
+once (retried every 10 s for a minute while the new network is not ready; while that lookup fails the
+previous network's address is dropped rather than shown as current).  The gateway is also
+looked up at least every ``network.poll_s`` and 2 s after a miss.  A gateway probe that moves to
+another router, or finds none (its IP is cleared: state ``down`` with the ``resolve_error``),
+starts its samples and counters afresh, so the old router's loss and average never show up on
+the new one.
 """
 from __future__ import annotations
 
@@ -41,6 +54,7 @@ PROBES: Tuple[str, ...] = ("gateway", "internet")
 SAMPLES_KEEP = 180
 RESOLVE_INTERVAL_S = 300.0
 RESOLVE_RETRY_S = 10.0
+GATEWAY_MISS_RECHECK_S = 2.0    # a missed gateway echo makes the probe look the gateway up again this soon
 STOP_JOIN_S = 2.0
 PC_INFO_CACHE_S = 5.0
 DEFAULT_INTERNET_HOST = "totalelectronics.com"
@@ -50,6 +64,9 @@ DEFAULT_INTERNET_HOST = "totalelectronics.com"
 #: usually means a new public address).
 WAN_REFRESH_S = 600.0
 WAN_RETRY_S = 60.0
+WAN_CHANGE_RETRY_S = 10.0       # a failed lookup within WAN_CHANGE_WINDOW_S of a network change retries this soon
+WAN_CHANGE_WINDOW_S = 60.0
+WAN_CHANGE_MIN_GAP_S = 30.0     # lookups network changes ask for are at least this far apart
 WAN_HOSTS: Tuple[str, ...] = ("1.1.1.1", "www.cloudflare.com")
 WAN_TIMEOUT_S = 8.0
 
@@ -89,6 +106,8 @@ class _Probe:
         self.resolved = False
         self.resolve_error: Optional[str] = None
         self.last_resolve_ts: Optional[float] = None
+        self.force = False              # look the address up on the next tick (a network change)
+        self.epoch = 0                  # bumped by a network change: a lookup already running is stale
         self.samples: Deque[Tuple[float, bool, Optional[float]]] = collections.deque(maxlen=SAMPLES_KEEP)
         self.consecutive_missed = 0
         self.consecutive_ok = 0
@@ -101,7 +120,8 @@ class LinkMap:
     def __init__(self, config: Any, bus: Any, pinger: Any = None, clock: Callable[[], float] = time.time,
                  sleep: Optional[Callable[[float], None]] = None, resolver: Optional[Callable[[str], Optional[str]]] = None,
                  gateway_lookup: Optional[Callable[[], Optional[str]]] = None,
-                 wan_fetch: Optional[Callable[[], Optional[str]]] = None) -> None:
+                 wan_fetch: Optional[Callable[[], Optional[str]]] = None,
+                 geo_lookup: Optional[Callable[[str], Optional[Dict[str, Any]]]] = None) -> None:
         self._config = config
         self._bus = bus
         self.pinger = pinger
@@ -111,6 +131,8 @@ class LinkMap:
         self._resolver = resolver
         self._gateway_lookup = gateway_lookup
         self._wan_fetch = wan_fetch
+        self._geo_lookup = geo_lookup
+        self._geo_logged: Optional[Tuple[Any, ...]] = None
         self._wan: Dict[str, Any] = {"ip": None, "ts": None, "error": None, "checked_ts": None}
         self._wan_wake = threading.Event()
         self._wan_thread: Optional[threading.Thread] = None
@@ -122,6 +144,9 @@ class LinkMap:
             "internet": _Probe("internet", self.internet_host()),
         }
         self._pc_cache: Tuple[float, Dict[str, Any]] = (0.0, {})
+        self._wan_changed_ts: Optional[float] = None
+        self._wan_due_ts: Optional[float] = None            # a network change asked for a lookup at this time
+        self._wan_change_lookup_ts: Optional[float] = None  # when the last lookup a network change asked for ran
 
     # -- configuration -----------------------------------------------------------------
     def internet_host(self) -> str:
@@ -137,6 +162,14 @@ class LinkMap:
             return default if v is None else v
         except Exception:  # noqa: BLE001
             return default
+
+    def _poll_s(self) -> float:
+        """The gateway is looked up at least this often: every network watcher poll."""
+        try:
+            value = float(self._cfg("network.poll_s", 5))
+        except (TypeError, ValueError):
+            return 5.0
+        return max(2.0, min(60.0, value)) if value == value else 5.0
 
     # -- lifecycle ---------------------------------------------------------------------
     def start(self) -> None:
@@ -216,26 +249,47 @@ class LinkMap:
             return None, f"resolve failed: {exc}"
 
     def _maybe_resolve(self, p: _Probe, now: float) -> Optional[str]:
-        with p.lock:
-            last = p.last_resolve_ts
-            if p.ip is None or not p.resolved:
-                due = last is None or now - last >= RESOLVE_RETRY_S or now < last
-            else:
-                due = now - last >= RESOLVE_INTERVAL_S or now < last
-            if not due:
+        for _attempt in range(2):
+            with p.lock:
+                last = p.last_resolve_ts
+                if p.force or last is None or now < last:
+                    due = True
+                elif p.ip is None or not p.resolved:
+                    due = now - last >= RESOLVE_RETRY_S
+                elif p.name == "gateway":
+                    due = (now - last >= min(RESOLVE_INTERVAL_S, self._poll_s())
+                           or (p.consecutive_missed > 0 and now - last >= GATEWAY_MISS_RECHECK_S))
+                else:
+                    due = now - last >= RESOLVE_INTERVAL_S
+                if not due:
+                    return p.ip
+                p.force = False
+                epoch = p.epoch
+            ip, err = self._resolve(p)
+            with p.lock:
+                if p.epoch != epoch:
+                    continue                    # a network change overtook this lookup: look again
+                p.last_resolve_ts = now
+                old = p.ip
+                if ip:
+                    if ip != old:
+                        log.info("link map %s -> %s", p.name, ip)
+                    p.ip = ip
+                    p.resolved = True
+                    p.resolve_error = None
+                else:
+                    p.resolved = False
+                    p.resolve_error = err
+                    if p.name == "gateway":
+                        p.ip = None             # no default gateway: never keep pinging the old router
+                if p.name == "gateway" and old is not None and p.ip != old:
+                    # another router (or none): the old one's loss and average say nothing about it
+                    p.samples.clear()
+                    p.consecutive_missed = 0
+                    p.consecutive_ok = 0
+                    p.last = None
                 return p.ip
-        ip, err = self._resolve(p)
         with p.lock:
-            p.last_resolve_ts = now
-            if ip:
-                if ip != p.ip:
-                    log.info("link map %s -> %s", p.name, ip)
-                p.ip = ip
-                p.resolved = True
-                p.resolve_error = None
-            else:
-                p.resolved = False
-                p.resolve_error = err
             return p.ip
 
     def tick(self, name: str, now: Optional[float] = None) -> Dict[str, Any]:
@@ -294,19 +348,84 @@ class LinkMap:
                     log.info("public IP: %s", ip)
                 self._wan = {"ip": ip, "ts": now, "error": None, "checked_ts": now}
             else:
-                self._wan = dict(self._wan, error=error, checked_ts=now)
+                wan = dict(self._wan, error=error, checked_ts=now)
+                changed = self._wan_changed_ts
+                if changed is not None and wan.get("ip") and float(wan.get("ts") or 0.0) < changed:
+                    # the last known address was looked up on the network this PC has left: never show it as current
+                    wan["ip"] = None
+                self._wan = wan
             return dict(self._wan)
+
+    def public_ip(self) -> Optional[str]:
+        """The last known public (WAN) address, or None."""
+        with self._lock:
+            return self._wan.get("ip")
+
+    def _public_geo(self, ip: Optional[str]) -> Optional[Dict[str, Any]]:
+        """IP location + ISP of the public address (a local lookup), or None; never raises."""
+        if not ip or self._geo_lookup is None:
+            return None
+        try:
+            geo = self._geo_lookup(ip)
+        except Exception:  # noqa: BLE001
+            log.debug("public IP location lookup failed", exc_info=True)
+            return None
+        if not isinstance(geo, dict):
+            return None
+        key = (ip, geo.get("place"), geo.get("isp"))
+        if key != self._geo_logged:
+            log.debug("public IP location: %s · %s", geo.get("place"), geo.get("isp"))
+            self._geo_logged = key
+        return dict(geo)
+
+    def on_network_change(self, data: Optional[Dict[str, Any]] = None) -> None:
+        """``net.changed`` (network watcher thread; quick, never raises): both probes look their
+        address up on their next tick, the PC node is refreshed and the public address looked up
+        at once, or :data:`WAN_CHANGE_MIN_GAP_S` after the last lookup a network change asked for."""
+        try:
+            for p in self._probes.values():
+                with p.lock:
+                    p.epoch += 1
+                    p.force = True
+            self._pc_cache = (0.0, {})
+            now = float(self._clock())
+            with self._lock:
+                self._wan_changed_ts = now
+                last = self._wan_change_lookup_ts
+                spaced = last is None or now < last or now - last >= WAN_CHANGE_MIN_GAP_S
+                self._wan_due_ts = now if spaced else last + WAN_CHANGE_MIN_GAP_S
+            self._wan_wake.set()
+        except Exception:  # noqa: BLE001
+            log.exception("handling a network change in the link map failed")
 
     def _wan_loop(self) -> None:
         while not self._stop.is_set():
+            # cleared before the lookup, so a network change reported while it runs wakes the next one
+            self._wan_wake.clear()
+            with self._lock:
+                due = self._wan_due_ts
+            now = float(self._clock())
+            if due is not None and now < due:
+                # a network change asked again within WAN_CHANGE_MIN_GAP_S: one lookup when that is up
+                self._wan_wake.wait(min(due - now, WAN_CHANGE_MIN_GAP_S))
+                continue
+            if due is not None:
+                with self._lock:
+                    if self._wan_due_ts == due:
+                        self._wan_due_ts = None
+                    self._wan_change_lookup_ts = now
             try:
                 result = self.refresh_public_ip()
             except Exception:  # noqa: BLE001
                 log.exception("public IP lookup failed")
                 result = {"ip": None}
-            delay = WAN_REFRESH_S if result.get("ip") and not result.get("error") else WAN_RETRY_S
-            self._wan_wake.clear()
-            self._wan_wake.wait(delay)      # an early wake means the internet came back up (or stop)
+            ok = bool(result.get("ip")) and not result.get("error")
+            delay = WAN_REFRESH_S if ok else WAN_RETRY_S
+            with self._lock:
+                changed = self._wan_changed_ts
+            if not ok and changed is not None and 0.0 <= float(self._clock()) - changed < WAN_CHANGE_WINDOW_S:
+                delay = WAN_CHANGE_RETRY_S      # the new network may need a few seconds before it reaches out
+            self._wan_wake.wait(delay)      # an early wake: the internet came back up, the network changed, or stop
 
     def _run(self, p: _Probe) -> None:
         interval = 1.0
@@ -400,4 +519,5 @@ class LinkMap:
             "gateway": gateway,
             "internet": self._probe_view(self._probes["internet"], now),
             "public_ip": wan,
+            "public_geo": self._public_geo(wan.get("ip")),
         }

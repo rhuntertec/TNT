@@ -29,9 +29,12 @@ Contract gaps / decisions taken here (the smallest sensible behaviour):
 * Reverse DNS runs on plain daemon threads (not a ``ThreadPoolExecutor``) so
   that stragglers blocked inside ``gethostbyaddr`` can never delay service
   shutdown; results arriving after the 3 s cap are discarded.
-* ``default_cidr`` falls back to a UDP-connect local-address guess (``/24``) and
-  finally ``192.168.1.0/24`` when ``tnt.netinfo`` is unavailable or reports no
-  internet-facing IPv4 address.
+* ``default_cidr`` is the internet-facing NIC's IPv4 network.  Without one (a static
+  address without a gateway, a self-assigned 169.254.x.x adapter next to a real one) or
+  when that NIC is a /31-/32 tunnel (a full-tunnel VPN), it is the first up physical adapter's
+  preferred, non-link-local IPv4 network (``_first_up_ipv4``; never a Hyper-V / WSL switch),
+  then a UDP-connect local-address guess (``/24``), and ``None`` when this PC is on no
+  IPv4 network at all: the old ``192.168.1.0/24`` guess scanned a network it is not on.
 * Extras for the Engine / diagnostics: ``running``, ``progress``, ``last_run_ts``
   properties and ``stop(timeout)`` (aborts a running scan and waits, bounded, for
   it to finish; used at service shutdown).
@@ -58,14 +61,15 @@ Contract gaps / decisions taken here (the smallest sensible behaviour):
 * ``DiscoveryResult.to_dict()`` adds ``"found"`` (host count) next to the dataclass
   fields; the dict is directly usable with ``Database.add_discovery_run``.
 * Every host is categorised by :func:`classify_device` (``device_type``: Router / DW Server /
-  Camera / Phone / Wifi or ``None``) on the way out of ``scan()``, whatever the outcome. The
+  Camera / Phone / Ubiquiti or ``None``) on the way out of ``scan()``, whatever the outcome. The
   rule set is pure and lives in one place; the UI only renders what the payload carries and
   :func:`fill_device_types` categorises rows stored before the column existed. The router is
   recognised by address, so the machine's own gateways are collected once per scan through
-  :func:`gateway_ips` (``tnt.netinfo``, IPv4 only, failures = no Router).
+  :func:`gateway_ips` (``tnt.netinfo``, IPv4 only, failures = no Router) when the scan starts:
+  a scan that the laptop carries onto another network still types the routers of the one it swept.
 
 Module-level seams that tests (and only tests) monkeypatch: ``_tcp_connect``,
-``_reverse_lookup``, ``_internet_ipv4``, ``_local_ipv4_guess``,
+``_reverse_lookup``, ``_internet_ipv4``, ``_first_up_ipv4``, ``_local_ipv4_guess``,
 ``RESOLVE_DEADLINE_S``, ``MAX_PORTS`` and ``DRAIN_CAP_S``. ``tnt.icmp`` / ``tnt.arp`` /
 ``tnt.oui`` / ``tnt.netinfo`` are imported lazily through ``importlib`` so a fake
 in ``sys.modules`` is honoured.
@@ -112,12 +116,14 @@ MAX_PORTS: int = 1024
 DRAIN_CAP_S: float = 5.0
 
 #: Device categories :func:`classify_device` can return, in the order it tries them.
-DEVICE_TYPES: List[str] = ["Router", "DW Server", "Camera", "Phone", "Wifi"]
+DEVICE_TYPES: List[str] = ["Router", "DW Server", "Camera", "Phone", "Ubiquiti"]
 DW_SERVER_PORT: int = 7001      # Digital Watchdog Spectrum media server (its web/client port)
 CAMERA_PORT: int = 554          # RTSP
 PHONE_PORT: int = 5060          # SIP
-WIFI_PORT: int = 22             # SSH - only an access point together with a Ubiquiti OUI
-WIFI_VENDOR_MATCH: str = "ubiquiti"   # the OUI registry says "Ubiquiti Inc." / "Ubiquiti Networks Inc."
+UBIQUITI_PORT: int = 22         # SSH - only counts together with a Ubiquiti OUI
+UBIQUITI_VENDOR_MATCH: str = "ubiquiti"   # the OUI registry says "Ubiquiti Inc." / "Ubiquiti Networks Inc."
+#: Device types earlier versions stored, and what they are called now (1.11 and older said "Wifi").
+LEGACY_DEVICE_TYPES: Dict[str, str] = {"Wifi": "Ubiquiti"}
 
 _RANGE_HELP = "e.g. 10.0.0.0/24, 10.0.0.1-10.0.0.50, 10.0.0.1-50 or a single IP such as 10.0.0.5"
 
@@ -298,8 +304,10 @@ def _internet_ipv4() -> Optional[Tuple[str, int]]:
 
     An adapter can carry several IPv4 addresses (a tentative APIPA 169.254.x.x next
     to the real DHCP lease, a secondary static address...). Prefer the address the
-    default route actually uses, then a *preferred* (DAD state) non-link-local one,
-    then anything that parses.
+    default route actually uses, then a *preferred* (DAD state) one, then anything
+    that parses. A self-assigned 169.254.x.x address never counts: a /24 around it is
+    not a network anyone can scan (an IPv6-only network, where the internet adapter's
+    only IPv4 address is self-assigned, gets the other adapters' networks or no default).
     """
     netinfo = importlib.import_module("tnt.netinfo")
     nic = netinfo.get_internet_nic()
@@ -312,7 +320,8 @@ def _internet_ipv4() -> Optional[Tuple[str, int]]:
         if not addr or prefix is None:
             continue
         try:
-            ipaddress.IPv4Address(addr)
+            if ipaddress.IPv4Address(addr).is_link_local:
+                continue
             cands.append((str(addr), int(prefix), bool(getattr(a, "preferred", True))))
         except (ValueError, TypeError):
             continue
@@ -323,9 +332,9 @@ def _internet_ipv4() -> Optional[Tuple[str, int]]:
     except Exception:  # noqa: BLE001
         route_ip = None
 
-    def rank(c: Tuple[str, int, bool]) -> Tuple[int, int, int]:
+    def rank(c: Tuple[str, int, bool]) -> Tuple[int, int]:
         addr, _prefix, preferred = c
-        return (0 if addr == route_ip else 1, 0 if preferred else 1, 1 if addr.startswith("169.254.") else 0)
+        return (0 if addr == route_ip else 1, 0 if preferred else 1)
 
     best = min(cands, key=rank)
     return best[0], best[1]
@@ -348,6 +357,34 @@ def _local_ipv4_guess() -> Optional[str]:
     if not ip or ip.startswith("127.") or ip == "0.0.0.0":
         return None
     return ip
+
+
+def _first_up_ipv4() -> Optional[Tuple[str, int]]:
+    """``(address, prefix)`` of the first up *physical* adapter's preferred IPv4 address that is
+    neither link-local (169.254.x.x) nor a /31-/32 point-to-point one.  For a PC without an
+    internet-facing adapter (a static bench address without a gateway) or whose default route goes
+    into a VPN tunnel.  A virtual adapter (a Hyper-V or WSL switch that stays up on every network, a
+    VPN) is never the network a person means to scan, so a laptop on a network where no DHCP server
+    answered gets no default rather than the virtual switch's."""
+    netinfo = importlib.import_module("tnt.netinfo")
+    best: Optional[Tuple[int, int, str, int]] = None
+    for pos, adapter in enumerate(netinfo.get_adapters(include_down=False) or []):
+        if getattr(adapter, "is_loopback", False) or not getattr(adapter, "is_physical", False):
+            continue
+        for entry in getattr(adapter, "ipv4", None) or []:
+            if not bool(getattr(entry, "preferred", True)):
+                continue
+            try:
+                addr = ipaddress.IPv4Address(str(getattr(entry, "address", "")))
+                prefix = int(getattr(entry, "prefix", 32))
+            except (TypeError, ValueError):
+                continue
+            if addr.is_link_local or addr.is_loopback or prefix >= 31:
+                continue
+            rank = (0 if getattr(adapter, "is_physical", False) else 1, pos, str(addr), prefix)
+            if best is None or rank < best:
+                best = rank
+    return (best[2], best[3]) if best is not None else None
 
 
 def _arp_table() -> Dict[str, str]:
@@ -433,8 +470,8 @@ def classify_device(ip: Any, open_ports: Any, mac: Optional[str] = None, vendor:
     2. ``DW Server`` -- TCP 7001 open (Digital Watchdog Spectrum media server).
     3. ``Camera``    -- TCP 554 open (RTSP).
     4. ``Phone``     -- TCP 5060 open (SIP).
-    5. ``Wifi``      -- TCP 22 open **and** the MAC vendor names Ubiquiti (an AP or a switch;
-       plain SSH on anything else says nothing about the device).
+    5. ``Ubiquiti``  -- TCP 22 open **and** the MAC vendor names Ubiquiti (an access point, a switch or
+       a gateway; plain SSH on anything else says nothing about the device).
 
     *mac* and *hostname* are accepted for future rules and to keep the call site uniform.
     """
@@ -450,8 +487,8 @@ def classify_device(ip: Any, open_ports: Any, mac: Optional[str] = None, vendor:
         return "Camera"
     if PHONE_PORT in ports:
         return "Phone"
-    if WIFI_PORT in ports and WIFI_VENDOR_MATCH in str(vendor or "").lower():
-        return "Wifi"
+    if UBIQUITI_PORT in ports and UBIQUITI_VENDOR_MATCH in str(vendor or "").lower():
+        return "Ubiquiti"
     return None
 
 
@@ -476,10 +513,15 @@ def apply_device_types(hosts: List[HostResult], gateways: Optional[Iterable[str]
 
 def fill_device_types(hosts: Any, gateways: Optional[Iterable[str]] = None) -> Any:
     """Categorise stored host **dicts** that carry no ``device_type`` (rows written before the
-    ``discovery_hosts.device_type`` column existed), in place. Never raises; rows that already
-    have a type are left untouched, and the gateways are only enumerated when something needs them.
+    ``discovery_hosts.device_type`` column existed), in place, and rename the types older versions
+    stored (:data:`LEGACY_DEVICE_TYPES`). Never raises; rows that already have a current type are left
+    untouched, and the gateways are only enumerated when something needs them.
     """
     try:
+        for h in hosts or []:
+            old = h.get("device_type") if isinstance(h, dict) else None
+            if isinstance(old, str) and old in LEGACY_DEVICE_TYPES:
+                h["device_type"] = LEGACY_DEVICE_TYPES[old]
         todo = [h for h in (hosts or []) if isinstance(h, dict) and not h.get("device_type")]
         if not todo:
             return hosts
@@ -705,8 +747,12 @@ class DiscoveryScanner:
         return out
 
     # -- range handling --------------------------------------------------------
-    def default_cidr(self) -> str:
-        """Internet-facing NIC's IPv4 network; a /24 around the IP when the prefix is < 22."""
+    def default_cidr(self) -> Optional[str]:
+        """Internet-facing NIC's IPv4 network; a /24 around the IP when the prefix is < 22.
+
+        Fallbacks (module notes): another up adapter's network, the route guess, then ``None``
+        when this PC is on no IPv4 network at all.
+        """
         addr: Optional[str] = None
         prefix: Optional[int] = None
         try:
@@ -715,6 +761,14 @@ class DiscoveryScanner:
                 addr, prefix = found
         except Exception as exc:  # noqa: BLE001 - netinfo missing or failing
             log.debug("netinfo unavailable for default_cidr: %s", exc)
+        if addr is None or (prefix is not None and int(prefix) >= 31):
+            try:
+                other = _first_up_ipv4()
+            except Exception as exc:  # noqa: BLE001
+                log.debug("adapter list unavailable for default_cidr: %s", exc)
+                other = None
+            if other:
+                addr, prefix = other
         if addr is None:
             try:
                 addr = _local_ipv4_guess()
@@ -722,14 +776,14 @@ class DiscoveryScanner:
                 addr = None
             prefix = 24
         if addr is None:
-            return "192.168.1.0/24"
+            return None
         try:
             p = int(prefix) if prefix is not None else 24
             if p < 22 or p > 32:
                 p = 24
             return str(ipaddress.ip_network(f"{addr}/{p}", strict=False))
         except ValueError:
-            return "192.168.1.0/24"
+            return None
 
     @staticmethod
     def _host_count(net: ipaddress.IPv4Network) -> int:
@@ -1123,13 +1177,15 @@ class DiscoveryScanner:
         label = (range_text or "").strip() if isinstance(range_text, str) else ""
         clean_ports: List[int] = []
 
+        scan_gateways: List[Optional[Set[str]]] = [None]   # the routers of the network the scan started on
+
         def finish(*, ok: bool, error: Optional[str], cancelled: bool, scanned: int,
                    hosts: Optional[List[HostResult]] = None) -> DiscoveryResult:
             hosts = hosts if hosts is not None else []
             if hosts:
-                # every exit (finished, cancelled, crashed) hands back categorised hosts;
-                # the gateways are read once here, and never let the scan fail
-                apply_device_types(hosts)
+                # every exit (finished, cancelled, crashed) hands back categorised hosts, typed
+                # with the gateways read when the scan started (never letting the scan fail)
+                apply_device_types(hosts, scan_gateways[0])
             hosts.sort(key=lambda h: _ip_key(h.ip))
             return DiscoveryResult(
                 ts=ts, cidr=label, ports=list(clean_ports), method="native", hosts=hosts,
@@ -1153,6 +1209,7 @@ class DiscoveryScanner:
             self._stop.clear()
             self._idle.clear()
         reporter = _ProgressReporter(progress, t0, state, sink)
+        scan_gateways[0] = gateway_ips()
 
         try:
             try:
@@ -1167,7 +1224,7 @@ class DiscoveryScanner:
             if not label:
                 # "both optional -> defaults" (API contract): no range means the local network
                 try:
-                    range_text = label = self.default_cidr()
+                    range_text = label = self.default_cidr() or ""
                 except Exception:  # noqa: BLE001
                     log.exception("default_cidr failed")
             try:

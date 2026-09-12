@@ -12,9 +12,38 @@
 
   let root = null, unsubs = [];
   let els = {};
-  let running = false, touched = false, currentRun = null;
+  let running = false, currentRun = null;
+  let rangeTouched = false, portsTouched = false;   // the user typed in Range / Ports: never overwrite that field
+  let autoRange = '';               // the default range last filled in for the user
+  let netPending = false;           // the PC changed networks and the new default range is not applied yet
   let pollTimer = null;
   let table = null;                 // TNT.hosttable instance while mounted
+  // run ids of the scans this PC changed networks during (discovery.done network_changed; the service does not store
+  // it with the run). Listened for from load, so a scan that ends while another view is open is marked too.
+  const netChangedRuns = new Set();
+  if (TNT.api && TNT.api.events && TNT.api.events.on) {
+    TNT.api.events.on('discovery.done', (d) => { if (d && d.network_changed && d.run_id != null) netChangedRuns.add(d.run_id); });
+  }
+
+  /** Pure: what a new default range does to the Range field -> { action, value }. 'replace' fills it in
+   *  (the field is empty or still holds the range filled in before, untouched); 'hint' offers it next
+   *  to a range the user typed (only after a network change); 'wait' holds it while a scan runs or
+   *  the field has the focus; 'none' when nothing changes. No default range after a network change (this
+   *  PC is on no IPv4 network now) 'replace's an untouched filled-in range with '': it was the old network's. */
+  function rangeUpdate(field, next) {
+    field = field || {};
+    const value = String(field.value || '').trim();
+    const nextRange = String(next || '').trim();
+    const untouchedAuto = !field.touched && !!value && value === String(field.auto || '');
+    if (!nextRange) {
+      if (!field.changed || !untouchedAuto) return { action: 'none', value };
+      return { action: field.running || field.focused ? 'wait' : 'replace', value: '' };
+    }
+    if (nextRange === value) return { action: 'none', value };
+    if (field.running) return { action: 'wait', value: nextRange };
+    if (!value || untouchedAuto) return { action: field.focused && value ? 'wait' : 'replace', value: nextRange };
+    return { action: field.changed ? 'hint' : 'none', value: nextRange };
+  }
 
   const PHASES = { ping: 'Ping sweep', ports: 'Checking ports', arp: 'Reading ARP table', resolve: 'Resolving names', done: 'Done' };
 
@@ -110,6 +139,10 @@
     els.summary.appendChild(h('span', { class: 'badge orange' }, run.method || 'native'));
     if (run.scanned) els.summary.appendChild(h('span', { class: 'muted' }, run.scanned + ' addresses'));
     if (run.error) els.summary.appendChild(h('span', { class: 'badge ' + (run.error === 'cancelled' ? 'yellow' : 'red') }, run.error));
+    // a scan this PC changed networks during swept (part of) the network it left: a yellow note, not a failure
+    if (run.id != null && netChangedRuns.has(run.id)) {
+      els.summary.appendChild(h('span', { class: 'badge yellow', title: 'This PC changed networks while the scan ran: part of it may be of the network it left' }, 'network changed during scan'));
+    }
     table.render(hosts, run.error === 'cancelled' ? 'Scan was cancelled before anything answered.' : 'No devices answered in ' + run.cidr + '.');
   }
 
@@ -135,14 +168,31 @@
     } catch (err) { TNT.ui.toast('Could not load run: ' + err.message, 'error'); }
   }
 
+  /** The note under the form when this PC changed networks but the Range field holds the user's own range. */
+  function showRangeHint(range) {
+    const { h, copyCode } = TNT.util;
+    if (!els.rangeHint) return;
+    if (!range) { els.rangeHint.hidden = true; return; }
+    const use = h('button', { class: 'btn btn-sm', type: 'button',
+      on: { click: () => { els.range.value = range; autoRange = range; rangeTouched = false; showRangeHint(null); } } }, 'Use it');
+    els.rangeHint.innerHTML = '';
+    els.rangeHint.appendChild(TNT.ui.icon('info'));
+    els.rangeHint.appendChild(h('span', { class: 'row', style: { gap: '8px' } }, 'This PC changed networks: the default range is now', copyCode(range), use));
+    els.rangeHint.hidden = false;
+  }
+
   async function loadStatus() {
     try {
       const s = await TNT.api.discoveryStatus();
       if (!root) return;
-      if (!touched) {
-        if (s.default_range && !els.range.value) els.range.value = s.default_range;
-        if (Array.isArray(s.default_ports) && !els.ports.value) els.ports.value = s.default_ports.join(', ');
-      }
+      // the default range follows the network until the user types a range of their own
+      const u = rangeUpdate({ value: els.range.value, auto: autoRange, touched: rangeTouched, running: running || !!s.running,
+        focused: document.activeElement === els.range, changed: netPending }, s.default_range);
+      if (u.action === 'replace') { els.range.value = u.value; autoRange = u.value; showRangeHint(null); }
+      else if (u.action === 'hint') showRangeHint(u.value);
+      else if (u.action === 'none' && (!s.default_range || (els.range.value || '').trim() === s.default_range)) showRangeHint(null);
+      if (u.action !== 'wait') netPending = false;       // 'wait': discovery.done or leaving the field asks again
+      if (!portsTouched && Array.isArray(s.default_ports) && !els.ports.value) els.ports.value = s.default_ports.join(', ');
       setRunning(!!s.running);
       if (s.running) { setProgress(s.progress); startPoll(); }
     } catch (err) { TNT.ui.toast('Could not read discovery status: ' + err.message, 'error'); }
@@ -165,7 +215,7 @@
       if (TNT.api.events.state === 'live') return;
       try {
         const s = await TNT.api.discoveryStatus();
-        if (s.running) setProgress(s.progress); else { stopPoll(); setRunning(false); await loadLast(); await loadRuns(currentRun && currentRun.id); }
+        if (s.running) setProgress(s.progress); else { stopPoll(); setRunning(false); await loadLast(); await loadRuns(currentRun && currentRun.id); if (root && netPending) loadStatus(); }
       } catch (e) { /* ignore */ }
     }, 2000);
   }
@@ -200,7 +250,7 @@
       const { h } = TNT.util;
       root = el;
       els = {};
-      running = false; touched = false; currentRun = null;
+      running = false; rangeTouched = false; portsTouched = false; autoRange = ''; netPending = false; currentRun = null;
       els.runs = h('select', { class: 'input sm', 'aria-label': 'Previous runs', disabled: true, style: { maxWidth: 'min(360px, 80vw)' } }, h('option', { value: '' }, 'Previous runs…'));
       els.runs.addEventListener('change', () => { if (els.runs.value) loadRun(parseInt(els.runs.value, 10)); });
       const head = h('div', { class: 'section-head' },
@@ -208,8 +258,11 @@
         h('div', { class: 'actions' }, els.runs));
       els.range = h('input', { class: 'input', type: 'text', placeholder: '10.0.0.0/24 or 10.0.0.1-10.0.0.50', 'aria-label': 'Range', spellcheck: 'false', autocomplete: 'off', style: { width: '100%' } });
       els.ports = h('input', { class: 'input', type: 'text', placeholder: '22, 80, 443, 8080', 'aria-label': 'Ports', spellcheck: 'false', autocomplete: 'off', style: { width: '100%' } });
-      els.range.addEventListener('input', () => { touched = true; });
-      els.ports.addEventListener('input', () => { touched = true; });
+      els.range.addEventListener('input', () => { rangeTouched = true; showRangeHint(null); });
+      els.ports.addEventListener('input', () => { portsTouched = true; });
+      // a new default range that arrived while the field had the focus is applied once it loses it
+      els.range.addEventListener('blur', () => { if (root && netPending) loadStatus(); });
+      els.rangeHint = h('div', { class: 'dhcp-info range-hint', hidden: true, role: 'status' });
       els.range.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !running) scan(); });
       els.ports.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !running) scan(); });
       els.scanBtn = h('button', { class: 'btn btn-primary', type: 'button', on: { click: scan } }, TNT.ui.icon('search'), 'Scan');
@@ -222,7 +275,7 @@
         h('div', { class: 'field', style: { flex: '1 1 220px' } }, h('label', null, 'Ports'), els.ports),
         els.scanBtn, els.cancelBtn);
       // no card title here on purpose: the range/ports/Scan row is self-explanatory
-      const ctlCard = h('div', { class: 'card' }, form, els.fuse);
+      const ctlCard = h('div', { class: 'card' }, form, els.rangeHint, els.fuse);
       els.resultsTitle = h('span', null, 'Results');
       els.exportBtn = h('button', { class: 'btn btn-sm', type: 'button', hidden: true, title: 'Export this scan as a CSV file', on: { click: exportCsv } },
         TNT.ui.icon('download'), 'Export CSV');
@@ -248,6 +301,7 @@
         if (!root) return;
         setProgress({ phase: 'done', done: 1, total: 1, found: currentRun ? (currentRun.hosts || []).length : 0, elapsed_s: currentRun ? currentRun.duration_s : 0 });
         els.fuse.set(1, 'done', 'Done', (currentRun ? (currentRun.hosts || []).length : 0) + ' found');
+        if (netPending) loadStatus();          // the PC changed networks during the scan: its default range now
       }));
       unsubs.push(TNT.api.events.on('hello', () => { if (root) loadStatus(); }));
     },
@@ -258,14 +312,21 @@
       if (!d || !els.fuse) return;
       if (d.running && !running) { setRunning(true); setProgress(d.progress); startPoll(); }
     },
+    // this PC changed networks (app.js, once a burst of changes settles): the default range follows it
+    netChanged() {
+      if (!root) return;
+      netPending = true;
+      loadStatus();
+    },
     unmount() {
       for (const u of unsubs) { try { u(); } catch (e) { /* ignore */ } }
       unsubs = [];
       stopPoll();
       if (table) table.destroy();
-      root = null; els = {}; currentRun = null; table = null;
+      root = null; els = {}; currentRun = null; table = null; netPending = false;
     },
     // exposed for tests
+    rangeUpdate,
     sortHosts,
     portUrl: (ip, port) => TNT.hosttable.portUrl(ip, port),
     portAction: (port) => TNT.hosttable.portAction(port),
