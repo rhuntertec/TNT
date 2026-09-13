@@ -476,6 +476,7 @@ def test_wlan_structure_layout():
     assert s.WLAN_BSS_LIST.wlanBssEntries.offset == 8
     assert ctypes.sizeof(s.WLAN_INTERFACE_INFO) == 532 and s.WLAN_INTERFACE_INFO_LIST.InterfaceInfo.offset == 8
     assert ctypes.sizeof(s.WLAN_ASSOCIATION_ATTRIBUTES) == 68 and s.WLAN_ASSOCIATION_ATTRIBUTES.dot11PhyType.offset == 48
+    assert (s.WLAN_ASSOCIATION_ATTRIBUTES.ulRxRate.offset, s.WLAN_ASSOCIATION_ATTRIBUTES.ulTxRate.offset) == (60, 64)
     assert ctypes.sizeof(s.WLAN_SECURITY_ATTRIBUTES) == 16
     assert ctypes.sizeof(s.WLAN_CONNECTION_ATTRIBUTES) == 604
     assert s.WLAN_CONNECTION_ATTRIBUTES.wlanAssociationAttributes.offset == 520
@@ -896,7 +897,7 @@ def test_radio_off_makes_no_list_or_scan_calls(world, clock):
 
 def test_readings_history_and_contract_shape(world, clock):
     start = clock.wall
-    world.connection = {"ssid": b"Synthetic Lab", "bssid": BSSID_A}
+    world.connection = {"ssid": b"Synthetic Lab", "bssid": BSSID_A, "rx_kbps": 433300, "tx_kbps": 390000}
     world.interfaces[0]["state"] = "connected"
     world.entries = [ap_entry(BSSID_A, -52, start - 1), ap_entry(BSSID_B, -70, start - 300, freq=2437, name="")]
     s = make_survey(world, clock)
@@ -904,9 +905,10 @@ def test_readings_history_and_contract_shape(world, clock):
     s.tick()
     view = s.survey()
     assert set(view) == {"available", "enabled", "state", "error", "started_ts", "last_read_ts", "last_scan_ts", "active",
-                         "scan_interval_s", "passive_interval_s", "interfaces", "aps", "history"}
+                         "scan_interval_s", "passive_interval_s", "interfaces", "aps", "history", "link_history"}
     assert view["interfaces"] == [{"guid": GUID_A, "description": "Synthetic Wi-Fi", "state": "connected",
-                                   "connected_bssid": TEXT_A, "connected_ssid": "Synthetic Lab"}]
+                                   "connected_bssid": TEXT_A, "connected_ssid": "Synthetic Lab", "rx_rate_mbps": 433.3, "tx_rate_mbps": 390.0}]
+    assert view["link_history"] == [[start, 390.0]], "the transmit rate, stamped when the read pass ended"
     a, b = view["aps"]
     assert set(a) == {"bssid", "ssid", "hidden", "rssi", "quality", "band", "channel", "center_channel", "width_mhz",
                       "freq_mhz", "spans", "phy", "phys", "generation", "security", "beacon_ms", "max_rate_mbps", "oui",
@@ -928,6 +930,7 @@ def test_readings_history_and_contract_shape(world, clock):
     assert (a["rssi"], a["seen_count"]) == (-49, 2) and b["seen_count"] == 1, "repeated cached values are not readings"
     assert view["history"][TEXT_A] == [[start, -52], [round(start + 6.5, 1), -49]]
     assert view["history"]["02:11:22:33:44:02"] == []
+    assert view["link_history"] == [[start, 390.0], [start + 60.0, 390.0]], "one point per read pass, the passive one a minute later"
 
 
 def test_history_coalesces_to_one_point_per_5_s_and_is_bounded(world, clock):
@@ -1137,8 +1140,9 @@ def test_connected_network_stays_named_through_scan_only_passes(world, clock):
 
 
 def test_a_failed_connection_query_keeps_the_last_association(world, clock, monkeypatch):
+    start = clock.wall
     world.interfaces[0]["state"] = "connected"
-    world.connection = {"ssid": b"Synthetic Lab", "bssid": BSSID_A}
+    world.connection = {"ssid": b"Synthetic Lab", "bssid": BSSID_A, "rx_kbps": 390000, "tx_kbps": 390000}
     world.entries = [ap_entry(BSSID_A, -50, clock.wall)]
     s = make_survey(world, clock)
     s.window_shown()
@@ -1150,13 +1154,17 @@ def test_a_failed_connection_query_keeps_the_last_association(world, clock, monk
     monkeypatch.setattr(FakeApi, "current_connection", flaky)
     clock.advance(60)
     s.tick()
-    assert s.survey()["interfaces"][0]["connected_ssid"] == "Synthetic Lab" and s.survey()["aps"][0]["connected"] is True
+    view = s.survey()
+    assert view["interfaces"][0]["connected_ssid"] == "Synthetic Lab" and view["aps"][0]["connected"] is True
+    assert (view["interfaces"][0]["tx_rate_mbps"], view["interfaces"][0]["rx_rate_mbps"]) == (390.0, 390.0), "carried with the association"
+    assert view["link_history"] == [[start, 390.0]], "a read that could not ask for the association adds no link speed"
 
 
 @pytest.mark.parametrize("how", ["radio off", "adapter gone", "location denied"])
 def test_connected_mark_does_not_outlive_the_association(world, clock, how):
+    start = clock.wall
     world.interfaces[0]["state"] = "connected"
-    world.connection = {"ssid": b"Synthetic Lab", "bssid": BSSID_A}
+    world.connection = {"ssid": b"Synthetic Lab", "bssid": BSSID_A, "rx_kbps": 390000, "tx_kbps": 390000}
     world.entries = [ap_entry(BSSID_A, -50, clock.wall)]
     s = make_survey(world, clock)
     s.window_shown()
@@ -1175,6 +1183,45 @@ def test_connected_mark_does_not_outlive_the_association(world, clock, how):
     assert view["state"] == {"radio off": "radio_off", "adapter gone": "no_adapter", "location denied": "location_denied"}[how]
     assert view["aps"][0]["connected"] is False
     assert all(i["connected_bssid"] is None for i in view["interfaces"])
+    # the link is down once nothing is associated (radio off, adapter gone); a refused query is unknown and adds no point
+    assert view["link_history"] == ([[start, 390.0]] if how == "location denied" else [[start, 390.0], [start + 60.0, 0.0]])
+
+
+def test_link_speed_follows_the_association(world, clock):
+    """The first connected interface's transmit rate, once per read pass (one point per 5 s bucket), in the history_s window
+    like the signal history; 0 once nothing is associated; a garbled rate is no reading; clear() starts it again."""
+    start = clock.wall
+    world.interfaces[0]["state"] = "connected"
+    world.connection = {"ssid": b"Synthetic Lab", "bssid": BSSID_A, "rx_kbps": 866700, "tx_kbps": 780000}
+    world.entries = [ap_entry(BSSID_A, -50, clock.wall)]
+    s = make_survey(world, clock)
+    s.window_shown()
+    s.survey({"active": True})
+    simulate(s, clock, 12, renew_every=5)                      # reads at 0, 4 and 9; the scan alone at 10 asks nothing
+    view = s.survey()
+    assert (view["interfaces"][0]["tx_rate_mbps"], view["interfaces"][0]["rx_rate_mbps"]) == (780.0, 866.7)
+    assert view["link_history"] == [[start + 4.0, 780.0], [start + 9.0, 780.0]], "0 s and 4 s share a 5 s bucket: the later stays"
+    world.connection = dict(world.connection, tx_kbps=6500, rx_kbps=0)
+    simulate(s, clock, 4, renew_every=5)                       # the read at 14
+    view = s.survey()
+    assert (view["interfaces"][0]["tx_rate_mbps"], view["interfaces"][0]["rx_rate_mbps"]) == (6.5, None)
+    assert view["link_history"][-1] == [start + 14.0, 6.5]
+    world.interfaces[0]["state"] = "disconnected"
+    world.connection = None
+    simulate(s, clock, 10, renew_every=5)                      # reads at 19 and 24
+    view = s.survey({"active": True, "history_s": 6})
+    assert view["interfaces"][0]["tx_rate_mbps"] is None
+    assert view["link_history"] == [[start + 24.0, 0.0]], "not associated: 0, and only the readings inside history_s"
+    assert [p[1] for p in s.survey()["link_history"]] == [780.0, 780.0, 6.5, 0.0, 0.0]
+    world.interfaces[0]["state"] = "connected"
+    world.connection = {"ssid": b"Synthetic Lab", "bssid": BSSID_A, "rx_kbps": -1, "tx_kbps": 2 ** 40}
+    simulate(s, clock, 5, renew_every=5)
+    view = s.survey()
+    assert (view["interfaces"][0]["tx_rate_mbps"], view["interfaces"][0]["rx_rate_mbps"]) == (None, None)
+    assert [p[1] for p in view["link_history"]] == [780.0, 780.0, 6.5, 0.0, 0.0], "a garbled rate adds nothing"
+    json.dumps(view, allow_nan=False)
+    s.clear()
+    assert s.survey()["link_history"] == []
 
 
 def test_an_interface_unplugged_during_a_pass_is_no_adapter(world, clock):

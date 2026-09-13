@@ -2,7 +2,9 @@
    Canvas charts for the WiFi page, built on the charts.js base class (hi-DPI, ResizeObserver,
    theme colours read from the CSS tokens, tooltips, destroy on unmount):
    * SignalChart   — one line per access point over time on a dBm axis (-100 … -20); the
-                     selected network's lines are drawn thick with an ink outline, on top.
+                     selected network's lines are drawn thick with an ink outline, on top. This PC's
+                     own link speed is a stepped, dashed ink line on a log Mbps axis at the right
+                     (1 … 1000, or 10 000), with the current speed in a sticker at the right edge.
    * SpectrumChart — one band (2.4 / 5 / 6 GHz): every access point is a translucent trapezoid
                      over the spectrum it occupies, its top edge at the signal level, labelled
                      with its network name; the selected network gets a thick ink outline.
@@ -19,6 +21,9 @@
   const DBM_BOTTOM = -100;     // bottom (the noise floor the shapes stand on)
   const SLOPE = 0.1;           // each sloped side of a spectrum shape covers 10 % of its span
   const GAP_S = 150;           // a line breaks where two readings are further apart than this
+  const MBPS_BOTTOM = 1;       // bottom of the link speed axis (log scale, at the right of the signal chart)
+  const MBPS_TOP = 1000;       // its top: 10 000 while a reading in range is faster
+  const LINK_KEY = '#link';    // hover key of the link speed line (a BSSID never looks like this)
 
   /** The three bands: the drawn frequency range (MHz), the channel ticks and the U-NII blocks. */
   const BANDS = {
@@ -192,6 +197,55 @@
     return Math.max(GAP_S, (Number(span) || 0) / 60);
   }
 
+  /** Top of the link speed axis (Mbps) for these readings: MBPS_TOP, or ten times that when one is faster. */
+  function mbpsTop(values) {
+    for (const v of values || []) if (Number(v) > MBPS_TOP) return MBPS_TOP * 10;
+    return MBPS_TOP;
+  }
+
+  /** y (px) of a link speed on the log axis: `top` Mbps at y0, MBPS_BOTTOM at y1 (clamped to the axis). */
+  function mbpsToY(mbps, y0, y1, top) {
+    const t = Math.max(MBPS_BOTTOM * 10, Number(top) || MBPS_TOP);
+    const v = clamp(Number(mbps) || MBPS_BOTTOM, MBPS_BOTTOM, t);
+    return y1 - (Math.log10(v / MBPS_BOTTOM) / Math.log10(t / MBPS_BOTTOM)) * (y1 - y0);
+  }
+
+  /** The labelled speeds of the link axis: every power of ten from MBPS_BOTTOM up to `top`. */
+  function mbpsTicks(top) {
+    const out = [];
+    for (let v = MBPS_BOTTOM; v <= (Number(top) || MBPS_TOP) * 1.000001; v *= 10) out.push(v);
+    return out;
+  }
+
+  /** "390 Mbps", "6.5 Mbps" (one decimal below 100), "—" without a link. */
+  function mbpsText(v) {
+    const n = Number(v);
+    if (v == null || !isFinite(n) || n <= 0) return '—';
+    return (n >= 100 ? String(Math.round(n)) : String(Math.round(n * 10) / 10)) + ' Mbps';
+  }
+
+  /** A link speed history ([[ts, Mbps]]) cut into its stretches with a link: a reading of 0 (not connected) ends one;
+   *  an entry without a time is skipped. */
+  function linkRuns(points) {
+    const runs = [];
+    let cur = null;
+    for (const p of points || []) {
+      if (!Array.isArray(p) || p[0] == null || !isFinite(p[0])) continue;
+      if (!(Number(p[1]) > 0)) { cur = null; continue; }
+      if (!cur) { cur = []; runs.push(cur); }
+      cur.push([Number(p[0]), Number(p[1])]);
+    }
+    return runs;
+  }
+
+  /** Where the current link speed sticker goes: `w` px wide and 20 px tall, right-aligned at `right`, its bottom 5 px
+   *  above the line at `y`, or its top 5 px below the line when above would cross `minY`. {x, y, w, h, below}. */
+  function stickerBox(right, y, w, minY) {
+    const h = 20, gap = 5;
+    const below = y - gap - h < (Number(minY) || 0);
+    return { x: right - w, y: below ? y + gap : y - gap - h, w, h, below };
+  }
+
   /* --------------------------------------------------------------- palette */
   /** One colour per network, derived from TNT's tokens: 12 hues (the seven accents and five 50/50
    *  mixes of neighbours), then the same 12 mixed 35 % towards --ink (darker in the light theme,
@@ -259,7 +313,7 @@
       this._onClick = (e) => {
         const rect = this.canvas.getBoundingClientRect();
         const hit = this.hitTest(e.clientX - rect.left, e.clientY - rect.top);
-        if (hit && this.opts.onPick) this.opts.onPick(hit.net);
+        if (hit && hit.net != null && this.opts.onPick) this.opts.onPick(hit.net);     // the link speed line is no network
       };
       canvas.addEventListener('click', this._onClick);
     }
@@ -278,7 +332,7 @@
       const x = e.clientX - rect.left, y = e.clientY - rect.top;
       const hit = this.hitTest(x, y);
       const key = hit ? hit.key : null;
-      this.canvas.style.cursor = hit && this.opts.onPick ? 'pointer' : '';
+      this.canvas.style.cursor = hit && hit.net != null && this.opts.onPick ? 'pointer' : '';
       // redraws go through render() (one per animation frame): a mouse move is never a synchronous redraw
       if (key !== this._hoverKey) {
         this._hoverKey = key;
@@ -298,16 +352,19 @@
 
   /* ----------------------------------------------------------- SignalChart */
   /** Signal strength over time. setData({series: [{key, net, name, bssid, color, points: [[ts, dBm]],
-   *  selected, tip(ts, dBm)}], t0, t1, dim, empty}). */
+   *  selected, tip(ts, dBm)}], link, t0, t1, dim, empty}). link: {points: [[ts, Mbps]] (0 = not connected),
+   *  tip(ts, Mbps)} draws this PC's link speed on a right-hand axis; null (a window without link speeds) draws neither. */
   class SignalChart extends WifiChart {
     constructor(canvas, opts) {
       super(canvas, opts);
-      this.series = []; this.t0 = 0; this.t1 = 0; this.dim = false; this.empty = '';
+      this.series = []; this.link = null; this.t0 = 0; this.t1 = 0; this.dim = false; this.empty = '';
       this._cols = new Map();    // pixel column -> the drawn readings in it (hit testing looks at nearby columns only)
-      this._colsSeries = null; this._colsGeom = '';
+      this._colsSeries = null; this._colsLink = null; this._colsGeom = '';
+      this._linkCache = null;    // the link line's screen points for one geometry and one points array
     }
     setData(d) {
       this.series = d.series || [];
+      this.link = d.link || null;
       this.t0 = d.t0; this.t1 = d.t1;
       this.dim = !!d.dim;
       this.empty = d.empty || '';
@@ -315,11 +372,15 @@
     }
     draw(ctx, w, h) {
       const c = this.c, font = this.font;
-      const padL = 48, padR = 14, padT = 12, padB = 26;
+      const link = this.link || null;
+      const top = link ? mbpsTop((link.points || []).map((p) => p && p[1])) : MBPS_TOP;
+      // the link speed axis keeps room right of the plot for its labels ("1000", or "10000")
+      const padL = 48, padR = link ? (top > MBPS_TOP ? 54 : 46) : 14, padT = 12, padB = 26;
       const px0 = padL, px1 = w - padR, py0 = padT, py1 = h - padB;
       const t0 = this.t0, t1 = Math.max(this.t1, this.t0 + 1);
       const xOf = (t) => px0 + ((t - t0) / (t1 - t0)) * (px1 - px0);
       const yOf = (v) => dbmToY(v, py0, py1);
+      const yLink = (v) => mbpsToY(v, py0, py1, top);
 
       // signal zones as a thin strip left of the plot: green / yellow / red
       const zone = (hi, lo, col) => { ctx.fillStyle = col; ctx.fillRect(px0 - 7, yOf(hi), 5, yOf(lo) - yOf(hi)); };
@@ -350,6 +411,19 @@
         ctx.beginPath(); ctx.moveTo(x, py1); ctx.lineTo(x, py1 + 5); ctx.stroke();
         if (x - lastX >= 56 && x > px0 + 14 && x < px1 - 14) { ctx.fillStyle = c.inkSoft; ctx.fillText(tk.label, x, py1 + 19); lastX = x; }
       }
+      // the link speed axis at the right: a tick and a label at every power of ten, "Mbps" under them
+      if (link) {
+        ctx.strokeStyle = alpha(c.ink, 0.35); ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(px1 + 0.5, py0); ctx.lineTo(px1 + 0.5, py1); ctx.stroke();
+        ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+        for (const v of mbpsTicks(top)) {
+          const y = Math.round(yLink(v)) + 0.5;
+          ctx.beginPath(); ctx.moveTo(px1, y); ctx.lineTo(px1 + 5, y); ctx.stroke();
+          ctx.fillStyle = c.inkSoft; ctx.fillText(String(v), px1 + 8, y);
+        }
+        ctx.textBaseline = 'alphabetic'; ctx.textAlign = 'right'; ctx.font = '800 11px ' + font; ctx.fillStyle = c.inkSoft;
+        ctx.fillText('Mbps', w - 2, py1 + 19);
+      }
 
       // lines: everything else thin (faded while a network is selected), the selected network
       // thick with an ink outline on top; the hovered line is lifted too
@@ -361,8 +435,8 @@
       // a hover redraw reuses every series' screen points and the hit-test columns: only new data
       // (setData) or a new size rebuilds them
       const geom = [t0, t1, px0, px1, py0, py1].join('|');
-      const rebuildHits = this._colsSeries !== this.series || this._colsGeom !== geom;
-      if (rebuildHits) { this._cols = new Map(); this._colsSeries = this.series; this._colsGeom = geom; }
+      const rebuildHits = this._colsSeries !== this.series || this._colsLink !== link || this._colsGeom !== geom;
+      if (rebuildHits) { this._cols = new Map(); this._colsSeries = this.series; this._colsLink = link; this._colsGeom = geom; }
       for (const s of order) {
         let segs;
         if (s._segCache && s._segCache.geom === geom && s._segCache.points === s.points) segs = s._segCache.segs;
@@ -405,13 +479,79 @@
           }
         }
       }
+      // this PC's link speed over every network line: stepped (a rate holds until the next reading), dashed ink over a
+      // paper halo; while the newest reading is recent its stretch runs on to the right edge, where the sticker names it
+      let sticker = null;
+      if (link) {
+        const lgeom = geom + '|' + top;
+        let lc = this._linkCache;
+        if (!lc || lc.geom !== lgeom || lc.points !== link.points) {
+          const segs = [];
+          for (const run of linkRuns(link.points)) {
+            for (const seg of this._segments({ points: run }, xOf, yLink, t0, t1)) if (seg.length) segs.push(seg);
+          }
+          const pts = link.points || [];
+          const newest = pts.length ? pts[pts.length - 1] : null;
+          const live = !!(segs.length && newest && Number(newest[1]) > 0 && newest[0] >= t1 - gapFor(t1 - t0));
+          lc = this._linkCache = { geom: lgeom, points: link.points, segs, live, value: live ? Number(newest[1]) : null };
+        }
+        const segs = lc.segs;
+        if (segs.length) {
+          drawn++;
+          const hover = this._hoverKey === LINK_KEY;
+          const last = segs[segs.length - 1];
+          const path = () => {
+            ctx.beginPath();
+            for (const seg of segs) {
+              ctx.moveTo(seg[0][0], seg[0][1]);
+              for (let i = 1; i < seg.length; i++) { ctx.lineTo(seg[i][0], seg[i - 1][1]); ctx.lineTo(seg[i][0], seg[i][1]); }
+              if (lc.live && seg === last) ctx.lineTo(px1, seg[seg.length - 1][1]);
+            }
+          };
+          ctx.lineJoin = 'miter'; ctx.lineCap = 'butt';
+          path(); ctx.strokeStyle = c.paper; ctx.lineWidth = hover ? 7 : 6; ctx.stroke();
+          path(); ctx.setLineDash([8, 5]); ctx.strokeStyle = c.ink; ctx.lineWidth = hover ? 3.5 : 2.5; ctx.stroke();
+          ctx.setLineDash([]); ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+          // a reading with no neighbour close enough for a line is a dot (the newest one runs on to the edge instead)
+          for (const seg of segs) {
+            if (seg.length !== 1 || (lc.live && seg === last)) continue;
+            ctx.beginPath(); ctx.arc(seg[0][0], seg[0][1], 3.5, 0, Math.PI * 2);
+            ctx.fillStyle = c.ink; ctx.fill();
+          }
+          if (lc.live) sticker = { y: last[last.length - 1][1], text: mbpsText(lc.value) };
+          if (rebuildHits) {
+            const ls = this._linkSeries || (this._linkSeries = { key: LINK_KEY, net: null, name: 'Link speed', link: true });
+            ls.tip = link.tip || null;
+            for (const seg of segs) {
+              for (const p of seg) {
+                const pt = { x: p[0], y: p[1], ts: p[2], v: p[3], s: ls, strong: false };
+                const cx = Math.round(p[0]);
+                const col = this._cols.get(cx);
+                if (col) col.push(pt); else this._cols.set(cx, [pt]);
+              }
+            }
+          }
+        }
+      }
       ctx.restore();
       // the hovered reading
       const hp = this._hoverPoint;
       if (hp && hp.s.key === this._hoverKey) {
         ctx.beginPath(); ctx.arc(hp.x, hp.y, 5, 0, Math.PI * 2);
-        ctx.fillStyle = this.color(hp.s.color); ctx.fill();
+        ctx.fillStyle = hp.s.link ? c.paper : this.color(hp.s.color); ctx.fill();
         ctx.strokeStyle = c.ink; ctx.lineWidth = 2; ctx.stroke();
+      }
+      // the current link speed: a sticker at the right edge just above the newest stretch of the line (below it near the top)
+      if (sticker) {
+        ctx.font = '800 12px ' + font;
+        const b = stickerBox(px1 - 4, sticker.y, Math.ceil(ctx.measureText(sticker.text).width) + 16, 1);
+        ctx.fillStyle = c.paper; ctx.strokeStyle = c.ink; ctx.lineWidth = 2;
+        if (TNT.charts && TNT.charts.roundRect) TNT.charts.roundRect(ctx, b.x, b.y, b.w, b.h, 9);
+        else { ctx.beginPath(); ctx.rect(b.x, b.y, b.w, b.h); }
+        ctx.fill(); ctx.stroke();
+        ctx.fillStyle = c.ink; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillText(sticker.text, b.x + b.w / 2, b.y + b.h / 2 + 0.5);
+        ctx.textBaseline = 'alphabetic';
       }
       if (!drawn) {
         ctx.fillStyle = c.inkSoft; ctx.font = '700 14px ' + font; ctx.textAlign = 'center';
@@ -470,7 +610,7 @@
       this._hoverPoint = best;
       if (!best) return null;
       const s = best.s;
-      const tip = s.tip ? s.tip(best.ts, best.v) : '<div class="t">' + escHtml(s.name) + '</div>' + dbmText(best.v);
+      const tip = s.tip ? s.tip(best.ts, best.v) : '<div class="t">' + escHtml(s.name) + '</div>' + (s.link ? mbpsText(best.v) : dbmText(best.v));
       return { key: s.key, net: s.net, tip, follow: true };
     }
   }
@@ -637,9 +777,10 @@
   }
 
   TNT.wifichart = {
-    DBM_TOP, DBM_BOTTOM, SLOPE, GAP_S, BANDS, BAND_KEYS, PALETTE_SIZE,
+    DBM_TOP, DBM_BOTTOM, SLOPE, GAP_S, BANDS, BAND_KEYS, PALETTE_SIZE, MBPS_BOTTOM, MBPS_TOP, LINK_KEY,
     channelFreq, apSpans, freqToX, dbmToY, trapezoid, apShapes, channelTicks, labelChannels, fillAlpha, dbmTicks,
     signalClass, signalBars, timeTicks, gapFor, paletteCss, paletteHex, mixHex, escHtml, dbmText, inPolygon,
+    mbpsTop, mbpsToY, mbpsTicks, mbpsText, linkRuns, stickerBox,
     SignalChart, SpectrumChart,
   };
 })();

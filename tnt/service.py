@@ -541,6 +541,8 @@ SELFCHECK_MODULES = (
     "tnt.speedtest.fastcom", "tnt.speedtest.scheduler", "tnt.speedtest.patterns",
     "tnt.discovery", "tnt.export_pdf", "tnt.diagnostics", "tnt.api.server", "tnt.api.routes",
     "tnt.api.sse", "tnt.engine", "tnt.netwatch", "tnt.mmdb", "tnt.geohints", "tnt.geohints_data", "tnt.geoip",
+    "tnt.winacl", "tnt.natcheck", "tnt.portcheck", "tnt.pcapng", "tnt.lldp", "tnt.pktmon", "tnt.switchport",
+    "tnt.capture", "tnt.tftp", "tnt.speedtest.quality",
     # third-party packages the service depends on
     "netaddr", "reportlab", "psutil",
 )

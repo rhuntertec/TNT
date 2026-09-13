@@ -27,6 +27,8 @@
     </span>
   </a>
   <div class="topbar-right">
+    <button class="btn topbar-quick" id="btn-ip-renew" type="button" title="Release this PC's IP addresses and renew them from the DHCP server" aria-label="IP Release/Renew"><span data-icon="renew"></span><span class="quick-label">IP Release/Renew</span></button>
+    <button class="btn topbar-quick" id="btn-flush-dns" type="button" title="Flush this PC's DNS cache" aria-label="Flush DNS"><span data-icon="flush"></span><span class="quick-label">Flush DNS</span></button>
     <button class="btn topbar-scan" id="btn-full-scan" type="button"><span data-icon="report"></span><span class="scan-label" id="full-scan-label">Full Scan</span></button>
     <div class="status-pill grey" id="status-pill" role="status" aria-live="polite">
       <span class="light grey" id="status-light"></span>
@@ -41,6 +43,7 @@
 </header>
 
 <main class="page" id="page">
+  <div class="update-banner" id="update-banner" role="status" hidden></div>
   <nav class="tiles" id="tiles" aria-label="Sections">
     <a class="tile" data-view="ipinfo" href="#ipinfo" style="--accent: var(--blue)">
       <div class="tile-head"><span class="tile-icon" data-icon="network"></span><span class="tile-title">Network info</span></div>
@@ -101,9 +104,14 @@
 <script src="js/tools/subnet.js"></script>
 <script src="js/tools/traceroute.js"></script>
 <script src="js/tools/lan.js"></script>
+<script src="js/tools/portforward.js"></script>
 <script src="js/tools/subnetcalc.js"></script>
+<script src="js/tools/dns.js"></script>
 <script src="js/tools/wifi.js"></script>
+<script src="js/tools/tftp.js"></script>
+<script src="js/tools/capture.js"></script>
 <script src="js/reportsui.js"></script>
+<script src="js/netcheck.js"></script>
 <script src="js/views/ipinfo.js"></script>
 <script src="js/views/ping.js"></script>
 <script src="js/views/outages.js"></script>

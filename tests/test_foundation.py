@@ -15,6 +15,19 @@ def test_config_validate_clamps_and_enums(data_dir):
     assert c2.get("ping.loaded") is False
 
 
+def test_config_update_section_defaults_and_validation(data_dir):
+    c = config.Config().load()
+    assert c.get("update") == {"enabled": True, "auto_install": False, "check_interval_h": 24, "channel": "stable"}
+    changed = c.update({"update": {"enabled": "yes", "auto_install": 1, "check_interval_h": 9999, "channel": "bogus"}})
+    # enabled default True and "yes"->True is no change; auto_install and the interval do change
+    assert {"update.auto_install", "update.check_interval_h"} <= changed
+    assert c.get("update.enabled") is True and c.get("update.auto_install") is True    # coerced to bool
+    assert c.get("update.check_interval_h") == 168                                     # clamped (1..168)
+    assert c.get("update.channel") == "stable"                                         # bad enum -> default
+    assert c.update({"update": {"channel": "prerelease", "check_interval_h": 0}}) and c.get("update.channel") == "prerelease"
+    assert c.get("update.check_interval_h") == 1
+
+
 def test_config_accepts_a_utf8_byte_order_mark(data_dir):
     """A config.json saved "UTF-8 with BOM" (Notepad on older Windows 10, PowerShell 5.1) is
     read normally: it used to be renamed to .corrupt and every setting reset to the defaults."""

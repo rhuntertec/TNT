@@ -9,7 +9,9 @@
    Open / OWE / WEP / WPA / WPA2 / WPA3 / Enterprise, one connected access point, signal random
    walks, access points that show up later, one that drops out and two that flap (one slower than the
    minute reads before the page opened, so its older history has lone readings between gaps). The session is
-   backfilled for 20 minutes (the last 5 of them with active reads) so every range has lines.
+   backfilled for 20 minutes (the last 5 of them with active reads) so every range has lines. The connected
+   access point's link speed steps between Wi-Fi 6 rates (its own seeded walk, so the signal walks stay the
+   same) and is 0 while that access point is out of range.
    Every SSID, BSSID, vendor and GUID here is made up; the BSSIDs use locally administered or
    obviously fake OUIs.
 
@@ -83,6 +85,10 @@
   const IFACE = { guid: '12345678-9abc-4def-8123-456789abcdef', description: 'Intel(R) Wi-Fi 6E AX211 160MHz' };
   const RATE = { b: 11, g: 54, a: 54, n: 150, ac: 433, ax: 600, be: 720 };
   const STEPS_PER_WIDTH = { 20: 1, 40: 2, 80: 4, 160: 8, 320: 16 };
+  // the connected access point's link speeds (Mbps, Wi-Fi 6 at 80 MHz), walked by a generator of their own
+  const LINK_RATES = [1201, 1080.9, 960.8, 864.7, 720.6, 600.4, 480.4];
+  let linkSeed = 424242;
+  function linkRand() { linkSeed = (linkSeed * 1103515245 + 12345) % 2147483648; return linkSeed / 2147483648; }
 
   function channelFreq(band, ch) {
     if (band === '2.4') return ch === 14 ? 2484 : 2407 + 5 * ch;
@@ -109,6 +115,8 @@
     lastRead: null, lastScan: null, lastManualScan: null, leaseFrom: 0, leaseUntil: 0, nextRead: null, visible: new Set(),
     aps: new Map(),     // bssid -> live record
     history: new Map(), // bssid -> [[ts, rssi]]
+    link: [],           // [[ts, Mbps]] of the connected access point, 0 while it is out of range
+    rateIdx: 1,         // its LINK_RATES entry now
   };
 
   function visibleAt(def, t) {
@@ -138,6 +146,16 @@
       h.push([Math.round(t * 10) / 10, rec.rssi]);
       if (h.length > 8640) h.splice(0, h.length - 8640);
     }
+    // the connected access point's link speed: a step now and then, 0 while it is out of range
+    const conn = AIR.find((d) => (d[9] || {}).connected);
+    const up = !!conn && sim.visible.has(conn[1]);
+    if (up) {
+      const r = linkRand();
+      if (r < 0.1) sim.rateIdx = Math.min(LINK_RATES.length - 1, sim.rateIdx + 1);
+      else if (r < 0.2) sim.rateIdx = Math.max(0, sim.rateIdx - 1);
+    }
+    sim.link.push([Math.round(t * 10) / 10, up ? LINK_RATES[sim.rateIdx] : 0]);
+    if (sim.link.length > 8640) sim.link.splice(0, sim.link.length - 8640);
     sim.lastRead = t;
   }
 
@@ -226,13 +244,17 @@
       }
     }
     const conn = aps.find((a) => a.connected);
+    // like the client: the association's link speeds (the newest reading) and the series in the window of the history
+    const newest = sim.link.length ? sim.link[sim.link.length - 1][1] : 0;
+    const tx = conn && newest > 0 ? newest : null;
+    const rx = tx == null ? null : LINK_RATES[Math.max(0, sim.rateIdx - 1)];
     return {
       available, enabled: sim.enabled, state, error: ERRORS[state] || null,
       started_ts: sim.startedTs, last_read_ts: state === 'ok' ? sim.lastRead : null, last_scan_ts: sim.lastScan,
       active: sim.enabled && activeAt(now), scan_interval_s: 10, passive_interval_s: 60,
       interfaces: available ? [{ guid: IFACE.guid, description: IFACE.description, state: conn ? 'connected' : 'disconnected',
-        connected_bssid: conn ? conn.bssid : null, connected_ssid: conn ? conn.ssid : null }] : [],
-      aps, history,
+        connected_bssid: conn ? conn.bssid : null, connected_ssid: conn ? conn.ssid : null, rx_rate_mbps: rx, tx_rate_mbps: tx }] : [],
+      aps, history, link_history: hs === 0 ? [] : sim.link.filter((p) => p[0] >= from),
     };
   }
 
@@ -255,7 +277,7 @@
       return later({ ok: true, error: null });
     },
     wifi_clear() {
-      sim.aps.clear(); sim.history.clear(); sim.visible = new Set();
+      sim.aps.clear(); sim.history.clear(); sim.link = []; sim.visible = new Set();
       sim.startedTs = Date.now() / 1000; sim.nextRead = sim.startedTs; sim.lastRead = null;
       return later({ ok: true });
     },

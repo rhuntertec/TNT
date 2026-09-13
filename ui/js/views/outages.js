@@ -43,7 +43,7 @@
   }
 
   function renderList(rows) {
-    const { h, fmtDateTime, fmtTime, fmtDuration } = TNT.util;
+    const { h, fmtDateTime, fmtDateTimeSec, fmtTime, fmtDuration } = TNT.util;
     tableBody.innerHTML = '';
     if (!rows.length) {
       tableBody.appendChild(h('tr', { class: 'empty-row' }, h('td', { colspan: '7' }, 'No outages in this period — nice and quiet.')));
@@ -54,7 +54,7 @@
       const open = !!o.open || o.end_ts == null;
       const dur = o.duration_s != null ? o.duration_s : ((open ? now : o.end_ts) - o.start_ts);
       const tr = h('tr', null,
-        h('td', { class: 'copy', data: { copy: TNT.util.fmtStamp(o.start_ts) } }, fmtDateTime(o.start_ts)),
+        h('td', { class: 'copy', data: { copy: TNT.util.fmtStamp(o.start_ts) } }, fmtDateTimeSec(o.start_ts)),
         // an open target outage is yellow; only an open full (total_*) outage is red
         h('td', { class: 'copy', data: { copy: open ? 'ongoing' : TNT.util.fmtStamp(o.end_ts) } }, open ? h('span', { class: 'badge ' + (String(o.kind || '').startsWith('total') ? 'red' : 'yellow') + ' pulse' }, 'ongoing') : (new Date(o.end_ts * 1000).toDateString() === new Date(o.start_ts * 1000).toDateString() ? fmtTime(o.end_ts) : fmtDateTime(o.end_ts))),
         h('td', { class: 'copy num' }, fmtDuration(dur)),

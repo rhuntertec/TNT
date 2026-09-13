@@ -12,6 +12,9 @@ limited broadcast (255.255.255.255) and every multicast/broadcast MAC (I/G bit s
 which also drops directed-broadcast rows such as ``10.0.0.255 ff-ff-...``) are
 skipped. When the same IP appears on several interfaces the entry with the "best"
 neighbour state (Permanent > Reachable > Stale > Delay > Probe > Incomplete) wins.
+Neighbours of an adapter that is not up are left out as well: ``arp -a`` does not list
+such an interface, but ``GetIpNetTable2`` keeps its last rows (a Wi-Fi adapter that went
+off leaves them ``Stale``), and they describe a network this PC is no longer on.
 
 Contract gaps filled here: ``GetIpNetTable2`` returning ``ERROR_NOT_FOUND`` (1168)
 is treated as an empty table rather than a failure; physical addresses that are not
@@ -39,7 +42,7 @@ import subprocess
 import sys
 import threading
 from ctypes import POINTER, Structure, Union, byref, c_char, c_ubyte, c_ulong, c_ulonglong, c_ushort, c_void_p
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from .oui import normalize_mac
 
@@ -145,6 +148,18 @@ def _usable(ip: str, mac: str) -> bool:
     return True
 
 
+def _down_interfaces() -> Set[int]:
+    """Interface indexes of the adapters that are not up (``arp -a`` does not list their neighbours). Empty when the
+    adapters cannot be listed, so nothing is left out then."""
+    try:
+        from . import netinfo
+
+        return {int(a.index) for a in netinfo.get_adapters(include_down=True, include_loopback=True) if not a.is_up}
+    except Exception:  # noqa: BLE001 - never lose the table over it
+        log.debug("could not list the adapters that are down", exc_info=True)
+        return set()
+
+
 def get_arp_table_native() -> Dict[str, str]:
     """``GetIpNetTable2(AF_INET)`` → ``{ip: MAC}``. Raises ``OSError`` on API failure."""
     dll = _dll()
@@ -159,6 +174,7 @@ def get_arp_table_native() -> Dict[str, str]:
     if not table.value:
         return {}
     best: Dict[str, tuple[int, str]] = {}
+    down: Optional[Set[int]] = None          # read once, at the first usable row
     try:
         count = c_ulong.from_address(table.value).value
         if count > _MAX_ROWS:
@@ -175,6 +191,10 @@ def get_arp_table_native() -> Dict[str, str]:
                 continue
             ip = str(ipaddress.IPv4Address(bytes(row.Address.Ipv4.sin_addr)))
             if not _usable(ip, mac):
+                continue
+            if down is None:
+                down = _down_interfaces()
+            if int(row.InterfaceIndex) in down:
                 continue
             state = int(row.State)
             prev = best.get(ip)
@@ -265,7 +285,9 @@ def _plain_ip(ip: str) -> Optional[ipaddress._BaseAddress]:
 
 def neighbour_rows_native(family: int = AF_UNSPEC) -> List[Tuple[str, int, str, str]]:
     """``(ip, interface index, MAC, state name)`` of every neighbour row with a unicast 6-byte address that is not
-    unreachable, IPv4 and IPv6 (``GetIpNetTable2``; a router of an IPv6-only network is an NDP entry).  Raises ``OSError``."""
+    unreachable, IPv4 and IPv6 (``GetIpNetTable2``; a router of an IPv6-only network is an NDP entry), on an adapter that
+    is not down (an adapter that went down keeps its last rows, which name a network this PC has left; see
+    :func:`_down_interfaces`).  Raises ``OSError``."""
     dll = _dll()
     table = c_void_p()
     rc = dll.GetIpNetTable2(int(family), byref(table))
@@ -278,6 +300,7 @@ def neighbour_rows_native(family: int = AF_UNSPEC) -> List[Tuple[str, int, str, 
     if not table.value:
         return []
     out: List[Tuple[str, int, str, str]] = []
+    down: Optional[Set[int]] = None          # read once, at the first usable row
     try:
         count = c_ulong.from_address(table.value).value
         if count > _MAX_ROWS:
@@ -295,6 +318,10 @@ def neighbour_rows_native(family: int = AF_UNSPEC) -> List[Tuple[str, int, str, 
             else:
                 addr = ipaddress.IPv6Address(bytes(row.Address.Ipv6.sin6_addr))
             if addr.is_multicast or addr.is_unspecified:
+                continue
+            if down is None:
+                down = _down_interfaces()
+            if int(row.InterfaceIndex) in down:
                 continue
             out.append((str(addr), int(row.InterfaceIndex), mac, NL_STATE_NAMES.get(int(row.State), "unknown")))
     finally:

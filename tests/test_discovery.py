@@ -804,10 +804,10 @@ class TestClassifyDevice:
         ([22], "Ubiquiti Inc.", "Ubiquiti"),
         ([22, 80, 443], "Ubiquiti Networks Inc.", "Ubiquiti"),
         ([22, 443], "UBIQUITI INC", "Ubiquiti"),      # the vendor match is case-insensitive
-        ([22], "Raspberry Pi Trading Ltd", None),     # plain ssh says nothing about the device
+        ([22], "Raspberry Pi Trading Ltd", None),     # a non-Ubiquiti vendor says nothing about the device
         ([22], None, None),                           # no vendor at all
-        ([80, 443], "Ubiquiti Inc.", None),           # a Ubiquiti box without 22 is not typed
-        ([], "Ubiquiti Inc.", None),
+        ([80, 443], "Ubiquiti Inc.", "Ubiquiti"),     # the Ubiquiti MAC alone earns the tag, no port needed
+        ([], "Ubiquiti Inc.", "Ubiquiti"),
         ([], None, None),
         ([80, 443, 8080], "Synology Incorporated", None),
     ])

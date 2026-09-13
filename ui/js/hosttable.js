@@ -29,7 +29,7 @@
   const DEVICE_TYPE_CLASS = { router: 'blue', 'dw server': 'purple', camera: 'orange', phone: 'green', ubiquiti: 'yellow' };
   /** Device types earlier versions stored (a cached run, a saved report) and what they are called now. */
   const LEGACY_DEVICE_TYPES = new Map([['Wifi', 'Ubiquiti']]);
-  const DW_SERVER_PORT = 7001, CAMERA_PORT = 554, PHONE_PORT = 5060, UBIQUITI_PORT = 22;
+  const DW_SERVER_PORT = 7001, CAMERA_PORT = 554, PHONE_PORT = 5060;
 
   /** The current name of a device type (an older name is renamed; anything else is returned trimmed). */
   const currentType = (type) => { const t = String(type == null ? '' : type).trim(); return LEGACY_DEVICE_TYPES.get(t) || t; };
@@ -37,7 +37,8 @@
   /** Badge colour for a device type ('grey' for anything unknown). */
   const deviceTypeClass = (type) => DEVICE_TYPE_CLASS[currentType(type).toLowerCase()] || 'grey';
 
-  /** Pure mirror of tnt/discovery.py classify_device: gateway → 7001 → 554 → 5060 → 22+Ubiquiti.
+  /** Pure mirror of tnt/discovery.py classify_device: gateway → 7001 → 554 → 5060 → a Ubiquiti MAC.
+   *  A Ubiquiti vendor alone earns the tag, whatever ports are open, but a more specific service wins.
    *  `gateway` is one address or a list of them. Returns null when nothing matches. */
   function classifyDevice(hst, gateway) {
     if (!hst) return null;
@@ -48,7 +49,7 @@
     if (ports.includes(DW_SERVER_PORT)) return 'DW Server';
     if (ports.includes(CAMERA_PORT)) return 'Camera';
     if (ports.includes(PHONE_PORT)) return 'Phone';
-    if (ports.includes(UBIQUITI_PORT) && /ubiquiti/i.test(String(hst.vendor || ''))) return 'Ubiquiti';
+    if (/ubiquiti/i.test(String(hst.vendor || ''))) return 'Ubiquiti';
     return null;
   }
 

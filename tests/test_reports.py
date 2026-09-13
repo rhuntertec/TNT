@@ -562,6 +562,18 @@ def test_speed_section_keeps_a_failed_result():
     assert none["result"] is None and none["reason"] == "Speed tests are not available" and none["window"]["count"] == 0
 
 
+def test_speed_steps_move_through_the_baseline_and_never_back():
+    """A speed test with the latency-under-load probe starts with a 3 s idle ``baseline`` phase: the Full Scan speed step
+    moves during it, and no later phase maps below an earlier one."""
+    steps = reports.SPEED_STEPS
+    assert list(steps) == ["baseline", "connect", "latency", "download", "upload", "done"]
+    assert reports._step_frac(steps, "baseline", 0.0) == 0.0 and reports._step_frac(steps, "baseline", 0.5) == 0.025
+    assert reports._step_frac(steps, "baseline", 1.0) == reports._step_frac(steps, "connect", 0.0) == 0.05
+    spans = list(steps.values())
+    assert all(lo <= hi for lo, hi in spans) and all(a[1] <= b[0] for a, b in zip(spans, spans[1:]))
+    assert spans[-1] == (1.0, 1.0) and reports._step_frac(steps, "warming up", 0.5) is None
+
+
 def test_ping_section_from_minute_rows(db):
     end = T0
     start = end - 3 * HOUR

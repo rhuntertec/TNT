@@ -1,5 +1,6 @@
 /* TNT — views/speed.js
-   Latest result (big numbers), Run now with live progress, history chart (24 h / 7 d / 30 d),
+   Latest result (big numbers), Run now with live progress, the "Latency under load" card (the last
+   test's bufferbloat grade, call quality, Zoom / Teams checks), history chart (24 h / 7 d / 30 d),
    patterns panel (by-hour bars + findings). */
 (function () {
   'use strict';
@@ -13,12 +14,95 @@
   let lastTs = null;
   let progressState = { running: false, phase: '', pct: 0 };
   let ticker = null;
+  let qualityKey = null;     // what the "Latency under load" card shows now (JSON of its qualityView)
 
-  const PHASES = { starting: 'Starting', latency: 'Measuring latency', download: 'Downloading', upload: 'Uploading', done: 'Done', idle: '' };
+  const PHASES = { starting: 'Starting', baseline: 'Measuring idle latency', latency: 'Measuring latency', download: 'Downloading', upload: 'Uploading', done: 'Done', idle: '' };
+
+  /* ------------------------------------------------- latency under load */
+  // the service's bufferbloat texts (tnt/speedtest/quality.py), used when a result carries no text of its own
+  const GRADE_TEXT = {
+    'A+': 'No bufferbloat: latency stays flat while the line is busy',
+    A: 'Excellent: calls and games are unaffected by heavy use',
+    B: 'Good: small delay spikes while the line is busy',
+    C: 'Bufferbloat: calls and games may lag while someone uploads or downloads',
+    D: 'Severe bufferbloat: calls will break up while the line is busy',
+    F: 'Unusable under load: the connection stalls when it is busy',
+  };
+  const GRADE_CLASS = { 'A+': 'green', A: 'green', B: 'green', C: 'yellow', D: 'red', F: 'red' };
+  const CHECK_NAMES = { zoom: 'Zoom', teams: 'Teams' };
+  const QUALITY_TEXT = {
+    none: 'Runs with every speed test',
+    failed: 'The last speed test failed',
+    missing: 'Not measured for this test',
+  };
+
+  /** Pure: what the "Latency under load" card shows for a speed result's quality (q, else last.quality) -> { state, grade, cls,
+   *  text, headline, gradeText, warning, call, busy, checks: [{ label, ok, title }], details }. state: 'none' (no test yet),
+   *  'failed', 'missing' (a test without the measurement), 'unavailable' (text = the service's reason), 'measured'. The chip is
+   *  the bufferbloat grade (A+/A/B green, C yellow, D/F red) or a grey "—". Percentages go through TNT.util.fmtPct and
+   *  milliseconds through TNT.util.fmtMs, so this runs once app.js has loaded. */
+  function qualityView(q, last) {
+    const isObj = (v) => !!v && typeof v === 'object';
+    const isNum = (v) => typeof v === 'number' && isFinite(v);
+    const out = { state: 'none', grade: '—', cls: 'grey', text: '', headline: '', gradeText: '', warning: '', call: '', busy: '', checks: [], details: '' };
+    if (!isObj(last)) return Object.assign(out, { text: QUALITY_TEXT.none });
+    if (!last.ok) return Object.assign(out, { state: 'failed', text: QUALITY_TEXT.failed });
+    const qq = isObj(q) ? q : isObj(last.quality) ? last.quality : null;
+    if (!qq) return Object.assign(out, { state: 'missing', text: QUALITY_TEXT.missing });
+    if (qq.available === false) return Object.assign(out, { state: 'unavailable', text: String(qq.reason || QUALITY_TEXT.missing) });
+    const { fmtMs, fmtPct } = TNT.util;
+    out.state = 'measured';
+    const w = isObj(qq.windows) ? qq.windows : {};
+    const base = isObj(w.baseline) ? w.baseline : {};
+    const down = isObj(w.download) ? w.download : {};
+    const up = isObj(w.upload) ? w.upload : {};
+    const bb = isObj(qq.bufferbloat) ? qq.bufferbloat : {};
+    if (GRADE_CLASS[bb.grade]) { out.grade = String(bb.grade); out.cls = GRADE_CLASS[bb.grade]; }
+    if (isNum(bb.increase_ms)) {
+      const parts = [['download', down], ['upload', up]].filter(([, x]) => isNum(x.increase_ms)).map(([name, x]) => name + ' +' + Math.round(x.increase_ms) + ' ms');
+      out.headline = 'Latency under load +' + Math.round(bb.increase_ms) + ' ms' + (parts.length ? ' (' + parts.join(', ') + ')' : '');
+    }
+    out.gradeText = bb.grade ? String(bb.text || GRADE_TEXT[bb.grade] || '') : String(bb.reason || '');
+    out.warning = bb.warning ? String(bb.warning) : '';
+    const call = isObj(qq.call) ? qq.call : {};
+    const mos = (x) => (isNum(x.mos) ? x.mos.toFixed(2) : '—');
+    if (isObj(call.idle) && call.idle.label) out.call = 'Call quality: ' + call.idle.label + ' (MOS ' + mos(call.idle) + ', estimate)';
+    if (isObj(call.loaded) && call.loaded.label) out.busy = 'While the line is busy: ' + call.loaded.label + ' (MOS ' + mos(call.loaded) + ')';
+    out.checks = (Array.isArray(call.checks) ? call.checks : []).filter((c) => isObj(c) && c.key)
+      .map((c) => ({ label: (CHECK_NAMES[c.key] || String(c.key)) + (c.ok ? ' ✓' : ' ✗'), ok: !!c.ok, title: c.detail ? String(c.detail) : '' }));
+    const sent = (x) => (isNum(x.sent) ? String(x.sent) : '—');
+    out.details = 'Idle ' + fmtMs(base.median_ms) + ' ms to ' + (qq.target || '?') + ' · busy ' + fmtMs(down.mean_ms) + ' / ' + fmtMs(up.mean_ms) + ' ms'
+      + ' · loss ' + fmtPct(down.loss_pct) + ' / ' + fmtPct(up.loss_pct) + ' · ' + sent(down) + ' / ' + sent(up) + ' probes';
+    return out;
+  }
+
+  /** The "Latency under load" card for the last speed test (redrawn only when what it shows changed). */
+  function renderQuality(last) {
+    const { h } = TNT.util;
+    if (!els.qBody) return;
+    const v = qualityView(last ? last.quality : null, last);
+    const key = JSON.stringify(v);
+    if (key === qualityKey) return;
+    qualityKey = key;
+    els.qChip.className = 'grade-chip ' + v.cls;
+    els.qChip.textContent = v.grade;
+    els.qChip.title = v.state === 'measured' && v.grade !== '—' ? 'Bufferbloat grade ' + v.grade : '';
+    els.qBody.innerHTML = '';
+    const add = (el) => els.qBody.appendChild(el);
+    if (v.text) add(h('div', { class: 'muted' }, v.text));
+    if (v.headline) add(h('div', { class: 'strong quality-headline' }, v.headline));
+    if (v.gradeText) add(h('div', null, v.gradeText));
+    if (v.warning) add(h('div', { class: 'muted small quality-warning' }, TNT.ui.icon('warning'), h('span', null, v.warning)));
+    if (v.call) add(h('div', { class: 'quality-call' }, v.call));
+    if (v.busy) add(h('div', { class: 'quality-call' }, v.busy));
+    if (v.checks.length) add(h('div', { class: 'row quality-checks' }, v.checks.map((c) => h('span', { class: 'badge ' + (c.ok ? 'green' : 'red'), title: c.title || null }, c.label))));
+    if (v.details) add(h('div', { class: 'muted small quality-details' }, v.details));
+  }
 
   function renderLatest(sp) {
     const { fmtMbps, fmtMs, relTime, untilText, fmtDateTime, h } = TNT.util;
     if (!sp) return;
+    renderQuality(sp.last);
     const last = sp.last;
     const now = TNT.util.nowS();
     if (last && last.ok) {
@@ -184,6 +268,11 @@
       els.fuse.hidden = true;
       els.fuse.style.marginTop = '14px';
       const latestCard = h('div', { class: 'card' }, h('div', { class: 'card-title' }, 'Latest result'), hero, els.meta, els.failed, els.next, els.fuse);
+      // latency under load: the grade of the last speed test, filled by renderLatest
+      els.qChip = h('span', { class: 'grade-chip grey' }, '—');
+      els.qBody = h('div', { class: 'quality-body' });
+      const qualityCard = h('div', { class: 'card quality-card' }, h('div', { class: 'card-title' }, 'Latency under load'),
+        h('div', { class: 'quality-row' }, els.qChip, els.qBody));
       // history
       const seg = TNT.ui.segmented([{ value: 1, label: '24 h' }, { value: 7, label: '7 d' }, { value: 30, label: '30 d' }], rangeDays, (v) => { rangeDays = v; loadHistory(); });
       const hcanvas = h('canvas', { style: { height: '240px' }, 'aria-label': 'Speed test history' });
@@ -208,7 +297,11 @@
         h('div', { class: 'label', style: { margin: '14px 0 8px' } }, 'Findings'),
         els.findings);
       root.appendChild(head);
-      root.appendChild(h('div', { class: 'stack' }, latestCard, histCard, patCard));
+      // Latest result and Latency under load share one row at half width each (they stack under 900 px)
+      root.appendChild(h('div', { class: 'stack' },
+        h('div', { class: 'grid grid-2' }, latestCard, qualityCard), histCard, patCard));
+      qualityKey = null;
+      renderQuality(TNT.state && TNT.state.status && TNT.state.status.speed ? TNT.state.status.speed.last : null);
       historyChart = new TNT.charts.LineChart(hcanvas, { unit: 'Mbps' });
       hourChart = new TNT.charts.BarChart(bcanvas, { unit: 'Mbps' });
       lastTs = null;
@@ -230,7 +323,9 @@
       if (ticker) { clearInterval(ticker); ticker = null; }
       if (historyChart) { historyChart.destroy(); historyChart = null; }
       if (hourChart) { hourChart.destroy(); hourChart = null; }
-      root = null; els = {};
+      root = null; els = {}; qualityKey = null;
     },
+    // exposed for tests
+    qualityView,
   };
 })();

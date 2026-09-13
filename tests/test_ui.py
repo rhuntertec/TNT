@@ -32,8 +32,9 @@ UI = ROOT / "ui"
 MOCK = ROOT / "tools" / "mock_api.py"
 JS_FILES = [
     "js/api.js", "js/charts.js", "js/wifichart.js", "js/hosttable.js",
-    "js/tools/subnet.js", "js/tools/traceroute.js", "js/tools/lan.js", "js/tools/subnetcalc.js", "js/tools/wifi.js",
-    "js/reportsui.js",
+    "js/tools/subnet.js", "js/tools/traceroute.js", "js/tools/lan.js", "js/tools/portforward.js", "js/tools/subnetcalc.js", "js/tools/dns.js",
+    "js/tools/wifi.js", "js/tools/tftp.js", "js/tools/capture.js",
+    "js/reportsui.js", "js/netcheck.js",
     "js/views/ipinfo.js", "js/views/ping.js",
     "js/views/outages.js", "js/views/speed.js", "js/views/discovery.js", "js/views/tools.js", "js/views/wifi.js",
     "js/views/reports.js",
@@ -202,7 +203,7 @@ def test_tools_view_markup_tile_and_danger_modal():
     assert "tools:" in app and "warning:" in app and "dhcp:" in app  # icons
     # the Tools tile: the DHCP server's state, then the other tools by name as plain text
     assert "tileEls.tools" in app and "DHCP client" in app and "Tools for the field" not in app
-    assert "const TOOLS_TILE_ITEMS = ['LAN throughput', 'Traceroute', 'Subnet calc', 'WiFi passwords'];" in app
+    assert "const TOOLS_TILE_ITEMS = ['LAN throughput', 'Port forward', 'Traceroute', 'TFTP server', 'Subnet calc', 'DNS', 'Packet capture', 'WiFi passwords'];" in app
     assert "TOOLS_TILE_ITEMS.map((name) => line(esc(name), 'tile-tool'))" in app
     # in two columns where the tile has room, so the list does not make the Tools tile's row taller than the others
     assert "'<div class=\"tile-tools\">' + TOOLS_TILE_ITEMS.map(" in app
@@ -425,7 +426,7 @@ def test_discovery_sort_order_and_port_urls_with_node(tmp_path):
                                  "fallback": "Camera", "legacy": "Ubiquiti", "none": None}
     assert out["classify"] == {"router": "Router", "routerList": "Router", "routerBeatsService": "Router",
                                "dw": "DW Server", "camera": "Camera", "phone": "Phone", "ubiquiti": "Ubiquiti",
-                               "ubiquitiCase": "Ubiquiti", "sshNotUbiquiti": None, "ubiquitiNoSsh": None,
+                               "ubiquitiCase": "Ubiquiti", "sshNotUbiquiti": None, "ubiquitiNoSsh": "Ubiquiti",
                                "noPorts": None, "noVendor": None, "nothing": None}
     # a type stored by 1.11 or older ("Wifi") keeps its colour under its new name
     assert out["badges"] == {"Router": "blue", "DW Server": "purple", "Camera": "orange", "Phone": "green",
@@ -484,7 +485,7 @@ def test_tools_lease_badges_and_server_summary_with_node(tmp_path):
 def test_tools_batch_markup_settings_wan_and_cards():
     """Traceroute / LAN throughput / Subnet calculator cards, the WAN chip and the IPv6 setting."""
     app = _read("js/app.js")
-    assert "'IPv6 addresses'" in app and "Show IPv6 addresses and subnets on the Network info page." in app
+    assert "'IPv6 addresses'" in app and "Show IPv6 addresses and subnets on the Network info page, and IPv6 addresses in DNS lookups on the Tools page." in app
     assert "saveSettings({ ui: { show_ipv6: v } }" in app and "s.ui && s.ui.show_ipv6" in app
     for icon in ("lan:", "target:", "question:", "route:"):
         assert icon in app, icon
@@ -500,9 +501,12 @@ def test_tools_batch_markup_settings_wan_and_cards():
     for t in ("'Traceroute'", "'LAN throughput'", "'Subnet calculator'"):
         assert t in tools, t
     assert "TNT.tools.traceroute.create()" in tools and "TNT.tools.lan.create()" in tools and "TNT.tools.subnetcalc.create()" in tools
-    # card order on the Tools page: DHCP server, LAN throughput, Traceroute, Subnet calculator
-    assert "els.card, els.unavailable, cards" in tools            # the DHCP card, then the tool cards
-    assert tools.index("'LAN throughput'") < tools.index("'Traceroute'") < tools.index("'Subnet calculator'")
+    # card order on the Tools page: LAN throughput, Port forward, Traceroute, the DHCP server, TFTP server, Subnet
+    # calculator, DNS, Packet capture, Saved Wi-Fi networks (one ordered list of keys, the DHCP card among them)
+    assert "cards.push(els.card, els.unavailable)" in tools       # the DHCP card sits in the ordered list
+    assert "const CARD_ORDER = ['lan', 'portforward', 'traceroute', 'dhcp', 'tftp', 'subnet', 'dns', 'capture', 'wifi'];" in tools
+    assert (tools.index("'LAN throughput'") < tools.index("'Port forward'") < tools.index("'Traceroute'") < tools.index("'TFTP server'")
+            < tools.index("'Subnet calculator'") < tools.index("'DNS'") < tools.index("'Packet capture'") < tools.index("'Saved Wi-Fi networks'"))
     assert "More tools" not in tools
     tr = _read("js/tools/traceroute.js")
     for s in ("'trace.start'", "'trace.hop'", "'trace.done'", "TNT.api.traceroute(", "TNT.api.tracerouteLast()", "totalelectronics.com",
@@ -527,7 +531,8 @@ def test_tools_batch_markup_settings_wan_and_cards():
     new_css = css[css.index("tools: traceroute, LAN throughput, subnet calculator"):css.index("/* ---------- easter egg")]
     assert not re.search(r"#[0-9A-Fa-f]{3,6}\b", new_css), "hard-coded colour in the new tools CSS"
     # the tool modules load before app.js: TNT.util / TNT.ui may only be touched inside functions
-    for rel in ("js/tools/subnet.js", "js/tools/traceroute.js", "js/tools/lan.js", "js/tools/subnetcalc.js"):
+    for rel in ("js/tools/subnet.js", "js/tools/traceroute.js", "js/tools/lan.js", "js/tools/portforward.js", "js/tools/subnetcalc.js",
+                "js/netcheck.js", "js/tools/tftp.js", "js/tools/capture.js"):
         top_level = [ln for ln in _read(rel).splitlines() if re.match(r"^  (const|let|var) ", ln)]
         assert not any(("TNT.util." in ln or "TNT.ui." in ln) and "=>" not in ln for ln in top_level), (rel, top_level)
 
@@ -723,7 +728,8 @@ def test_network_change_wiring():
         assert s in app, s
     # every view that shows network state has the hook; the Tools view hands it to its cards
     for rel in ("js/views/ipinfo.js", "js/views/discovery.js", "js/views/tools.js", "js/views/outages.js",
-                "js/tools/lan.js", "js/tools/subnetcalc.js", "js/tools/wifi.js"):
+                "js/tools/lan.js", "js/tools/subnetcalc.js", "js/tools/wifi.js", "js/tools/tftp.js", "js/tools/capture.js",
+                "js/tools/portforward.js"):
         assert "netChanged(" in _read(rel), rel
     tools = _read("js/views/tools.js")
     assert "if (m.netChanged) m.netChanged(info, state)" in tools and "danger.networkChanged()" in tools
@@ -1080,8 +1086,8 @@ def test_wifi_card_markup_icon_and_api():
     assert "'?reveal=0'" in api and "'?reveal=1'" in api
     tools = _read("js/views/tools.js")
     assert "'Saved Wi-Fi networks'" in tools and "TNT.tools.wifi.create()" in tools and "icon: 'wifi'" in tools
-    # last card on the page: after the subnet calculator
-    assert tools.index("'Subnet calculator'") < tools.index("'Saved Wi-Fi networks'")
+    # last card on the page: after the subnet calculator and DNS
+    assert tools.index("'Subnet calculator'") < tools.index("'DNS'") < tools.index("'Saved Wi-Fi networks'")
     src = _read("js/tools/wifi.js")
     for s in ("TNT.tools.wifi = {", "TNT.api.wifiProfiles(", "TNT.app.saveBlob(", "TNT.hosttable.csvCell",
               "Every Wi-Fi network this PC has joined", "'Show keys'", "'Hide keys'", "'Export CSV'",
@@ -1440,6 +1446,9 @@ const live = [
 out.tile = {
   strongest: V.tileSummary(sv('ok', { aps: live }), 'ready'),
   connected: V.tileSummary(sv('ok', { aps: live.map((a, i) => Object.assign({}, a, { connected: i === 0 })) }), 'ready'),
+  linked: V.tileSummary(sv('ok', { aps: live.map((a, i) => Object.assign({}, a, { connected: i === 0 })),
+    interfaces: [{ guid: 'g', state: 'connected', connected_bssid: '02:00:00:00:00:01', connected_ssid: 'Alpha', tx_rate_mbps: 390, rx_rate_mbps: 433.3 }] }), 'ready'),
+  linkedElsewhere: V.tileSummary(sv('ok', { aps: live, interfaces: [{ connected_bssid: '02:00:00:00:00:01', tx_rate_mbps: 390 }] }), 'ready'),
   empty: V.tileSummary(sv('ok'), 'ready'),
   starting: V.tileSummary(sv('starting'), 'ready').kind,
   denied: V.tileSummary(sv('location_denied'), 'ready').headline,
@@ -1520,6 +1529,36 @@ Object.assign(sd, { c: { ink: '#101010', inkSoft: '#606060', green: '#00A000', y
   series: [{ key: 'a', net: 's:a', name: 'a', color: 0, selected: true, points: [[100, -50], [600, -52], [610, -53]] }] });
 sd.color = () => '#3060C0';
 try { sd.draw(ctx2d, 1000, 300); out.drawGap = { error: null, arcs: calls.arc }; } catch (e) { out.drawGap = { error: String(e), arcs: calls.arc }; }
+// --- this PC's link speed: the log axis, its ticks and text, the stretches with a link, the sticker's place; the page's merge
+// and current link; drawing it (right axis labels, a dashed line, the newest speed in the sticker) and hovering it
+const r3 = (x) => Math.round(x * 1000) / 1000;
+out.mbps = {
+  y: [W.mbpsToY(1000, 10, 310), W.mbpsToY(1, 10, 310), W.mbpsToY(100, 10, 310), W.mbpsToY(10000, 10, 310), W.mbpsToY(0, 10, 310), W.mbpsToY(1000, 10, 310, 10000)].map(r3),
+  top: [W.mbpsTop([390, 866.7]), W.mbpsTop([2402]), W.mbpsTop([]), W.mbpsTop(null)],
+  ticks: [W.mbpsTicks(1000), W.mbpsTicks(10000)],
+  text: [W.mbpsText(390), W.mbpsText(866.7), W.mbpsText(6.5), W.mbpsText(54), W.mbpsText(0), W.mbpsText(null), W.mbpsText(99.96)],
+  runs: W.linkRuns([[1, 390], [2, 390], [3, 0], [4, 433.3], ['x', 5], [6, null], [7, 6.5]]),
+  sticker: [W.stickerBox(500, 100, 60, 1), W.stickerBox(500, 20, 60, 1)],
+};
+out.linkMerge = [V.mergeLink([[1, 390], [2, 0]], [[2, 433.3], [3, 0], [4, null]], 1.5, 10), V.mergeLink(null, undefined, null, 10)];
+out.currentLink = [
+  V.currentLink({ interfaces: [{ connected_bssid: null, tx_rate_mbps: 100 }, { connected_bssid: '02:00:00:00:00:09', connected_ssid: 'Lab', tx_rate_mbps: 390, rx_rate_mbps: 433.3 }] }),
+  V.currentLink({ interfaces: [{ connected_bssid: '02:00:00:00:00:09', tx_rate_mbps: null }] }), V.currentLink(null),
+];
+const texts = [], dashes = [];
+const rec = new Proxy({}, {
+  get: (t, k) => (k in t ? t[k] : k === 'fillText' ? (s) => { texts.push(String(s)); } : k === 'setLineDash' ? (d) => { dashes.push(d.slice()); }
+    : k === 'measureText' ? (s) => ({ width: String(s).length * 7 }) : () => {}),
+  set: (t, k, v) => { t[k] = v; return true; },
+});
+const sl = Object.create(W.SignalChart.prototype);
+Object.assign(sl, { c: { ink: '#101010', inkSoft: '#606060', green: '#00A000', yellow: '#C0A000', red: '#C00000', paper: '#FFFFFF' }, font: 'sans-serif',
+  t0: 0, t1: 1000, dim: false, empty: '', _hoverKey: null, _cols: new Map(), _colsSeries: null, _colsGeom: '', series: [],
+  link: { points: [[100, 390], [400, 0], [600, 866.7], [995, 1201]], tip: (ts, v) => 'link ' + v } });
+sl.color = () => '#3060C0';
+try { sl.draw(rec, 1000, 300); out.linkDraw = { error: null, texts, dashed: dashes.some((d) => d.length === 2) }; } catch (e) { out.linkDraw = { error: String((e && e.stack) || e) }; }
+// the newest reading's screen point: 54 px right of the plot for the 10000 label, 12 px on top, 26 px under it
+out.linkHit = sl.hitTest(48 + 0.995 * (1000 - 54 - 48), W.mbpsToY(1201, 12, 300 - 26, 10000));
 // the incremental merge agrees with the plain Map merge it replaced, on random caches, overlaps, junk and caps
 function refMerge(cache, incoming, cutoff, cap) {
   const res = {}; const cut = cutoff == null ? -Infinity : cutoff;
@@ -1686,8 +1725,10 @@ def test_wifi_survey_helpers_with_node(tmp_path):
     assert st["callError"]["kind"] == "error" and st["callError"]["text"] == "boom" and st["noData"] == "waiting"
     tile = out["tile"]
     assert tile["strongest"]["kind"] == "ok" and tile["strongest"]["networks"] == 2 and tile["strongest"]["aps"] == 2
-    assert tile["strongest"]["top"] == {"name": "Bravo", "rssi": -48, "cls": "green", "bars": 4, "connected": False, "band": "2.4", "channel": 6}
+    assert tile["strongest"]["top"] == {"name": "Bravo", "rssi": -48, "cls": "green", "bars": 4, "connected": False, "band": "2.4", "channel": 6, "rate": None}
     assert tile["connected"]["top"]["name"] == "Alpha" and tile["connected"]["top"]["connected"] is True and tile["connected"]["top"]["cls"] == "yellow"
+    # the link speed comes from the interface connected to that very access point, never for a network it is not on
+    assert tile["connected"]["top"]["rate"] is None and tile["linked"]["top"]["rate"] == 390 and tile["linkedElsewhere"]["top"]["rate"] is None
     assert tile["empty"]["top"] is None and tile["starting"] == "starting"
     assert (tile["denied"], tile["noadapter"], tile["off"], tile["nobridge"]) == ("Location access needed", "No Wi-Fi adapter", "Survey off", "Open in the TNT window")
     assert tile["waiting"] == "waiting" and tile["callError"]["kind"] == "error"
@@ -1721,6 +1762,21 @@ def test_wifi_survey_helpers_with_node(tmp_path):
     # a gap never loses the reading before it (a lone reading is a one-point line), and drawing that never throws
     assert out["segs"] == [[[0], [400, 410]], [[0, 10, 20], [400], [700]], [[0, 0.2], [400]]]
     assert out["drawGap"] == {"error": None, "arcs": 1}
+    # this PC's link speed: a log axis (1 at the bottom, 1000 or 10000 at the top), its text, the stretches with a link and the
+    # sticker above the line (below it near the top); the page merges the series like the history and names the current link
+    m = out["mbps"]
+    assert m["y"] == [10, 310, 110, 10, 310, 85]
+    assert m["top"] == [1000, 10000, 1000, 1000] and m["ticks"] == [[1, 10, 100, 1000], [1, 10, 100, 1000, 10000]]
+    assert m["text"] == ["390 Mbps", "867 Mbps", "6.5 Mbps", "54 Mbps", "—", "—", "100 Mbps"]
+    assert m["runs"] == [[[1, 390], [2, 390]], [[4, 433.3]], [[7, 6.5]]]
+    assert m["sticker"] == [{"x": 440, "y": 75, "w": 60, "h": 20, "below": False}, {"x": 440, "y": 25, "w": 60, "h": 20, "below": True}]
+    assert out["linkMerge"] == [[[2, 433.3], [3, 0]], []]
+    assert out["currentLink"] == [{"tx": 390, "rx": 433.3, "bssid": "02:00:00:00:00:09", "ssid": "Lab"}, None, None]
+    ld = out["linkDraw"]
+    assert ld["error"] is None and ld["dashed"] is True, ld
+    assert [t for t in ld["texts"] if t in ("1", "10", "100", "1000", "10000", "Mbps")] == ["1", "10", "100", "1000", "10000", "Mbps"]
+    assert "1201 Mbps" in ld["texts"] and "No readings in this range yet" not in ld["texts"]
+    assert out["linkHit"] == {"key": "#link", "net": None, "tip": "link 1201", "follow": True}, "a tooltip, and no network to pick"
     assert out["mergeMismatches"] == 0
     b = out["bridge"]
     assert b["none"] == "waiting" and b["noneAfterReady"] == "none" and b["outdated"] == "outdated" and b["ready"] == "ready"
@@ -1779,8 +1835,8 @@ function load(search) {
 
 #: the survey dict and its access point dicts, exactly as the shared contract with the client lists them
 SURVEY_KEYS = {"available", "enabled", "state", "error", "started_ts", "last_read_ts", "last_scan_ts", "active", "scan_interval_s",
-               "passive_interval_s", "interfaces", "aps", "history"}
-SURVEY_IFACE_KEYS = {"guid", "description", "state", "connected_bssid", "connected_ssid"}
+               "passive_interval_s", "interfaces", "aps", "history", "link_history"}
+SURVEY_IFACE_KEYS = {"guid", "description", "state", "connected_bssid", "connected_ssid", "rx_rate_mbps", "tx_rate_mbps"}
 SURVEY_AP_KEYS = {"bssid", "ssid", "hidden", "rssi", "quality", "band", "channel", "center_channel", "width_mhz", "freq_mhz", "spans",
                   "phy", "phys", "generation", "security", "beacon_ms", "max_rate_mbps", "oui", "locally_administered", "base_oui",
                   "connected", "first_seen", "last_seen", "seen_count", "stale"}
@@ -1834,6 +1890,14 @@ def test_mock_wifi_bridge_matches_the_survey_contract(tmp_path, mock):
     assert max(ssids.count(x) for x in ssids) >= 3
     assert [a["connected"] for a in aps].count(True) == 1
     assert s["interfaces"][0]["connected_bssid"] == next(a["bssid"] for a in aps if a["connected"])
+    # the connected access point's link speed: the interface's speeds and a series of Wi-Fi 6 rates in the history window
+    iface = s["interfaces"][0]
+    assert iface["tx_rate_mbps"] in (1201, 1080.9, 960.8, 864.7, 720.6, 600.4, 480.4) and iface["rx_rate_mbps"] > 0
+    assert s["link_history"] and s["link_history"][-1][1] == iface["tx_rate_mbps"]
+    assert all(len(p) == 2 and p[0] <= out["now"] and (p[1] == 0 or p[1] >= 480.4) for p in s["link_history"])
+    assert out["none"]["link_history"] == [] and out["recent"]["link_history"] and all(p[0] >= out["now"] - 61 for p in out["recent"]["link_history"])
+    # (the mock stamps readings to 0.1 s, so the first one after Clear may sit up to 0.05 s before the new start)
+    assert all(p[0] >= out["clear"][1]["started_ts"] - 0.051 for p in out["clear"][1]["link_history"]), "Clear starts the series again"
     assert {2484, 5955, 7115} <= {a["freq_mhz"] for a in aps}   # 2.4 GHz ch 14, 6 GHz ch 1 and 233
     # history: only readings, per BSSID, within history_s
     assert s["history"] and set(s["history"]) <= {a["bssid"] for a in aps}
@@ -2047,6 +2111,14 @@ def test_small_screen_layout_rules():
     assert text.get("overflow") == "hidden" and text.get("text-overflow") == "ellipsis" and text.get("min-width") == "0"
     for sel in (".brand", ".topbar-right > .live-badge", ".topbar-right > .btn"):
         assert decl(sel).get("flex") == "none", sel
+    # the quick tools (IP Release/Renew, Flush DNS: .btn children of the row too) are 44 px icon-only buttons below 1200 px, so
+    # the row still fits down to 800 px; their aria-label names them there
+    narrow = _css_media(css, "(max-width: 1199.98px)")
+    assert _css_decls(narrow, ".topbar-quick .quick-label").get("display") == "none"
+    assert _css_decls(narrow, ".topbar-quick").get("width") == "44px" and _css_decls(narrow, ".topbar-quick").get("padding") == "0"
+    html = _read("index.html")
+    for tool_id, name in (("btn-ip-renew", "IP Release/Renew"), ("btn-flush-dns", "Flush DNS")):
+        assert re.search(r'<button class="btn topbar-quick" id="' + tool_id + r'" type="button" title="[^"]+" aria-label="' + re.escape(name) + '">', html), tool_id
     # ping tiles keep room for the grip and the remove button beside the (ellipsized) name
     assert decl(".ptile-head").get("padding-right") == "74px" and decl(".ptile-host").get("text-overflow") == "ellipsis"
     app = _read("js/app.js")
@@ -2248,7 +2320,7 @@ def test_speedtests_history_patterns_and_run(mock):
     st, _, conflict = _req(mock.port, "POST", "/api/speedtests/run")
     assert st == 409 and conflict["error"]["code"] == "conflict"
     st, _, s = _req(mock.port, "GET", "/api/status")
-    assert s["speed"]["running"] is True and s["speed"]["progress"]["phase"] in ("latency", "download", "upload")
+    assert s["speed"]["running"] is True and s["speed"]["progress"]["phase"] in ("baseline", "latency", "download", "upload")
 
 
 def test_discovery_scan_cancel_and_runs(mock):
@@ -2722,6 +2794,73 @@ def test_mock_ip_location_follows_the_service(mock):
         # the whole GEO the mock answers is the one the service builds from those records
         asn = {"autonomous_system_number": geo["asn"], "autonomous_system_organization": geo["as_org"]}
         assert fresh.geoip_lookup(ip) == geoip.build_geo(ip, city, asn, fresh.geoip_month), ip
+
+
+def test_mock_update_status_check_install_and_parity(mock):
+    """Auto-update in the mock, in tnt.updater's shapes: status.update and GET /api/update, the key/state parity with
+    tnt.updater, POST /api/update/check and /install with an update.state event, and the dev-only POST /mock/update."""
+    from tnt import config, updater
+
+    mod = mock.mod
+    assert mod.UPDATE_STATUS_KEYS == updater.STATUS_KEYS and mod.UPDATE_STATES == updater.STATES
+    assert mod.DEFAULTS["update"] == config.DEFAULTS["update"]
+    st, _, s = _req(mock.port, "GET", "/api/status")
+    u = s["update"]
+    assert st == 200 and set(u) == set(mod.UPDATE_STATUS_KEYS) and u["state"] == "available"
+    assert u["enabled"] is True and u["current_version"] == mod.VERSION and u["latest_version"] == mod.UPDATE_LATEST_VERSION
+    assert u["asset"]["name"] == f"TNT-Setup-{mod.UPDATE_LATEST_VERSION}.exe" and u["notes_url"] and u["download"] is None
+    st, _, u2 = _req(mock.port, "GET", "/api/update")
+    assert st == 200 and u2 == u
+    # install begins the (fake) download, with the event
+    q = mock.state.hub.subscribe()
+    try:
+        st, _, r = _req(mock.port, "POST", "/api/update/install")
+        assert st == 200 and r["state"] == "downloading" and r["download"]["phase"] == "download"
+        got = _drain(q, "update.", "update.state", 3)
+        assert got and got[-1][0] == "update.state" and got[-1][1]["state"] == "downloading"
+    finally:
+        mock.state.hub.unsubscribe(q)
+    # the development route shows the other states; Check now returns to available
+    st, _, r = _req(mock.port, "POST", "/mock/update", {"state": "error"})
+    assert st == 200 and r == {"state": "error"}
+    st, _, u = _req(mock.port, "GET", "/api/update")
+    assert u["state"] == "error" and u["error"] and u["next_check_ts"] > time.time()
+    st, _, r = _req(mock.port, "POST", "/api/update/check")
+    assert st == 200 and r["state"] == "available"
+    # switched off: the disabled shape at once, and check + install refuse
+    try:
+        st, _, r = _req(mock.port, "PUT", "/api/settings", {"update": {"enabled": False}})
+        assert st == 200 and "update.enabled" in r["changed"]
+        st, _, u = _req(mock.port, "GET", "/api/update")
+        assert u["enabled"] is False and u["state"] == "disabled" and set(u) == set(mod.UPDATE_STATUS_KEYS)
+        st, _, err = _req(mock.port, "POST", "/api/update/check")
+        assert st == 409 and err["error"]["code"] == "conflict"
+        st, _, err = _req(mock.port, "POST", "/api/update/install")
+        assert st == 409 and err["error"]["code"] == "conflict"
+    finally:
+        mock.state.update_settings({"update": {"enabled": True}})
+
+
+def test_update_ui_wiring():
+    """The auto-update banner, Settings section, SSE handler, API methods and the client relaunch bridge are wired."""
+    html = _read("index.html")
+    assert 'id="update-banner"' in html and 'class="update-banner"' in html
+    css = _read("css/tnt.css")
+    assert ".update-banner {" in css and ".update-banner-actions" in css
+    api = _read("js/api.js")
+    for fn in ("updateStatus", "updateCheck", "updateInstall"):
+        assert fn + ":" in api, fn
+    assert "'/update'" in api and "'/update/check'" in api and "'/update/install'" in api
+    app = _read("js/app.js")
+    assert "function renderUpdateBanner" in app and "function updateBannerView" in app
+    assert "function renderSettingsUpdate" in app and "function startUpdateInstall" in app
+    assert "ev.on('update.state'" in app                              # live progress
+    assert "renderAll() { renderHeader(); renderTiles(); renderUpdateBanner(); }" in app
+    assert "group('Updates'" in app and "'Check for updates'" in app  # the Settings section
+    assert "api.updateInstall()" in app and "api.updateCheck()" in app
+    assert "window.pywebview.api" in app and "arm_relaunch" in app    # arm the client relaunch before installing
+    tray = (ROOT / "client" / "tray.py").read_text(encoding="utf-8")
+    assert "def arm_relaunch(self)" in tray and "cmd.exe" in tray and 'start ""' in tray
 
 
 #: every key tnt.lanpeers.LanPeers.peers_view() carries (the mock must mirror it exactly)
@@ -3494,8 +3633,660 @@ def test_tools_page_follows_a_network_change_in_a_browser(browser_page, mock):
     assert "SITE-B-PC" in dom and "TEC-LAPTOP-02" not in dom
     # the Tools tile: the DHCP server's line, then the tools by name
     tile = _tile_body(dom, "tools")
-    assert re.findall(r'<div class="tile-line tile-tool">([^<]+)</div>', tile) == ["LAN throughput", "Traceroute", "Subnet calc", "WiFi passwords"]
+    assert re.findall(r'<div class="tile-line tile-tool">([^<]+)</div>', tile) == ["LAN throughput", "Port forward", "Traceroute", "TFTP server",
+                                                                                    "Subnet calc", "DNS", "Packet capture", "WiFi passwords"]
     assert "DHCP server" in tile and "Tools for the field" not in tile
+
+
+# ---------------------------------------------------------------------------
+# the DNS card, the collapsible Tools cards and the top bar's quick tools (IP Release/Renew, Flush DNS)
+# ---------------------------------------------------------------------------
+def test_quick_tools_markup_css_and_controller():
+    html = _read("index.html")
+    renew = re.search(r'<button class="btn topbar-quick" id="btn-ip-renew" type="button" title="[^"]+" aria-label="IP Release/Renew">'
+                      r'<span data-icon="renew"></span><span class="quick-label">IP Release/Renew</span></button>', html)
+    flush = re.search(r'<button class="btn topbar-quick" id="btn-flush-dns" type="button" title="[^"]+" aria-label="Flush DNS">'
+                      r'<span data-icon="flush"></span><span class="quick-label">Flush DNS</span></button>', html)
+    assert renew and flush and renew.start() < flush.start() < html.index('id="btn-full-scan"') < html.index('id="status-pill"')
+    api = _read("js/api.js")
+    for s in ("dnsLookup: (name, server, type) => api.post('/tools/dns/lookup', Object.assign({ name }, server ? { server } : {}, type ? { type } : {}), "
+              "{ timeout: 30000 }),",
+              "flushDns: () => api.post('/tools/dns/flush', {}, { timeout: 45000 }),",
+              "ipRenew: () => api.post('/tools/ip/renew', {}, { timeout: 240000 }),",
+              "api.quick = { outcome: quickOutcome, NAMES: QUICK_NAMES };"):
+        assert s in api, s
+    app = _read("js/app.js")
+    for s in ("dns: '<svg ", "flush: '<svg ", "renew: '<svg ", "chevron: '<svg ",
+              "$('#btn-ip-renew').addEventListener('click', () => quickRun('renew'));",
+              "$('#btn-flush-dns').addEventListener('click', () => quickRun('flush'));",
+              "busyLabel: 'Renewing…'", "busyLabel: 'Flushing…'", "run: () => api.ipRenew()", "run: () => api.flushDns()",
+              "if (!btn || st.busy) return;", "btn.setAttribute('aria-busy', 'true');", "btn.disabled = on;",
+              "const o = api.quick.outcome(tool, result, error);", "quickFlash(btn, tool, o.ok);", "toast(o.text, o.kind,",
+              "btn.classList.add(ok ? 'flash-ok' : 'flash-bad');", "'\\nLast run ' + fmtTime(ts)",
+              # the pause around a renew is part of the renew: no "Monitoring paused/resumed" toasts while it runs and just after
+              "const RENEW_QUIET_MS = 5000;", "if (tool === 'renew') quietPauseUntil = Infinity;",
+              "if (tool === 'renew') quietPauseUntil = Date.now() + RENEW_QUIET_MS;",
+              "if (d && Date.now() >= quietPauseUntil) toast(d.paused ? 'Monitoring paused' : 'Monitoring resumed'"):
+        assert s in app, s
+    # a release/renew reads the network again at once, done or not: the status and the open view's hook, no settle timer
+    run = app[app.index("async function quickRun(tool)"):app.index("/* ================================================================ SSE */")]
+    after = run[run.index("if (tool !== 'renew') return;"):]
+    assert "refreshStatus();" in after and "current.view.netChanged({ source: 'renew', changes: [] }, state)" in after
+    assert "setTimeout" not in after and "NET_SETTLE_MS" not in after
+    css = _read("css/tnt.css")
+    base = _css_base(css)
+    assert _css_decls(base, ".btn.flash-ok").get("animation") == "flash-ok 1.5s ease-out"
+    assert _css_decls(base, ".btn.flash-bad").get("animation") == "flash-bad 1.5s ease-out"
+    assert re.search(r"@keyframes flash-ok \{[^}]*var\(--green\)", css) and re.search(r"@keyframes flash-bad \{[^}]*var\(--red\)", css)
+    # no animation for those who asked for less motion: a static tint while the class is on
+    reduced = _css_media(css, "(prefers-reduced-motion: reduce)")
+    assert "var(--green)" in _css_decls(reduced, ".btn.flash-ok").get("background", "")
+    assert "var(--red)" in _css_decls(reduced, ".btn.flash-bad").get("background", "")
+    busy = _css_decls(base, '.btn.topbar-quick[aria-busy="true"]')
+    assert busy.get("opacity") == "1" and "var(--yellow)" in busy.get("background", "")
+    top_css = css[css.index("/* IP Release/Renew and Flush DNS"):css.index("/* ---------- layout")]
+    assert not re.search(r"#[0-9A-Fa-f]{3,6}\b", top_css), "hard-coded colour in the quick tools CSS"
+
+
+def test_collapsible_tool_cards_and_dns_card_markup():
+    html = _read("index.html")
+    assert html.index("js/tools/subnetcalc.js") < html.index("js/tools/dns.js") < html.index("js/tools/wifi.js") < html.index("js/views/tools.js")
+    tools = _read("js/views/tools.js")
+    assert "{ key: 'dns', title: 'DNS', icon: 'dns', create: () => TNT.tools.dns.create() }," in tools
+    for s in ("makeCollapsible(els.card, titleRow, body, 'dhcp', 'DHCP server', [els.badge, els.toggle]);",
+              "makeCollapsible(card, title, mod.body, c.key, c.title, [mod.head]);",
+              "'aria-expanded': 'false', 'aria-controls': body.id", "row.insertBefore(btn, row.firstChild);", "body.hidden = !open;",
+              "const hit = t.closest('button, a, input, select, textarea, label, .badge');", "(controls || []).some((c) => c && c.contains(t))",
+              "if (checked) { openCard('dhcp'); turnOn(false); }", "if (att && att !== attentionShown) openCard('dhcp');",
+              "withCardOpen,", "dhcpAttention,"):
+        assert s in tools, s
+    # the opened cards outlive the view (module level, never reset by mount or unmount): only a reload starts collapsed
+    assert re.search(r"^  let openCards = \[\];", tools, re.M) and tools.count("openCards = [") == 1
+    assert tools.count("checkAttention();") == 2          # after a status is applied and after a failed pre-start check
+    dns = _read("js/tools/dns.js")
+    for s in ("TNT.tools.dns = { create, resultView, validName, validServer, validType, TYPES };", "TNT.api.dnsLookup(n.name, s.server, t.type)",
+              "TNT.ui.busy(els.runBtn, running, 'Looking up…')", "placeholder: 'www.example.com'", "placeholder: \"this PC's DNS server, or 1.1.1.1\"",
+              "h('label', null, 'DNS name / IP address')", "h('label', null, 'DNS server (optional)')", "TNT.ui.icon('search'), 'Look up'",
+              "TNT.ui.icon('close'), 'Clear');", "els.runBtn, els.clearBtn);", "detailsOpen = true;", "resultView(result, { showIpv6: shownV6 })",
+              "update(state) {", "if (v6 !== shownV6)", "title: V6_HIDDEN_TITLE",
+              "if (e.key === 'Enter') run();", "'non-authoritative'", "'Details (' + records.length + ')'", "'aria-invalid'",
+              "'Type a DNS name or IP address to look up'", "\" is not a DNS name or IP address'", "\" is not a DNS server name or IP address'",
+              "err.status === 400"):
+        assert s in dns, s
+    # the tool modules load before app.js: TNT.util / TNT.ui may only be touched inside functions
+    top_level = [ln for ln in dns.splitlines() if re.match(r"^  (const|let|var) ", ln)]
+    assert not any(("TNT.util." in ln or "TNT.ui." in ln) and "=>" not in ln for ln in top_level), top_level
+    css = _read("css/tnt.css")
+    base = _css_base(css)
+    assert _css_decls(base, ".card-head").get("cursor") == "pointer"
+    assert _css_decls(base, '.card-toggle[aria-expanded="true"] svg.icon').get("transform") == "rotate(90deg)"
+    assert _css_decls(base, ".card.collapsed > .card-title").get("margin-bottom") == "0"
+    toggle = _css_decls(base, ".card-toggle")
+    assert toggle.get("border-radius") == "50%" and toggle.get("flex") == "none"
+    for sel in (".dns-asked", ".dns-addresses", ".dns-aliases"):
+        assert _css_decls(base, sel).get("flex-wrap") == "wrap", sel
+    for sel in (".dns-addr", ".dns-details", ".dns-table td.wrap", ".tool-summary.dns-invalid"):
+        assert _css_decls(base, sel), sel
+    new_css = css[css.index("tools: traceroute, LAN throughput, subnet calculator"):css.index("/* ---------- easter egg")]
+    assert ".card-toggle" in new_css and ".dns-addresses" in new_css      # inside the tools section: tokens only (checked above)
+
+
+def test_dns_card_collapsible_cards_and_quick_tools_are_in_the_design_doc():
+    docs = _doc("docs/DESIGN.md")
+    for s in ("collapsible cards", "`.card-toggle`", "\"DNS\" card", "nslookup", "non-authoritative", "IP Release/Renew", "Flush DNS",
+              "`.flash-ok`", "`.flash-bad`", "Renewing…", "below 1200 px", "calculator, DNS, Packet capture, Saved Wi-Fi networks",
+              "Subnet calc, DNS, Packet capture, WiFi passwords"):
+        assert s in docs, s
+
+
+_DNS_NAME_CASES = ["", "   ", "www.example.com", "  www.example.com.  ", "example.com..", ".example.com", "-bad.example", "bad-.example",
+                   "a_b.example", "has space.example", "*.example.com", "http://example.com", "bücher.example", "x" * 63 + ".example",
+                   "x" * 64 + ".example", ".".join(["a" * 63, "b" * 63, "c" * 63, "d" * 61]), ".".join(["a" * 63, "b" * 63, "c" * 63, "d" * 62]),
+                   ".".join(["a" * 63, "b" * 63, "c" * 63, "d" * 61]) + ".", "203.0.113.10", "01.2.3.4", "256.1.1.1", "1.2.3",
+                   "2001:db8::10", "::ffff:192.0.2.1", "::", "1:2:3:4:5:6:7:8", "1:2:3:4:5:6:7:8:9", "1::2::3", "2001:db8::10%12",
+                   "[2001:db8::1]", "12345::1", "2001:db8::10.", "203.0.113.10.", "::.", "q" * 90 + " z"]
+_DNS_SERVER_CASES = [None, "", "  ", "1.1.1.1", "ns1.example.net", "2001:db8::53", "bad server", "dns..example", "x" * 100 + "!"]
+
+_NODE_DNS_DRIVER = r"""
+const fs = require('fs'), vm = require('vm');
+const window = { TNT: { views: {}, util: {}, api: {}, ui: {} } };
+const ctx = vm.createContext({ window, console });
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx, { filename: 'dns.js' });
+const D = window.TNT.tools.dns;
+const input = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+process.stdout.write(JSON.stringify({ names: input.names.map((t) => D.validName(t)), servers: input.servers.map((t) => D.validServer(t)),
+                                      views: input.results.map((r) => D.resultView(r)),
+                                      hidden: input.results.map((r) => D.resultView(r, { showIpv6: false })) }));
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+def test_dns_card_helpers_with_node(tmp_path, mock):
+    """validName / validServer give the service's 400 texts (held to the mock's copy of its rules) and resultView reads the
+    mock's answers."""
+    answers = [_req(mock.port, "POST", "/api/tools/dns/lookup", body)[2] for body in (
+        {"name": "www.example.com"}, {"name": "203.0.113.10", "server": "1.1.1.1"}, {"name": "nope.example"}, {"name": "mail.example.com"})]
+    answers += [None, {"name": "example.net", "server": None, "resolver": {"name": None, "address": None}, "answer_name": "example.net",
+                       "addresses": ["198.51.100.20"], "aliases": [], "records": [{"type": "A", "name": "example.net", "value": "198.51.100.20", "ttl": 600}],
+                       "authoritative": True, "ok": True, "error": None, "duration_ms": 7, "ts": 1.0}]
+    fixture = tmp_path / "dns.json"
+    fixture.write_text(json.dumps({"names": _DNS_NAME_CASES, "servers": _DNS_SERVER_CASES, "results": answers}, ensure_ascii=False), encoding="utf-8")
+    driver = tmp_path / "driver.js"
+    driver.write_text(_NODE_DNS_DRIVER, encoding="utf-8")
+    r = subprocess.run(["node", str(driver), str(UI / "js/tools/dns.js"), str(fixture)], capture_output=True, text=True, encoding="utf-8", timeout=30)
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout)
+
+    def service(fn: Any, value: Any) -> Dict[str, Any]:
+        try:
+            return {"ok": True, "value": fn(value)}
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    # the same verdict and message as the service's rules (the mock's copy, held to tnt.nettools by
+    # test_mock_network_tools_follow_the_service) for every name and server; the page sends what was typed, trimmed
+    for text, js in zip(_DNS_NAME_CASES, out["names"]):
+        py = service(mock.mod.dns_query_name, text)
+        assert js["ok"] is py["ok"], (text, js, py)
+        assert js["name"] == text.strip() if py["ok"] else js["error"] == py["error"], (text, js, py)
+    for text, js in zip(_DNS_SERVER_CASES, out["servers"]):
+        py = service(mock.mod.dns_query_server, text)
+        assert js["ok"] is py["ok"], (text, js, py)
+        assert js["server"] == (text or "").strip() if py["ok"] else js["error"] == py["error"], (text, js, py)
+    names = dict(zip(_DNS_NAME_CASES, out["names"]))
+    assert names[""] == {"ok": False, "error": "Type a DNS name or IP address to look up"} and names["   "] == names[""]
+    assert names["  www.example.com.  "] == {"ok": True, "name": "www.example.com."}
+    assert names["has space.example"]["error"] == '"has space.example" is not a DNS name or IP address'
+    assert names["q" * 90 + " z"]["error"] == '"' + "q" * 80 + '" is not a DNS name or IP address'
+    for good in ("bücher.example", "2001:db8::10", "::ffff:192.0.2.1", "a_b.example", "x" * 63 + ".example", "1.2.3"):
+        assert names[good]["ok"] is True, good
+    for bad in ("x" * 64 + ".example", "[2001:db8::1]", "1:2:3:4:5:6:7:8:9", "example.com..", "http://example.com", "12345::1"):
+        assert names[bad]["ok"] is False, bad
+    servers = dict(zip(map(str, _DNS_SERVER_CASES), out["servers"]))
+    assert servers["None"] == servers[""] == servers["  "] == {"ok": True, "server": ""}
+    assert servers["bad server"] == {"ok": False, "error": '"bad server" is not a DNS server name or IP address'}
+    # resultView of the mock's answers
+    www, rev, nx, noaddr, nothing, auth = out["views"]
+    assert www["ok"] is True and www["cls"] == "ok" and www["reverse"] is False and www["summary"] == "example.com has 2 addresses"
+    assert re.fullmatch(r"Asked gateway\.lan \(10\.0\.0\.251\) · this PC's DNS server · \d+ ms", www["asked"]) and www["nonAuthoritative"] is True
+    assert www["addresses"] == [{"address": "203.0.113.10", "family": "IPv4"}, {"address": "2001:db8::10", "family": "IPv6"}]
+    assert www["aliases"] == ["www.example.com"] and len(www["records"]) == 3
+    assert www["records"][0] == {"type": "CNAME", "name": "www.example.com", "value": "example.com", "ttl": "3600 s"}
+    assert rev["reverse"] is True and rev["summary"] == "203.0.113.10 is example.com" and re.fullmatch(r"Asked 1\.1\.1\.1 · \d+ ms", rev["asked"])
+    assert rev["addresses"] == [{"address": "203.0.113.10", "family": "IPv4"}] and rev["records"][0]["type"] == "PTR"
+    assert nx["ok"] is False and nx["cls"] == "bad" and nx["summary"] == "nope.example — Non-existent domain" and nx["addresses"] == []
+    assert noaddr["summary"] == "mail.example.com — No addresses found for this name"
+    assert nothing == {"ok": False, "cls": "bad", "reverse": False, "type": "", "summary": "the lookup failed", "asked": None, "nonAuthoritative": False,
+                       "addresses": [], "hiddenV6": 0, "aliases": [], "values": [], "groups": [], "records": [], "hint": ""}
+    # IPv6 hidden (Settings › Appearance, the default): IPv4 addresses and no AAAA record, the count of what was left out
+    hidden = out["hidden"]
+    assert www["hiddenV6"] == 0 and hidden[0]["hiddenV6"] == 1 and hidden[0]["summary"] == "example.com has 1 address"
+    assert hidden[0]["addresses"] == [{"address": "203.0.113.10", "family": "IPv4"}]
+    assert [x["type"] for x in hidden[0]["records"]] == [x["type"] for x in www["records"] if x["type"] != "AAAA"] and len(hidden[0]["records"]) == 2
+    assert hidden[1] == rev and hidden[2] == nx and hidden[4] == nothing, "a reverse lookup and a failure look the same either way"
+    assert auth["summary"] == "example.net has 1 address" and auth["asked"] is None and auth["nonAuthoritative"] is False
+    assert auth["records"] == [{"type": "A", "name": "example.net", "value": "198.51.100.20", "ttl": "600 s"}]
+
+
+_NODE_COLLAPSE_QUICK_DRIVER = r"""
+const fs = require('fs'), vm = require('vm');
+const window = { TNT: { views: {}, util: {}, ui: {} } };
+const ctx = vm.createContext({ window, console });
+['api.js', 'hosttable.js', 'tools.js'].forEach((n, i) => vm.runInContext(fs.readFileSync(process.argv[2 + i], 'utf8'), ctx, { filename: n }));
+const T = window.TNT, V = T.views.tools, Q = T.api.quick, E = T.api.ApiError;
+const before = ['dhcp', 'dns'];
+const A = V.dhcpAttention;
+const out = {
+  cards: V.cards,
+  open: [V.withCardOpen([], 'dns', true), V.withCardOpen(before, 'dns', false), V.withCardOpen(before, 'dns', true), V.withCardOpen(null, 'lan', true),
+         V.withCardOpen(undefined, 'lan', false)],
+  untouched: before,
+  openAtLoad: V.openCards(),
+  attention: {
+    none: A(null, null), empty: A({}, null), unavailable: A({ available: false, error: 'x' }, null),
+    error: A({ error: 'could not bind UDP 67' }, null), scanFailed: A({ error: 'x' }, 'could not check Ethernet'),
+    firewall: A({ running: true, firewall: { ok: false, rule: 'TNT DHCP server', error: 'access denied' } }, null),
+    firewallOff: A({ running: false, firewall: { ok: null } }, null),
+    warning: A({ warning: 'Pool overlaps a static address' }, null),
+    conflictShown: A({ warning: 'Another DHCP server is active on Ethernet', scan: { servers: [{ server_ip: '10.0.0.251' }] } }, null),
+    conflictNotShown: A({ warning: 'Another DHCP server is active on Ethernet', scan: { servers: [] } }, null),
+    internetOnly: A({ adapter: { name: 'Ethernet', is_internet: true, will_change: true } }, null),
+    scanServers: A({ scan: { servers: [{ server_ip: '10.0.0.251' }] } }, null),
+  },
+  quick: {
+    renewOk: Q.outcome('renew', { ok: true, address: '10.0.0.112', adapter: 'Ethernet', warnings: [] }),
+    renewWarn: Q.outcome('renew', { ok: true, address: '10.0.0.112', adapter: 'Ethernet', warnings: ['Ethernet 2: no DHCP server answered', 'second'] }),
+    renewNoAddress: Q.outcome('renew', { ok: true, address: null, adapter: null, warnings: null }),
+    renewFailed: Q.outcome('renew', { ok: false, error: 'No DHCP server answered on any adapter', warnings: ['Ethernet: no DHCP server answered'] }),
+    renewFailedBare: Q.outcome('renew', { ok: false, error: null, warnings: [] }),
+    renewNull: Q.outcome('renew', null),
+    admin: Q.outcome('renew', null, new E('Releasing and renewing IP addresses needs a Windows administrator account.', 'admin_required', 403)),
+    forbidden: Q.outcome('renew', null, new E('Not for another origin', 'forbidden', 403)),
+    busy: Q.outcome('renew', null, new E('An IP release/renew is already running', 'conflict', 409)),
+    missing: Q.outcome('renew', null, new E('Not Found', 'not_found', 404)),
+    timeout: Q.outcome('renew', null, new E('Request timed out', 'timeout', 0)),
+    flushOk: Q.outcome('flush', { ok: true, method: 'native', error: null }),
+    flushFailed: Q.outcome('flush', { ok: false, method: 'ipconfig', error: 'ipconfig /flushdns failed' }),
+    flushDown: Q.outcome('flush', null, new E('Cannot reach the TNT service', 'network', 0)),
+    flushUnavailable: Q.outcome('flush', null, new E('unavailable', 'unavailable', 503)),
+  },
+};
+process.stdout.write(JSON.stringify(out));
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+def test_tools_collapse_helpers_and_quick_tool_outcomes_with_node(tmp_path):
+    driver = tmp_path / "driver.js"
+    driver.write_text(_NODE_COLLAPSE_QUICK_DRIVER, encoding="utf-8")
+    files = [UI / "js/api.js", UI / "js/hosttable.js", UI / "js/views/tools.js"]
+    r = subprocess.run(["node", str(driver)] + [str(f) for f in files], capture_output=True, text=True, encoding="utf-8", timeout=30)
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout)
+    assert out["cards"] == ["LAN throughput", "Port forward", "Traceroute", "TFTP server", "Subnet calculator", "DNS", "Packet capture", "Saved Wi-Fi networks"]
+    # the open cards: added once, removed, never changed in place; none open when the page loads
+    assert out["open"] == [["dns"], ["dhcp"], ["dhcp", "dns"], ["lan"], []] and out["untouched"] == ["dhcp", "dns"] and out["openAtLoad"] == []
+    # what opens the DHCP card by itself: a failed pre-start check, an error, a firewall failure, a warning not already in the red scan box
+    assert out["attention"] == {
+        "none": None, "empty": None, "unavailable": None, "error": "error:could not bind UDP 67", "scanFailed": "scan:could not check Ethernet",
+        "firewall": "firewall:access denied", "firewallOff": None, "warning": "warning:Pool overlaps a static address", "conflictShown": None,
+        "conflictNotShown": "warning:Another DHCP server is active on Ethernet", "internetOnly": None, "scanServers": None}
+    q = out["quick"]
+    assert q["renewOk"] == {"ok": True, "kind": "ok", "text": "IP address renewed: 10.0.0.112 on Ethernet"}
+    assert q["renewWarn"] == {"ok": True, "kind": "warn", "text": "IP address renewed: 10.0.0.112 on Ethernet · Ethernet 2: no DHCP server answered"}
+    assert q["renewNoAddress"] == {"ok": True, "kind": "ok", "text": "IP address renewed"}
+    assert q["renewFailed"] == {"ok": False, "kind": "error",
+                                "text": "IP release/renew failed: No DHCP server answered on any adapter · Ethernet: no DHCP server answered"}
+    assert q["renewFailedBare"]["text"] == "IP release/renew failed: no address came back" and q["renewNull"]["ok"] is False
+    # refusals are the service's words: a standard user and one already running are warnings, another origin an error
+    assert q["admin"] == {"ok": False, "kind": "warn", "text": "Releasing and renewing IP addresses needs a Windows administrator account."}
+    assert q["busy"] == {"ok": False, "kind": "warn", "text": "An IP release/renew is already running"}
+    assert q["forbidden"] == {"ok": False, "kind": "error", "text": "Not for another origin"}
+    assert q["missing"]["text"] == "IP Release/Renew is not available on this service"
+    assert q["timeout"] == {"ok": False, "kind": "error", "text": "Could not release and renew the IP address: Request timed out"}
+    assert q["flushOk"] == {"ok": True, "kind": "ok", "text": "DNS cache flushed"}
+    assert q["flushFailed"] == {"ok": False, "kind": "error", "text": "Could not flush the DNS cache: ipconfig /flushdns failed"}
+    assert q["flushDown"]["text"] == "Could not flush the DNS cache: Cannot reach the TNT service"
+    assert q["flushUnavailable"]["text"] == "unavailable"          # a 503 in the service's words; only an older service's 404 gets ours
+
+
+def test_mock_network_tools_follow_the_service():
+    """The mock's DNS lookup, Flush DNS and IP Release/Renew answer with the service's keys and texts (tnt.nettools, tnt.api.routes,
+    tnt.engine) and check names and servers by the same rules."""
+    from tnt import nettools
+    from tnt.api import routes as service_routes
+    mod = _load_mock()
+    for key in ("DNS_RESULT_KEYS", "DNS_RECORD_KEYS", "FLUSH_RESULT_KEYS", "RENEW_RESULT_KEYS", "RENEW_ADAPTER_KEYS"):
+        assert getattr(mod, key) == getattr(nettools, key), key
+    assert (mod.DNS_NAME_REQUIRED_MSG, mod.DNS_NO_SERVER_MSG, mod.DNS_TIMEOUT_MSG, mod.DNS_NO_ADDRESSES_MSG, mod.DNS_NXDOMAIN_MSG) == (
+        nettools.EMPTY_NAME_TEXT, nettools.NO_SERVER_TEXT, nettools.TIMEOUT_TEXT, nettools.NO_ADDRESSES_TEXT, nettools.RCODE_TEXT[3])
+    assert (mod.IP_RENEW_NO_DHCP_MSG, mod.IP_RENEW_NO_ADDRESS_MSG) == (nettools.NO_DHCP_ADAPTER_TEXT, nettools.NO_ADDRESS_TEXT)
+    assert mod.IP_RENEW_ADMIN_REQUIRED_MSG == service_routes.IP_RENEW_ADMIN_REQUIRED_MSG
+    assert mod.QUICK_TOOLS_CROSS_ORIGIN_MSG == service_routes.QUICK_TOOLS_CROSS_ORIGIN_MSG
+    assert f'RuntimeError("{mod.IP_RENEW_BUSY_MSG}")' in (ROOT / "tnt" / "engine.py").read_text(encoding="utf-8")
+
+    def outcome(fn: Any, value: Any) -> Tuple[str, Any]:
+        try:
+            return ("ok", fn(value))
+        except ValueError as exc:
+            return ("error", str(exc))
+
+    # the same answer for every name and server: the address normalized or the host name without its trailing dot, else the text
+    for value in _DNS_NAME_CASES + [None, 5]:
+        assert outcome(mod.dns_query_name, value) == outcome(nettools.validate_name, value), value
+    for value in _DNS_SERVER_CASES + [5]:
+        assert outcome(mod.dns_query_server, value) == outcome(nettools.validate_server, value), value
+
+
+def test_mock_dns_lookup_answers_like_nslookup(mock):
+    def look(body: Dict[str, Any]) -> Dict[str, Any]:
+        st, _, res = _req(mock.port, "POST", "/api/tools/dns/lookup", body)
+        assert st == 200, (body, res)
+        assert list(res) == list(mock.mod.DNS_RESULT_KEYS), list(res)
+        assert isinstance(res["duration_ms"], int) and res["duration_ms"] >= 0 and res["ts"] > 0
+        return res
+
+    www = look({"name": "www.example.com"})
+    assert www["ok"] is True and www["error"] is None and www["name"] == "www.example.com" and www["server"] is None
+    # no server given: this PC's DNS server on the office network, with its name
+    assert www["resolver"] == {"name": "gateway.lan", "address": "10.0.0.251"}
+    assert www["answer_name"] == "example.com" and www["addresses"] == ["203.0.113.10", "2001:db8::10"] and www["aliases"] == ["www.example.com"]
+    assert [(x["type"], x["name"], x["value"]) for x in www["records"]] == [
+        ("CNAME", "www.example.com", "example.com"), ("A", "example.com", "203.0.113.10"), ("AAAA", "example.com", "2001:db8::10")]
+    assert all(set(x) == {"type", "name", "value", "ttl"} and isinstance(x["ttl"], int) for x in www["records"]) and www["authoritative"] is False
+    assert look({"name": "totalelectronics.com", "server": ""})["addresses"] == ["198.51.100.40"]
+    dot = look({"name": "  www.example.com.  "})
+    assert dot["ok"] is True and dot["name"] == "www.example.com"          # trimmed and the trailing dot dropped, like the service
+    # a server given: an address is asked as it is, a name is found first
+    one = look({"name": "example.com", "server": "1.1.1.1"})
+    assert one["ok"] is True and one["server"] == "1.1.1.1" and one["resolver"] == {"name": None, "address": "1.1.1.1"}
+    ns = look({"name": "example.net", "server": "ns1.example.net"})
+    assert ns["resolver"] == {"name": "ns1.example.net", "address": "198.51.100.53"} and ns["addresses"] == ["198.51.100.20"]
+    lost = look({"name": "example.com", "server": "nowhere.example"})
+    assert lost["ok"] is False and lost["error"] == 'Could not find the DNS server "nowhere.example"' and lost["addresses"] == []
+    silent = look({"name": "example.com", "server": "192.0.2.1"})
+    assert silent["ok"] is False and silent["error"] == "No response from the DNS server (timed out)"
+    assert silent["resolver"] == {"name": None, "address": "192.0.2.1"} and silent["answer_name"] is None
+    # an address is a reverse (PTR) lookup: its name, and the address looked up
+    ptr = look({"name": "203.0.113.10"})
+    assert ptr["ok"] is True and ptr["answer_name"] == "example.com" and ptr["addresses"] == ["203.0.113.10"]
+    assert ptr["records"] == [{"type": "PTR", "name": "10.113.0.203.in-addr.arpa", "value": "example.com", "ttl": 3600}]
+    assert look({"name": "198.51.100.99"})["answer_name"] == "host-198-51-100-99.example.net"
+    nx = look({"name": "nope.example"})
+    assert nx["ok"] is False and nx["error"] == "Non-existent domain" and nx["answer_name"] is None and nx["records"] == []
+    empty = look({"name": "mail.example.com"})
+    assert empty["ok"] is False and empty["error"] == "No addresses found for this name" and empty["addresses"] == []
+    idn = look({"name": "bücher.example"})                  # asked in punycode
+    assert idn["name"] == "xn--bcher-kva.example" and idn["error"] == "Non-existent domain"
+    # a network without a DNS server (a self-assigned address)
+    profile = mock.state.net_profile
+    mock.state.net_profile = "apipa"
+    try:
+        none = look({"name": "www.example.com"})
+    finally:
+        mock.state.net_profile = profile
+    assert none["ok"] is False and none["error"] == "No DNS server is configured on this PC" and none["resolver"] == {"name": None, "address": None}
+
+
+def test_mock_dns_lookup_validation_gives_the_service_texts(mock):
+    def bad(body: Dict[str, Any], message: str) -> None:
+        st, _, res = _req(mock.port, "POST", "/api/tools/dns/lookup", body)
+        assert st == 400 and res["error"] == {"code": "bad_request", "message": message}, (body, res)
+
+    bad({}, "Type a DNS name or IP address to look up")
+    bad({"name": "   "}, "Type a DNS name or IP address to look up")
+    bad({"name": None, "server": "1.1.1.1"}, "Type a DNS name or IP address to look up")
+    bad({"name": 5}, "name must be text")                                   # the route's own checks come first
+    bad({"name": "example.com", "server": 7}, "server must be text or null")
+    bad({"name": "not a name"}, '"not a name" is not a DNS name or IP address')
+    bad({"name": "example.com.."}, '"example.com.." is not a DNS name or IP address')
+    bad({"name": "-bad.example"}, '"-bad.example" is not a DNS name or IP address')
+    bad({"name": "q" * 90 + " z"}, '"' + "q" * 80 + '" is not a DNS name or IP address')
+    bad({"name": "www.example.com", "server": "bad server"}, '"bad server" is not a DNS server name or IP address')
+    bad({"name": "www.example.com", "server": "x" * 100 + "!"}, '"' + "x" * 80 + '" is not a DNS server name or IP address')
+    assert _req(mock.port, "GET", "/api/tools/dns/lookup")[0] == 404
+
+
+def test_mock_dns_flush_and_ip_renew(mock):
+    st, _, fl = _req(mock.port, "POST", "/api/tools/dns/flush", {})
+    assert st == 200 and list(fl) == list(mock.mod.FLUSH_RESULT_KEYS)
+    assert fl["ok"] is True and fl["method"] == "native" and fl["error"] is None and isinstance(fl["duration_ms"], int)
+    state = mock.state
+    results: Dict[str, Any] = {}
+    state.ip_renew_s = 0.6
+    try:
+        th = threading.Thread(target=lambda: results.update(first=_req(mock.port, "POST", "/api/tools/ip/renew", {})), daemon=True)
+        th.start()
+        deadline = time.time() + 5
+        while time.time() < deadline and not state.ip_renew_running:
+            time.sleep(0.01)
+        assert state.ip_renew_running
+        # one at a time
+        st, _, busy = _req(mock.port, "POST", "/api/tools/ip/renew", {})
+        assert st == 409 and busy["error"] == {"code": "conflict", "message": "An IP release/renew is already running"}
+        th.join(timeout=10)
+    finally:
+        state.ip_renew_s = 1.5
+    st, _, res = results["first"]
+    assert st == 200 and list(res) == list(mock.mod.RENEW_RESULT_KEYS)
+    assert all(list(a) == list(mock.mod.RENEW_ADAPTER_KEYS) for a in res["adapters"])
+    assert res["ok"] is True and res["error"] is None and res["method"] == "native"
+    assert state.paused is False and res["paused_monitoring"] is True
+    assert res["address"] == "10.0.0.112" and res["adapter"] == "Ethernet" and not state.ip_renew_running
+    assert res["adapters"] == [{"name": "Ethernet", "released": True, "renewed": True, "error": None},
+                               {"name": "Ethernet 2", "released": True, "renewed": False, "error": "No DHCP server answered"}]
+    assert res["warnings"] == ["Ethernet 2: no DHCP server answered, it kept a self-assigned address"]
+    # a standard user may look up and flush, not release and renew
+    state.wifi_admin = False
+    state.ip_renew_s = 0.05
+    try:
+        st, _, err = _req(mock.port, "POST", "/api/tools/ip/renew", {})
+        assert st == 403 and err["error"] == {"code": "admin_required", "message": "Releasing and renewing IP addresses needs a Windows administrator account."}
+        assert _req(mock.port, "POST", "/api/tools/dns/flush", {})[0] == 200
+        assert _req(mock.port, "POST", "/api/tools/dns/lookup", {"name": "example.com"})[0] == 200
+    finally:
+        state.wifi_admin = True
+        state.ip_renew_s = 1.5
+
+
+def test_mock_network_tools_refuse_a_page_of_another_origin(mock):
+    def post(path: str, body: Dict[str, Any], headers: Dict[str, str]) -> Tuple[int, Any]:
+        conn = http.client.HTTPConnection("127.0.0.1", mock.port, timeout=10)
+        try:
+            conn.request("POST", path, body=json.dumps(body).encode(), headers=dict(headers, **{"Content-Type": "application/json"}))
+            resp = conn.getresponse()
+            return resp.status, json.loads(resp.read())
+        finally:
+            conn.close()
+
+    routes = (("/api/tools/dns/lookup", {"name": "example.com"}), ("/api/tools/dns/flush", {}), ("/api/tools/ip/renew", {}))
+    mock.state.ip_renew_s = 0.05
+    try:
+        for headers in ({"Origin": "https://evil.example", "Sec-Fetch-Site": "cross-site"}, {"Sec-Fetch-Site": "same-site"}, {"Origin": "null"}):
+            for path, body in routes:
+                st, res = post(path, body, headers)
+                # the status and code only: the real server words a cross-site refusal before its routes in its own way
+                assert st == 403 and res["error"]["code"] == "forbidden", (path, headers, res)
+        # the TNT window's own page is served by the service: allowed
+        for path, body in routes:
+            st, res = post(path, body, {"Origin": f"http://127.0.0.1:{mock.port}", "Sec-Fetch-Site": "same-origin"})
+            assert st == 200 and res["ok"] is True, (path, res)
+    finally:
+        mock.state.ip_renew_s = 1.5
+
+
+def _serve_probe(mock: Any, monkeypatch: Any, name: str, page: str) -> None:
+    """Serve `page` at /<name> from the mock (every other path as before)."""
+    data = page.encode("utf-8")
+    original = mock.mod.Handler._static
+
+    def static(self: Any, path: str) -> None:
+        if path != "/" + name:
+            return original(self, path)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+        return None
+
+    monkeypatch.setattr(mock.mod.Handler, "_static", static)
+
+
+def _probe_result(dom: str) -> Dict[str, Any]:
+    m = re.search(r'<pre id="probe">(.*?)</pre>', dom, re.S)
+    assert m and m.group(1) != "pending", "the probe page did not finish"
+    return json.loads(m.group(1))
+
+
+# the real page (scripts on) in a same-origin iframe, driven like a user: the Tools cards, the DNS card and Flush DNS
+_TOOLS_PROBE = r"""<!doctype html><html><head><meta charset="utf-8"><title>tools probe</title></head><body>
+<pre id="probe">pending</pre>
+<iframe id="app" src="/index.html#tools" style="width:1366px;height:900px;border:0;display:block"></iframe>
+<script>
+const out = {};
+const frame = document.getElementById('app');
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+async function until(fn, ms) {
+  const end = Date.now() + ms;
+  for (;;) {
+    let v = null;
+    try { v = fn(); } catch (e) { v = null; }
+    if (v) return v;
+    if (Date.now() > end) return null;
+    await sleep(40);
+  }
+}
+function cards(doc) {
+  return Array.from(doc.querySelectorAll('#view .card-toggle')).map((b) => {
+    const body = doc.getElementById(b.getAttribute('aria-controls'));
+    return { tool: b.closest('.card').dataset.tool, label: b.getAttribute('aria-label'), expanded: b.getAttribute('aria-expanded'),
+             hidden: !!(body && body.hidden), first: b.parentElement.firstElementChild === b };
+  });
+}
+const card = (doc, tool) => cards(doc).find((c) => c.tool === tool) || null;
+async function run() {
+  await until(() => frame.contentDocument && frame.contentDocument.querySelectorAll('#view .card-toggle').length >= 8, 8000);
+  const win = frame.contentWindow, doc = frame.contentDocument;
+  out.initial = cards(doc);
+  // a control in a title row never toggles its card: the Traceroute badge, the DHCP server's badge
+  doc.querySelector('[data-tool="traceroute"] .card-title .badge').click();
+  doc.querySelector('[data-tool="dhcp"] .switch-row .badge').click();
+  out.afterControls = [card(doc, 'traceroute'), card(doc, 'dhcp')];
+  // the title text opens a card; the chevron opens and closes one
+  doc.querySelector('[data-tool="dns"] .card-title').click();
+  out.afterTitle = card(doc, 'dns');
+  const lan = doc.querySelector('[data-tool="lan"] .card-toggle');
+  lan.click(); out.lanOpened = card(doc, 'lan');
+  lan.click(); out.lanClosed = card(doc, 'lan');
+  lan.click();
+  // leaving Tools and coming back keeps the opened cards open
+  win.location.hash = '#ipinfo';
+  await until(() => !doc.querySelector('#view .card-toggle'), 4000);
+  win.location.hash = '#tools';
+  await until(() => doc.querySelectorAll('#view .card-toggle').length >= 8, 4000);
+  out.afterReturn = cards(doc);
+  // the DNS card: a bad name is caught before anything is sent, then www.example.com is looked up
+  const dns = doc.querySelector('[data-tool="dns"]');
+  const name = dns.querySelector('input');
+  const look = dns.querySelector('.btn-primary');
+  name.value = 'not a name';
+  name.dispatchEvent(new win.Event('input', { bubbles: true }));
+  look.click();
+  const invalid = dns.querySelector('.dns-invalid');
+  out.invalid = { text: invalid.textContent, hidden: invalid.hidden, ariaInvalid: name.getAttribute('aria-invalid') };
+  name.value = 'www.example.com';
+  name.dispatchEvent(new win.Event('input', { bubbles: true }));
+  out.invalidCleared = invalid.hidden;
+  look.click();
+  await until(() => dns.querySelector('.dns-addr code'), 5000);
+  const detailsBtn = dns.querySelector('.dns-details-btn');
+  const clearBtn = dns.querySelector('.dns-clear');
+  const summaryText = () => dns.querySelector('.tool-summary[role="status"]').textContent;
+  const addrTexts = () => Array.from(dns.querySelectorAll('.dns-addr')).map((a) => a.textContent);
+  // IPv6 is hidden by default (Settings > Appearance): the IPv4 address, its records unfolded, Clear right of Look up
+  out.dns = { summary: summaryText(), asked: dns.querySelector('.dns-asked').textContent, addresses: addrTexts(), details: detailsBtn.textContent,
+              detailsOpen: detailsBtn.getAttribute('aria-expanded'), tableShown: !dns.querySelector('.dns-details .table-wrap').hidden,
+              rows: Array.from(dns.querySelectorAll('.dns-table tbody tr')).map((tr) => tr.firstElementChild.textContent),
+              label: dns.querySelector('.dns-form label').textContent, clearNext: clearBtn.previousElementSibling === look,
+              clearEnabled: !clearBtn.disabled, hiddenTitle: (dns.querySelector('.dns-v6-hidden') || {}).title || null };
+  // IPv6 shown: the same answer drawn again with its IPv6 address and AAAA record, without another lookup
+  const setV6 = (on) => {
+    const st = win.TNT.state;
+    st.settings = Object.assign({}, st.settings, { ui: Object.assign({}, (st.settings || {}).ui, { show_ipv6: on }) });
+    win.TNT.views.tools.update(st);
+  };
+  setV6(true);
+  out.dnsV6 = { summary: summaryText(), addresses: addrTexts(), rows: dns.querySelectorAll('.dns-table tbody tr').length };
+  setV6(false);
+  // Clear: the answer and what was typed both go, and Clear has nothing left to do
+  clearBtn.click();
+  out.cleared = { summary: summaryText(), addresses: addrTexts().length, details: dns.querySelector('.dns-details').hidden, name: name.value,
+                  clearDisabled: clearBtn.disabled };
+  // Flush DNS: busy while it runs, then the green flash and a toast
+  const btn = doc.getElementById('btn-flush-dns');
+  const seen = { busy: false, busyLabel: null, disabled: false, ok: false, bad: false };
+  const watch = new win.MutationObserver(() => {
+    if (btn.getAttribute('aria-busy') === 'true') { seen.busy = true; seen.busyLabel = btn.querySelector('.quick-label').textContent; seen.disabled = btn.disabled; }
+    if (btn.classList.contains('flash-ok')) seen.ok = true;
+    if (btn.classList.contains('flash-bad')) seen.bad = true;
+  });
+  watch.observe(btn, { attributes: true, subtree: true, childList: true, characterData: true });
+  btn.click();
+  await until(() => seen.ok || seen.bad, 5000);
+  watch.disconnect();
+  out.flush = Object.assign(seen, { label: btn.querySelector('.quick-label').textContent, title: btn.title,
+    toasts: Array.from(doc.querySelectorAll('#toasts .toast')).map((t) => t.textContent) });
+  out.errors = doc.documentElement.getAttribute('data-mock-errors');
+}
+run().catch((e) => { out.failed = String((e && e.stack) || e); }).then(() => { document.getElementById('probe').textContent = JSON.stringify(out); });
+</script></body></html>"""
+
+
+def test_tools_cards_collapse_dns_lookup_and_flush_dns_in_a_browser(browser_page, mock, monkeypatch):
+    _serve_probe(mock, monkeypatch, "tools-probe.html", _TOOLS_PROBE)
+    res = _probe_result(browser_page("tools-probe.html", budget_ms=15000))
+    assert "failed" not in res, res.get("failed")
+    assert res["errors"] == "[]"
+    # every card starts collapsed, its chevron first in the title row and named after the tool
+    assert [(c["tool"], c["label"]) for c in res["initial"]] == [("lan", "LAN throughput"), ("portforward", "Port forward"),
+                                                                  ("traceroute", "Traceroute"), ("dhcp", "DHCP server"), ("tftp", "TFTP server"),
+                                                                  ("subnet", "Subnet calculator"), ("dns", "DNS"), ("capture", "Packet capture"),
+                                                                  ("wifi", "Saved Wi-Fi networks")]
+    assert all(c["expanded"] == "false" and c["hidden"] and c["first"] for c in res["initial"]), res["initial"]
+    assert all(c["expanded"] == "false" and c["hidden"] for c in res["afterControls"]), res["afterControls"]
+    assert res["afterTitle"]["expanded"] == "true" and res["afterTitle"]["hidden"] is False
+    assert res["lanOpened"]["expanded"] == "true" and res["lanClosed"]["expanded"] == "false" and res["lanClosed"]["hidden"] is True
+    assert {c["tool"]: c["expanded"] for c in res["afterReturn"]} == {"dhcp": "false", "tftp": "false", "lan": "true", "portforward": "false",
+                                                                      "traceroute": "false", "subnet": "false", "dns": "true", "capture": "false",
+                                                                      "wifi": "false"}
+    assert res["invalid"] == {"text": '"not a name" is not a DNS name or IP address', "hidden": False, "ariaInvalid": "true"}
+    assert res["invalidCleared"] is True
+    d = res["dns"]
+    assert d["summary"] == "example.com has 1 address· 1 IPv6 hidden" and d["addresses"] == ["203.0.113.10IPv4"], d
+    assert d["hiddenTitle"].replace("&gt;", ">") == "IPv6 addresses are hidden — turn them on under Settings > Appearance"   # read back from the page's HTML
+    assert re.fullmatch(r"Asked gateway\.lan \(10\.0\.0\.251\) · this PC's DNS server · \d+ msnon-authoritative", d["asked"]), d["asked"]
+    # every new answer arrives with Details unfolded; Clear sits right of Look up under the new label
+    assert d["details"] == "Details (2)" and d["detailsOpen"] == "true" and d["tableShown"] is True and d["rows"] == ["CNAME", "A"], d
+    assert d["label"] == "DNS name / IP address" and d["clearNext"] is True and d["clearEnabled"] is True
+    assert res["dnsV6"] == {"summary": "example.com has 2 addresses", "addresses": ["203.0.113.10IPv4", "2001:db8::10IPv6"], "rows": 3}
+    assert res["cleared"] == {"summary": "No lookup yet — type a name or an IP address and hit Look up", "addresses": 0, "details": True,
+                              "name": "", "clearDisabled": True}
+    f = res["flush"]
+    assert f["busy"] and f["busyLabel"] == "Flushing…" and f["disabled"] and f["ok"] and not f["bad"], f
+    assert f["label"] == "Flush DNS" and re.search(r"\nLast run \d\d:\d\d:\d\d: done$", f["title"]) and "DNS cache flushed" in f["toasts"], f
+
+
+# the real page (scripts on) in one iframe per window width: the header's controls after the first status
+_TOPBAR_PROBE = r"""<!doctype html><html><head><meta charset="utf-8"><title>top bar probe</title></head><body style="margin:0">
+<pre id="probe">pending</pre>
+<script>
+const WIDTHS = __WIDTHS__;
+const results = {};
+let pending = WIDTHS.length;
+function measure(doc, win) {
+  const bar = doc.getElementById('topbar'), right = bar.querySelector('.topbar-right');
+  const kids = Array.from(right.children).map((el) => {
+    const r = el.getBoundingClientRect();
+    return { id: el.id, top: Math.round(r.top), right: Math.round(r.right * 10) / 10, w: Math.round(r.width) };
+  });
+  return { height: Math.round(bar.getBoundingClientRect().height), inner: doc.documentElement.clientWidth, kids,
+           labels: win.getComputedStyle(doc.querySelector('#btn-ip-renew .quick-label')).display !== 'none',
+           pill: Math.round(doc.getElementById('status-pill').getBoundingClientRect().width) };
+}
+for (const w of WIDTHS) {
+  const f = document.createElement('iframe');
+  f.style.cssText = 'width:' + w + 'px;height:600px;border:0;display:block';
+  f.onload = () => {
+    const doc = f.contentDocument, win = f.contentWindow;
+    const done = () => { results[w] = measure(doc, win); if (--pending === 0) document.getElementById('probe').textContent = JSON.stringify(results); };
+    (doc.fonts && doc.fonts.ready ? doc.fonts.ready : Promise.resolve()).then(() => setTimeout(done, 1500));
+  };
+  f.src = '/index.html#ipinfo';
+  document.body.appendChild(f);
+}
+</script></body></html>"""
+
+
+def test_top_bar_stays_one_row_with_the_quick_tools_in_a_browser(browser_page, mock, monkeypatch):
+    """Brand, IP Release/Renew, Flush DNS, Full Scan, the status pill, LIVE and the gear on one row from 1920 px down to 660 px
+    (two rows at most on a phone-width window below that): the quick tools show their labels from 1200 px, icons only below;
+    nothing leaves the window and the status pill keeps room for its light."""
+    widths = [1920, 1440, 1366, 1280, 1200, 1199, 1100, 1024, 960, 900, 853, 800, 780, 760, 720, 700, 680, 660, 640, 600, 560]
+    _serve_probe(mock, monkeypatch, "topbar-probe.html", _TOPBAR_PROBE.replace("__WIDTHS__", json.dumps(widths)))
+    res = _probe_result(browser_page("topbar-probe.html", budget_ms=10000, size=(1920, 900)))
+    for w in widths:
+        r = res[str(w)]
+        tops = [k["top"] for k in r["kids"]]
+        if w >= 660:
+            assert r["height"] <= 70, (w, r)                                   # one 64 px row
+            assert max(tops) - min(tops) <= 12, (w, r["kids"])                 # every control on it
+        else:
+            assert r["height"] <= 130, (w, r)                                  # a phone-width window: two rows at most
+        assert max(k["right"] for k in r["kids"]) <= r["inner"] + 0.5, (w, r)  # none pushed past the right edge
+        assert r["labels"] is (w >= 1200), (w, r["labels"])
+        assert r["pill"] >= 60, (w, r["pill"])                                 # the status light stays in view
+    assert [k["id"] for k in res["1366"]["kids"]] == ["btn-ip-renew", "btn-flush-dns", "btn-full-scan", "status-pill", "live-badge", "btn-settings"]
 
 
 # ---------------------------------------------------------------------------
@@ -3581,8 +4372,10 @@ def _assert_report_shape(rep: Dict[str, Any]) -> None:
 
 def test_reports_tile_full_scan_button_and_wiring():
     html = _read("index.html")
-    # Full Scan is the first thing on the right of the header, immediately left of the status pill
-    assert re.search(r'<div class="topbar-right">\s*<button class="btn topbar-scan" id="btn-full-scan" type="button"><span data-icon="report"></span>'
+    # the two quick tools first on the right of the header, then Full Scan, immediately left of the status pill
+    assert re.search(r'<div class="topbar-right">\s*<button class="btn topbar-quick" id="btn-ip-renew" [^>]*>.*?</button>\s*'
+                     r'<button class="btn topbar-quick" id="btn-flush-dns" [^>]*>.*?</button>\s*'
+                     r'<button class="btn topbar-scan" id="btn-full-scan" type="button"><span data-icon="report"></span>'
                      r'<span class="scan-label" id="full-scan-label">Full Scan</span></button>\s*<div class="status-pill', html)
     tiles = re.findall(r'<a class="tile" data-view="([a-z]+)"', html)
     assert len(tiles) == 8 and tiles[-1] == "reports"

@@ -746,6 +746,70 @@ def test_arp_native_rejects_implausible_row_count(monkeypatch):
     assert arp.get_arp_table() == {"10.0.0.1": "00:00:5E:00:53:AB"}
 
 
+def _fake_neighbour_dll(rows):
+    """A stand-in for iphlpapi whose GetIpNetTable2 answers IPv4 *rows* of ``(interface index, ip, MAC hex, NL_NEIGHBOR_STATE)``
+    and counts FreeMibTable calls."""
+
+    class FakeDll:
+        freed = 0
+
+        def GetIpNetTable2(self, family, out_ptr):
+            self.keep = ctypes.create_string_buffer(arp._ROWS_OFFSET + ctypes.sizeof(arp.MIB_IPNET_ROW2) * len(rows))
+            base = ctypes.addressof(self.keep)
+            ctypes.c_ulong.from_address(base).value = len(rows)
+            for row, (index, ip, mac, state) in zip((arp.MIB_IPNET_ROW2 * len(rows)).from_address(base + arp._ROWS_OFFSET), rows):
+                row.Address.si_family = arp.AF_INET
+                row.Address.Ipv4.sin_addr[:] = list(ipaddress.IPv4Address(ip).packed)
+                row.InterfaceIndex = index
+                row.PhysicalAddress[:6] = list(bytes.fromhex(mac))
+                row.PhysicalAddressLength = 6
+                row.State = state
+            out_ptr._obj.value = base
+            return 0
+
+        def FreeMibTable(self, table):
+            self.freed += 1
+
+    return FakeDll()
+
+
+def test_arp_native_leaves_out_the_neighbours_of_an_adapter_that_is_down(monkeypatch):
+    """GetIpNetTable2 keeps the last neighbours of an adapter that went down (a Wi-Fi adapter switched off leaves Stale rows);
+    ``arp -a`` does not list that interface, and neither does the native table, even where the down adapter's row has the
+    better state."""
+    from types import SimpleNamespace
+
+    rows = [(13, "192.0.2.10", "02005e100001", 4), (11, "192.0.2.11", "02005e100002", 4), (11, "192.0.2.10", "02005e100003", 5)]
+    adapters = [SimpleNamespace(index=11, is_up=False), SimpleNamespace(index=13, is_up=True)]
+    monkeypatch.setattr(netinfo, "get_adapters", lambda include_down=True, include_loopback=False: list(adapters))
+    assert arp._down_interfaces() == {11}
+    fake = _fake_neighbour_dll(rows)
+    monkeypatch.setattr(arp, "_dll", lambda: fake)
+    assert arp.get_arp_table_native() == {"192.0.2.10": "02:00:5E:10:00:01"} and fake.freed == 1
+    # the adapters cannot be listed: nothing is left out (the better state wins as before)
+    monkeypatch.setattr(netinfo, "get_adapters", lambda include_down=True, include_loopback=False: 1 / 0)
+    assert arp._down_interfaces() == set()
+    assert arp.get_arp_table_native() == {"192.0.2.10": "02:00:5E:10:00:03", "192.0.2.11": "02:00:5E:10:00:02"}
+
+
+def test_neighbour_lookup_leaves_out_the_rows_of_an_adapter_that_is_down(monkeypatch):
+    """neighbour(ip) with no interface keeps the best state among the rows for *ip*: a Stale row that an adapter kept after it
+    went down must not beat the Delay row of the adapter that is up (it names the router of a network this PC has left)."""
+    from types import SimpleNamespace
+
+    rows = [(11, "192.0.2.1", "02005e100001", 4), (13, "192.0.2.1", "02005e100002", 3)]
+    adapters = [SimpleNamespace(index=11, is_up=False), SimpleNamespace(index=13, is_up=True)]
+    monkeypatch.setattr(netinfo, "get_adapters", lambda include_down=True, include_loopback=False: list(adapters))
+    fake = _fake_neighbour_dll(rows)
+    monkeypatch.setattr(arp, "_dll", lambda: fake)
+    assert arp.neighbour_rows_native(arp.AF_INET) == [("192.0.2.1", 13, "02:00:5E:10:00:02", "delay")] and fake.freed == 1
+    assert arp.neighbour("192.0.2.1") == ("02:00:5E:10:00:02", "delay")
+    assert arp.neighbour("192.0.2.1", 11) is None and arp.neighbour("192.0.2.1", 13) == ("02:00:5E:10:00:02", "delay")
+    # the adapters cannot be listed: nothing is left out, and the better state wins as before
+    monkeypatch.setattr(netinfo, "get_adapters", lambda include_down=True, include_loopback=False: 1 / 0)
+    assert arp.neighbour("192.0.2.1") == ("02:00:5E:10:00:01", "stale")
+
+
 # =========================================================================================
 # oui
 # =========================================================================================

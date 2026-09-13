@@ -120,7 +120,6 @@ DEVICE_TYPES: List[str] = ["Router", "DW Server", "Camera", "Phone", "Ubiquiti"]
 DW_SERVER_PORT: int = 7001      # Digital Watchdog Spectrum media server (its web/client port)
 CAMERA_PORT: int = 554          # RTSP
 PHONE_PORT: int = 5060          # SIP
-UBIQUITI_PORT: int = 22         # SSH - only counts together with a Ubiquiti OUI
 UBIQUITI_VENDOR_MATCH: str = "ubiquiti"   # the OUI registry says "Ubiquiti Inc." / "Ubiquiti Networks Inc."
 #: Device types earlier versions stored, and what they are called now (1.11 and older said "Wifi").
 LEGACY_DEVICE_TYPES: Dict[str, str] = {"Wifi": "Ubiquiti"}
@@ -470,8 +469,9 @@ def classify_device(ip: Any, open_ports: Any, mac: Optional[str] = None, vendor:
     2. ``DW Server`` -- TCP 7001 open (Digital Watchdog Spectrum media server).
     3. ``Camera``    -- TCP 554 open (RTSP).
     4. ``Phone``     -- TCP 5060 open (SIP).
-    5. ``Ubiquiti``  -- TCP 22 open **and** the MAC vendor names Ubiquiti (an access point, a switch or
-       a gateway; plain SSH on anything else says nothing about the device).
+    5. ``Ubiquiti``  -- the MAC vendor names Ubiquiti (an access point, a switch or a gateway); the
+       branding alone is enough, whatever ports are open. A device that also matches a more specific
+       service above keeps that stronger label (a Ubiquiti camera stays ``Camera``).
 
     *mac* and *hostname* are accepted for future rules and to keep the call site uniform.
     """
@@ -487,7 +487,7 @@ def classify_device(ip: Any, open_ports: Any, mac: Optional[str] = None, vendor:
         return "Camera"
     if PHONE_PORT in ports:
         return "Phone"
-    if UBIQUITI_PORT in ports and UBIQUITI_VENDOR_MATCH in str(vendor or "").lower():
+    if UBIQUITI_VENDOR_MATCH in str(vendor or "").lower():
         return "Ubiquiti"
     return None
 

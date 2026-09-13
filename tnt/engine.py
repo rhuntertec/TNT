@@ -3,10 +3,12 @@
 Start order: ``ensure_dirs -> logging -> config -> db -> bus -> close stale outages /
 gap row -> dhcp-restore (undo a NIC re-address left behind by a previous run) ->
 IcmpPinger -> PingManager -> LinkMap -> GeoIpManager (IP location data: loads the installed
-data, its thread downloads) -> OutageTracker -> SpeedScheduler -> DiscoveryScanner ->
-DhcpServer (constructed, never started by itself) -> LanPeers (beacon + throughput server,
-started) -> NetWatcher (network-change watcher, started) -> ReportManager (Full Scan site
-reports) -> ApiServer -> maintenance thread (heartbeat + retention)``.
+data, its thread downloads) -> NatChecker -> PortChecker -> OutageTracker -> SpeedScheduler ->
+DiscoveryScanner -> DhcpServer (constructed, never started by itself) -> TftpServer
+(constructed, its folder secured) -> LanPeers (beacon + throughput server, started) ->
+SwitchPortFinder -> CaptureManager (a crashed Packet Monitor session cleaned up on a thread) ->
+NetWatcher (network-change watcher, started) -> ReportManager (Full Scan site reports) ->
+ApiServer -> maintenance thread (heartbeat + retention)``.
 
 Every sibling module is imported lazily inside :meth:`Engine.start` and wrapped in
 ``try/except``: a missing or broken module disables *that* feature (the attribute
@@ -96,6 +98,29 @@ Contract gaps resolved here (documented deviations):
   database, is not part of the db retry, and its ``start()`` only starts the ``tnt-geoip`` thread (the first download
   check waits ``FIRST_CHECK_DELAY_S``).  ``stop()`` stops it right after the link map.  A failure leaves ``engine.geoip``
   None with ``errors["geoip"]``; ``status.geoip`` is then null and ``/api/geoip`` answers 503.
+* :meth:`Engine.ip_release_renew` (the top bar's IP Release/Renew, ``tnt.nettools.release_renew``) runs one at a time
+  (a second call is ``RuntimeError`` "already running", the API's 409).  It pauses monitoring for the seconds without
+  an address when it is not paused already, so that time is a monitoring gap and not an outage, and resumes only what
+  it paused; afterwards it drops the netinfo caches and makes the network watcher look at once.  The change is not
+  labelled with ``NetWatcher.note_own_change``: that marker is the DHCP server tool's (``cause`` ``dhcp`` makes the
+  network tracker count the offline spell as travel, and its summary names the DHCP server).
+* The network tools (ARCHITECTURE 3.23-3.25) are constructed at start and work only on request: the NAT check
+  (``tnt.natcheck.NatChecker``, ``engine.natcheck``) and the port-forward test (``tnt.portcheck.PortChecker``,
+  ``engine.portcheck``) right after the IP location manager; the TFTP server (``tnt.tftp.TftpServer``, ``engine.tftp``)
+  right after the DHCP server, off after every start, with its folder created and secured at once (``ensure_root()``;
+  a failure there is only the server's status warning); the switch port finder (``tnt.switchport.SwitchPortFinder``,
+  ``engine.switchport``) and packet capture (``tnt.capture.CaptureManager``, ``engine.capture``) right after the LAN
+  peers.  Constructing them runs no network, Packet Monitor or netsh work; ``_start_capture`` starts the daemon thread
+  ``tnt-pktmon-recover`` (``CaptureManager.recover()`` stops a Packet Monitor session a crash left behind) and
+  ``start()`` never waits for it.  The NAT check and the port-forward test read the network through accessors that look
+  when they are called: the link map's ``public_ip``, the watcher's ``changed_ts`` and generation,
+  ``LinkMap.refresh_public_ip`` and, for the port-forward test, the NAT check's last verdict.  None of them needs the
+  database (TFTP without one skips its events rows), so none is part of the db retry.  ``_on_net_changed`` tells the
+  NAT check after the link map and the TFTP server and switch port finder after the DHCP server (both stop on their
+  own helper threads); ``stop()`` stops the TFTP server right after the DHCP server and closes the capture, then the
+  switch port finder, right after the LAN peers (idle, each returns at once and runs no pktmon command);
+  ``_run_retention`` also applies the capture retention.  The speed scheduler gets the pinger for its latency-under-load
+  probe (which makes a private one per run).
 """
 from __future__ import annotations
 
@@ -177,6 +202,7 @@ class Engine:
         self.pinger: Any = None
         self.linkmap: Any = None
         self.geoip: Any = None
+        self.update: Any = None
         self.raw_log: Any = None
         self.ping: Any = None
         self.outages: Any = None
@@ -187,6 +213,8 @@ class Engine:
         self.netwatch: Any = None
         self.reports: Any = None
         self.networks: Any = None
+        # the network tools (see the module docstring)
+        self.natcheck = self.portcheck = self.switchport = self.capture = self.tftp = None
         self.api: Any = None
 
         self.started_ts: Optional[float] = None
@@ -233,6 +261,9 @@ class Engine:
         self._netinfo_cache: Optional[Dict[str, Any]] = None
         self._netinfo_cache_ts = 0.0
 
+        # one IP release/renew at a time
+        self._renew_lock = threading.Lock()
+
     # ------------------------------------------------------------------ props
     @property
     def mode(self) -> str:
@@ -272,11 +303,17 @@ class Engine:
         self._start_ping_manager()
         self._start_linkmap()
         self._start_geoip()
+        self._start_update()
+        self._start_natcheck()
+        self._start_portcheck()
         self._start_outages()
         self._start_speed()
         self._start_discovery()
         self._start_dhcp()
+        self._start_tftp()
         self._start_lan()
+        self._start_switchport()
+        self._start_capture()
         self._start_netwatch()
         self._start_reports()
         self._start_api()
@@ -318,9 +355,17 @@ class Engine:
             # after the API (no request can reach it mid-teardown) and before the pinger
             # goes away; stop() also puts a re-addressed adapter back on DHCP
             self._bounded("dhcp", self.dhcp.stop, deadline, 3.0)
+        if getattr(self, "tftp", None) is not None:
+            # closes the listeners and ends every transfer (the device is told the server is shutting down)
+            self._bounded("tftp", self.tftp.stop, deadline, 2.0)
         if self.lan is not None:
             # closes the beacon listener and the throughput server (a test in flight is cut)
             self._bounded("lan", self.lan.stop, deadline, 2.0)
+        if getattr(self, "capture", None) is not None:
+            # a running capture is discarded (a session left behind is cleaned up at the next start)
+            self._bounded("capture", lambda: self.capture.close(1.0), deadline, 1.5)
+        if getattr(self, "switchport", None) is not None:
+            self._bounded("switchport", lambda: self.switchport.close(1.0), deadline, 1.5)
         self._join(self._disc_thread, deadline, 2.0)
         if self.speed is not None:
             self._bounded("speedtest", self.speed.stop, deadline, 3.0)
@@ -330,6 +375,8 @@ class Engine:
             self._bounded("linkmap", self.linkmap.stop, deadline, 2.0)
         if getattr(self, "geoip", None) is not None:
             self._bounded("geoip", self.geoip.stop, deadline, 1.0)
+        if getattr(self, "update", None) is not None:
+            self._bounded("update", self.update.stop, deadline, 1.0)
         if self.ping is not None:
             self._bounded("ping", self.ping.stop, deadline, 4.0)
         if self.raw_log is not None:
@@ -603,6 +650,19 @@ class Engine:
             self.geoip = None
             self._fail("geoip", exc)
 
+    def _start_update(self) -> None:
+        """Auto-update: checks the GitHub releases page on its own thread and, on request, downloads,
+        verifies (SHA-256) and launches the installer."""
+        try:
+            from .updater import UpdateManager
+
+            um = UpdateManager(self.config, self.bus, current_version=self.version)
+            um.start()
+            self.update = um
+        except Exception as exc:  # noqa: BLE001
+            self.update = None
+            self._fail("update", exc)
+
     def _public_ip(self) -> Optional[str]:
         lm = getattr(self, "linkmap", None)
         try:
@@ -613,6 +673,57 @@ class Engine:
     def _geo_lookup(self, ip: str) -> Optional[Dict[str, Any]]:
         gm = getattr(self, "geoip", None)
         return gm.lookup(ip) if gm is not None else None
+
+    # ------------------------------------------------------------ NAT check + port-forward test
+    def _public_ip_view(self) -> Dict[str, Any]:
+        """The link map's public address ``{"ip", "ts", "error", "checked_ts"}`` (a copy; ``{}`` without a link map)."""
+        lm = getattr(self, "linkmap", None)
+        return dict(((lm.view() if lm is not None else None) or {}).get("public_ip") or {})
+
+    def _net_changed_ts(self) -> Optional[float]:
+        """When the network watcher last saw the network change (None without a watcher)."""
+        nw = getattr(self, "netwatch", None)
+        return (nw.state() or {}).get("changed_ts") if nw is not None else None
+
+    def _net_generation(self) -> int:
+        """The network watcher's generation (0 without a watcher; ``NetWatcher.generation`` is a property)."""
+        nw = getattr(self, "netwatch", None)
+        return nw.generation if nw is not None else 0
+
+    def _nat_verdict(self) -> Optional[str]:
+        """The verdict of the NAT check's last kept result (None without one)."""
+        nat = getattr(self, "natcheck", None)
+        return (nat.last() or {}).get("verdict") if nat is not None else None
+
+    def _start_natcheck(self) -> None:
+        """The NAT check (``tnt.natcheck.NatChecker``, ``engine.natcheck``): constructed only, it runs on request.  The
+        accessors look at the link map and the network watcher when they are called (the watcher starts later)."""
+        try:
+            from . import netinfo  # lazy: optional at runtime
+            from .natcheck import NatChecker
+
+            lm = getattr(self, "linkmap", None)
+            self.natcheck = NatChecker(adapters_fn=netinfo.get_adapters, internet_nic_fn=lambda: netinfo.get_internet_nic(),
+                                       public_ip_fn=self._public_ip_view, changed_ts_fn=self._net_changed_ts,
+                                       refresh_fn=lm.refresh_public_ip if lm is not None else None,
+                                       generation_fn=self._net_generation)
+        except Exception as exc:  # noqa: BLE001
+            self.natcheck = None
+            self._fail("natcheck", exc)
+
+    def _start_portcheck(self) -> None:
+        """The port-forward test (``tnt.portcheck.PortChecker``, ``engine.portcheck``): constructed only, it runs on
+        request; it refuses while the NAT check's last verdict is ``vpn``."""
+        try:
+            from .portcheck import PortChecker
+
+            lm = getattr(self, "linkmap", None)
+            self.portcheck = PortChecker(public_ip_fn=self._public_ip_view, changed_ts_fn=self._net_changed_ts,
+                                         refresh_fn=lm.refresh_public_ip if lm is not None else None,
+                                         generation_fn=self._net_generation, nat_verdict_fn=self._nat_verdict)
+        except Exception as exc:  # noqa: BLE001
+            self.portcheck = None
+            self._fail("portcheck", exc)
 
     def _start_outages(self) -> None:
         if self.ping is None:
@@ -639,7 +750,7 @@ class Engine:
         try:
             from .speedtest import SpeedScheduler
 
-            sched = SpeedScheduler(self.db, self.config, self.bus, network_fn=self._network_id)
+            sched = SpeedScheduler(self.db, self.config, self.bus, network_fn=self._network_id, pinger=self.pinger)
             sched.start()
             self.speed = sched
         except Exception as exc:  # noqa: BLE001
@@ -720,6 +831,24 @@ class Engine:
             self.dhcp = None
             self._fail("dhcp", exc)
 
+    def _start_tftp(self) -> None:
+        """The TFTP server (``tnt.tftp.TftpServer``, ``engine.tftp``): constructed and its folder created and secured; it
+        listens only after ``POST /api/tftp/start``.  Works without the database (not part of the db retry); its
+        firewall rule is managed for the installed service only, like the LAN peers' rules."""
+        try:
+            from .tftp import TftpServer
+
+            self.tftp = TftpServer(self.db, self.config, self.bus,
+                                   exe_path=self._dhcp_exe_path() if paths.is_frozen() else None)
+        except Exception as exc:  # noqa: BLE001
+            self.tftp = None
+            self._fail("tftp", exc)
+            return
+        try:
+            self.tftp.ensure_root()         # never raises: a folder that cannot be secured is the server's warning
+        except Exception:  # noqa: BLE001
+            log.exception("preparing the TFTP folder failed")
+
     # ------------------------------------------------------------ LAN peers
     def _start_lan(self) -> None:
         """LAN peer discovery + throughput server (``tnt.lanpeers.LanPeers``, ``engine.lan``).
@@ -740,6 +869,35 @@ class Engine:
         except Exception as exc:  # noqa: BLE001
             self.lan = None
             self._fail("lan", exc)
+
+    # ------------------------------------------------------------ switch port + packet capture
+    def _start_switchport(self) -> None:
+        """The switch port finder (``tnt.switchport.SwitchPortFinder``, ``engine.switchport``): constructed only; Packet
+        Monitor runs only while a search does."""
+        try:
+            from .switchport import SwitchPortFinder
+
+            self.switchport = SwitchPortFinder(self.bus, generation_fn=self._net_generation)
+        except Exception as exc:  # noqa: BLE001
+            self.switchport = None
+            self._fail("switchport", exc)
+
+    def _start_capture(self) -> None:
+        """Packet capture (``tnt.capture.CaptureManager``, ``engine.capture``): constructed, then ``recover()`` runs on
+        the daemon thread ``tnt-pktmon-recover`` (a Packet Monitor session a crash left behind is stopped and the saved
+        captures are counted).  ``start()`` never waits for it."""
+        try:
+            from .capture import CaptureManager
+
+            self.capture = CaptureManager(self.bus)
+        except Exception as exc:  # noqa: BLE001
+            self.capture = None
+            self._fail("capture", exc)
+            return
+        try:
+            threading.Thread(target=self.capture.recover, name="tnt-pktmon-recover", daemon=True).start()
+        except Exception:  # noqa: BLE001 - capture still works; a leftover session is cleaned up at the next start
+            log.exception("starting the Packet Monitor clean-up failed")
 
     # ------------------------------------------------------------ network changes
     def _start_netwatch(self) -> None:
@@ -833,7 +991,7 @@ class Engine:
             self._disc_defaults_ts = 0.0
             if self._disc_thread is not None and self._disc_thread.is_alive():
                 self._disc_net_changed = True
-        for name in ("networks", "ping", "outages", "linkmap", "lan", "dhcp", "reports"):
+        for name in ("networks", "ping", "outages", "linkmap", "natcheck", "lan", "dhcp", "tftp", "switchport", "reports"):
             # networks first: the samples, outages and reports that follow are tagged with the network identified now
             fn = getattr(getattr(self, name, None), "on_network_change", None)
             if not callable(fn):
@@ -1014,6 +1172,12 @@ class Engine:
                     log.info("raw ping log trim removed %d file(s)", n)
             except Exception:  # noqa: BLE001
                 log.exception("raw log trim failed")
+        capture = getattr(self, "capture", None)
+        if capture is not None:
+            try:
+                capture.enforce_retention(now)      # the newest 10 captures, at most 2 GB and 7 days
+            except Exception:  # noqa: BLE001
+                log.exception("packet capture retention failed")
         if scheduled and self.db is not None and _dt.datetime.fromtimestamp(now).weekday() == 6:
             try:
                 t0 = time.monotonic()
@@ -1110,6 +1274,53 @@ class Engine:
         self._publish("monitoring.paused", {"paused": state})
         self._db_event("info", "monitoring", "paused" if state else "resumed")
         return state
+
+    def ip_release_renew(self) -> Dict[str, Any]:
+        """The top bar's IP Release/Renew: ``tnt.nettools.release_renew()`` with monitoring paused around it (see the
+        module docstring).  RENEW_RESULT with ``paused_monitoring``; ``RuntimeError`` while one is running."""
+        if not self._renew_lock.acquire(blocking=False):
+            raise RuntimeError("An IP release/renew is already running")
+        try:
+            from . import nettools
+
+            paused_here = False
+            if self.ping is not None and not bool(getattr(self.ping, "paused", False)):
+                try:
+                    # the seconds without an address are a monitoring gap, not an outage
+                    paused_here = bool(self.set_paused(True))
+                except Exception:  # noqa: BLE001 - never a reason not to renew
+                    log.exception("pausing monitoring for the IP release/renew failed")
+            try:
+                result = nettools.release_renew()
+            finally:
+                if paused_here:
+                    try:
+                        self.set_paused(False)
+                    except Exception:  # noqa: BLE001
+                        log.exception("resuming monitoring after the IP release/renew failed")
+                self._addresses_changed()
+            result["paused_monitoring"] = paused_here
+            return result
+        finally:
+            self._renew_lock.release()
+
+    def _addresses_changed(self) -> None:
+        """This PC's addresses were just changed on purpose: drop both netinfo caches and make the network watcher
+        look at once, so Network info follows without waiting for the next poll."""
+        with self._netinfo_lock:
+            self._netinfo_cache = None
+            self._netinfo_cache_ts = 0.0
+        try:
+            from . import netinfo  # lazy: optional at runtime
+
+            netinfo._invalidate_cache()
+        except Exception:  # noqa: BLE001
+            log.exception("dropping the netinfo cache failed")
+        if getattr(self, "netwatch", None) is not None:
+            try:
+                self.netwatch.poll_soon()
+            except Exception:  # noqa: BLE001
+                log.exception("waking the network watcher failed")
 
     def add_target(self, host: str, label: Optional[str] = None) -> Dict[str, Any]:
         pm = self.ping

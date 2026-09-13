@@ -276,9 +276,10 @@ JOB_PHASE = {"speed": "speed", "discovery": "discovery", "wifi": "wifi", "histor
 #: the part of the job's 0..100 each phase covers
 PHASE_PCT = {"speed": (0.0, 35.0), "discovery": (35.0, 70.0), "wifi": (70.0, 90.0), "history": (90.0, 97.0),
              "save": (97.0, 100.0)}
-#: a phase's own progress mapped onto its part: speed-test steps and discovery phases
-SPEED_STEPS = {"connect": (0.0, 0.05), "latency": (0.05, 0.15), "download": (0.15, 0.6), "upload": (0.6, 1.0),
-               "done": (1.0, 1.0)}
+#: a phase's own progress mapped onto its part: speed-test steps and discovery phases (a speed test with the
+#: latency-under-load probe starts with its 3 s idle ``baseline``; without one it starts at ``connect``)
+SPEED_STEPS = {"baseline": (0.0, 0.05), "connect": (0.05, 0.05), "latency": (0.05, 0.15), "download": (0.15, 0.6),
+               "upload": (0.6, 1.0), "done": (1.0, 1.0)}
 DISCOVERY_STEPS = {"ping": (0.0, 0.3), "ports": (0.3, 0.85), "arp": (0.85, 0.9), "resolve": (0.9, 1.0),
                    "done": (1.0, 1.0)}
 BANDS: Tuple[str, ...] = ("2.4", "5", "6")

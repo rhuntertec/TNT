@@ -262,6 +262,15 @@ try {
             Write-Step "Code signing: setup exe"
             Invoke-Sign -Files @($SetupExe)
         }
+
+        # ---- 11. SHA-256 checksum (the auto-updater verifies the download against this) ----
+        # Hash the FINAL exe (after signing). Publish this .sha256 as a release asset next to the exe;
+        # tnt.updater refuses to install a download whose SHA-256 does not match it.
+        Write-Step "SHA-256 checksum: setup exe"
+        $Sha256File = $SetupExe + ".sha256"
+        $Hash = (Get-FileHash -Algorithm SHA256 -Path $SetupExe).Hash.ToLower()
+        Set-Content -Path $Sha256File -Value ("{0}  {1}" -f $Hash, (Split-Path -Leaf $SetupExe)) -Encoding ascii -NoNewline
+        Write-Host ("wrote {0} ({1})" -f $Sha256File, $Hash)
     }
 
     # ---- summary ---------------------------------------------------------------------
@@ -270,6 +279,7 @@ try {
     Write-Host ("  service : {0}" -f $ServiceExe)
     Write-Host ("  client  : {0}" -f $ClientExe)
     if ($SetupExe) { Write-Host ("  setup   : {0}" -f $SetupExe) }
+    if ($SetupExe -and (Test-Path ($SetupExe + ".sha256"))) { Write-Host ("  sha256  : {0}" -f ($SetupExe + ".sha256")) }
     if ($SkipSign) {
         Write-Warning "Unsigned build: Windows SmartScreen will warn when the installer is run. Configure TNT_SIGN_THUMBPRINT or TNT_SIGN_PFX for release builds."
     }

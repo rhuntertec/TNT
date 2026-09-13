@@ -58,6 +58,18 @@
     report: '<svg ' + S + '><path d="M9 3.6h6v2.8H9z" stroke-linejoin="round"/><path d="M9 5H6.6A1.6 1.6 0 0 0 5 6.6v12.8A1.6 1.6 0 0 0 6.6 21h10.8a1.6 1.6 0 0 0 1.6-1.6V6.6A1.6 1.6 0 0 0 17.4 5H15"/><path d="M8.6 16.6v-2.4M12 16.6v-5M15.4 16.6v-3.4"/></svg>',
     // two opposite arrows: swap the two reports of a comparison
     swap: '<svg ' + S + '><path d="M4 8.2h14.6M15 4.6l3.6 3.6-3.6 3.6"/><path d="M20 15.8H5.4M9 12.2l-3.6 3.6L9 19.4"/></svg>',
+    // a globe with a meridian and the equator: the DNS card (names on the internet)
+    dns: '<svg ' + S + '><circle cx="12" cy="12" r="8.8"/><path d="M3.2 12h17.6"/><path d="M12 3.2c2.5 2.4 3.7 5.3 3.7 8.8s-1.2 6.4-3.7 8.8c-2.5-2.4-3.7-5.3-3.7-8.8s1.2-6.4 3.7-8.8z"/></svg>',
+    // a broom with two specks of dust: Flush DNS in the top bar
+    flush: '<svg ' + S + '><path d="M20 3.2l-7.4 7.4"/><path d="M10.5 9.3l3.4 3.4-3.7 6.2-5.9-5.9z" stroke-linejoin="round"/><path d="M8.3 10.6l4.3 4.3"/><path d="M3.2 17.4h.01M6.2 20.4h.01"/></svg>',
+    // two arrows chasing each other round: IP Release/Renew in the top bar
+    renew: '<svg ' + S + '><path d="M19.6 10.2A7.8 7.8 0 0 0 5.4 7.4"/><path d="M5 3.6v4.2h4.2"/><path d="M4.4 13.8a7.8 7.8 0 0 0 14.2 2.8"/><path d="M19 20.4v-4.2h-4.2"/></svg>',
+    // a chevron pointing right, turned down while its card is open: the collapsible Tools cards and the DNS card's Details
+    chevron: '<svg ' + S + '><path d="M9.2 5.4 15.8 12l-6.6 6.6"/></svg>',
+    // a file with a folded corner and an arrow up and an arrow down on it: the TFTP server card (files to and from devices)
+    tftp: '<svg ' + S + '><path d="M7 3.4h6.8l5 5V19a1.6 1.6 0 0 1-1.6 1.6H7A1.6 1.6 0 0 1 5.4 19V5A1.6 1.6 0 0 1 7 3.4z" stroke-linejoin="round"/><path d="M13.6 3.6v5h5"/><path d="M9.8 17.8v-6.4M7.9 13.3l1.9-1.9 1.9 1.9"/><path d="M14.4 11.4v6.4M12.5 15.9l1.9 1.9 1.9-1.9"/></svg>',
+    // a magnifier over a waveform: the Packet capture card
+    capture: '<svg ' + S + '><circle cx="10.5" cy="10.5" r="6.6"/><path d="M15.6 15.6 21 21"/><path d="M6.2 10.8h1.6l1.2-2.6 1.8 5.2 1.4-3.8.9 1.2h1.5" stroke-width="2"/></svg>',
     // the same cylinder stick the easter egg throws: curved far end, elliptical cap with the
     // wick hole, curved seams and label band, fuse out of the cap, spark at the tip
     dynamite: '<svg viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">' +
@@ -131,6 +143,13 @@
     const sameDay = d.toDateString() === n.toDateString();
     return (sameDay ? 'Today' : MONTHS[d.getMonth()] + ' ' + d.getDate()) + ', ' + fmtClock(ts);
   }
+  // like fmtDateTime but the clock carries seconds (the Outages list's start time, to match the end time)
+  function fmtDateTimeSec(ts) {
+    if (ts == null) return '—';
+    const d = new Date(ts * 1000), n = new Date();
+    const sameDay = d.toDateString() === n.toDateString();
+    return (sameDay ? 'Today' : MONTHS[d.getMonth()] + ' ' + d.getDate()) + ', ' + fmtTime(ts);
+  }
   function fmtStamp(ts) { const d = new Date(ts * 1000); return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) + ' ' + fmtTime(ts); }
   function fmtDuration(s) {
     if (s == null || !isFinite(s)) return '—';
@@ -180,7 +199,7 @@
     el.classList.add('pop');
   }
   function targetName(t) { return t ? (t.label || t.host) : ''; }
-  TNT.util = { h, esc, nowS, fmtMs, fmtNum, fmtPct, fmtMbps, fmtClock, fmtTime, fmtDate, fmtDateTime, fmtStamp, fmtDuration, relTime, untilText, fmtBytes, ipKey, copyCode, pop, targetName, pad2 };
+  TNT.util = { h, esc, nowS, fmtMs, fmtNum, fmtPct, fmtMbps, fmtClock, fmtTime, fmtDate, fmtDateTime, fmtDateTimeSec, fmtStamp, fmtDuration, relTime, untilText, fmtBytes, ipKey, copyCode, pop, targetName, pad2 };
 
   /* ================================================================== ui */
   const $ = (sel, root) => (root || document).querySelector(sel);
@@ -458,6 +477,7 @@
     notifyView();
     renderSettingsGateway();
     renderSettingsGeoip();
+    renderSettingsUpdate();
     // a newer network generation than this page has seen (the event was missed: stream down, PC asleep,
     // window hidden) or a restarted service: the same refresh as the event, the toast only for a change
     if (net.changed) {
@@ -559,6 +579,102 @@
     const show = geoipRetryVisible();
     if (btn && btn.hidden === show) btn.hidden = !show;
   }
+
+  /* ---- auto-update (GitHub releases): a dismissible banner + the Settings › Updates section ---- */
+  const UPDATE_DISMISS_KEY = 'tnt.update.dismissed';   // per-viewer: a version they chose to hide the banner for
+  const UPDATE_BUSY_STATES = ['checking', 'downloading', 'verifying', 'installing'];
+  function updateState() { return (state.status && state.status.update) || null; }
+  /** Pure: what the top banner shows for an update STATUS -> { show, version, notesUrl, installing, text, hasAsset }. */
+  function updateBannerView(u) {
+    if (!u || !u.enabled || !u.latest_version) return { show: false };
+    const busyNow = u.state === 'downloading' || u.state === 'verifying' || u.state === 'installing';
+    if (!(u.state === 'available' || u.state === 'ready' || busyNow)) return { show: false };
+    let dismissed = null;
+    try { dismissed = localStorage.getItem(UPDATE_DISMISS_KEY); } catch (e) { /* storage may be unavailable */ }
+    if (!busyNow && dismissed === u.latest_version) return { show: false };
+    const dl = u.download || null;
+    const pct = dl && dl.total ? Math.min(100, Math.round(100 * (dl.received || 0) / dl.total)) : null;
+    const text = u.state === 'downloading' ? (pct != null ? 'Downloading… ' + pct + '%' : 'Downloading…')
+      : u.state === 'verifying' ? 'Verifying…'
+      : u.state === 'installing' ? 'Installing… TNT will close and reopen' : '';
+    return { show: true, version: u.latest_version, notesUrl: u.notes_url || null, installing: busyNow,
+             text, hasAsset: !!(u.asset && u.asset.name) };
+  }
+  function renderUpdateBanner() {
+    const el = $('#update-banner');
+    if (!el) return;
+    const v = updateBannerView(updateState());
+    if (!v.show) { if (!el.hidden) { el.hidden = true; el.innerHTML = ''; el.dataset.sig = ''; } return; }
+    const sig = v.version + '|' + v.installing + '|' + (v.text || '') + '|' + v.hasAsset + '|' + !!v.notesUrl;
+    if (el.dataset.sig === sig && !el.hidden) return;   // spare the button's focus/hover on unrelated repaints
+    el.dataset.sig = sig;
+    el.hidden = false;
+    el.innerHTML = '';
+    el.appendChild(h('div', { class: 'update-banner-msg' }, iconEl('download'),
+      h('span', null, h('strong', null, 'Update available'), ' — TNT ', h('strong', null, v.version))));
+    const right = h('div', { class: 'update-banner-actions' });
+    if (v.installing) {
+      right.appendChild(h('span', { class: 'muted' }, v.text || 'Working…'));
+    } else {
+      if (v.notesUrl) right.appendChild(h('a', { class: 'update-banner-link', href: v.notesUrl,
+        on: { click: (e) => openExternal(v.notesUrl, e) } }, 'Release notes'));
+      const install = h('button', { class: 'btn btn-primary btn-sm', type: 'button', disabled: !v.hasAsset,
+        title: v.hasAsset ? '' : 'This release has no installer to download' }, 'Install');
+      install.addEventListener('click', () => startUpdateInstall(v.version));
+      right.appendChild(install);
+      const dismiss = h('button', { class: 'btn btn-icon btn-sm', type: 'button', 'aria-label': 'Dismiss', title: 'Dismiss' }, iconEl('close'));
+      dismiss.addEventListener('click', () => {
+        try { localStorage.setItem(UPDATE_DISMISS_KEY, v.version); } catch (e) { /* ignore */ }
+        el.hidden = true; el.innerHTML = ''; el.dataset.sig = '';
+      });
+      right.appendChild(dismiss);
+    }
+    el.appendChild(right);
+  }
+  async function startUpdateInstall(version) {
+    const ok = await confirmDialog({ title: 'Install update?',
+      message: 'TNT ' + version + ' will download and verify, then TNT closes and reopens to install it. '
+        + 'Background monitoring resumes on its own. Continue?', ok: 'Install', cancel: 'Not now' });
+    if (!ok) return;
+    // arm the client to reopen its window after the installer replaces it (a no-op outside the TNT client)
+    try {
+      const b = window.pywebview && window.pywebview.api;
+      if (b && typeof b.arm_relaunch === 'function') { const r = b.arm_relaunch(); if (r && r.catch) r.catch(() => {}); }
+    } catch (e) { /* ignore */ }
+    try {
+      await api.updateInstall();
+      toast('Downloading the update…', 'ok');
+      renderUpdateBanner();
+      renderSettingsUpdate();
+    } catch (err) {
+      toast('Could not start the update: ' + (err && err.message ? err.message : err), 'error');
+    }
+  }
+  /** Pure: the Settings › Updates status line for an update STATUS at time `now`. */
+  function updateSettingsText(u, now) {
+    if (!u) return '';
+    if (!u.enabled) return 'Off: TNT does not check for updates.';
+    const cur = 'This build: TNT ' + (u.current_version || '?');
+    const when = u.checked_ts ? ' · checked ' + relTime(u.checked_ts, now) : '';
+    switch (u.state) {
+      case 'checking': return 'Checking for updates…';
+      case 'downloading': { const dl = u.download || {}; const pct = dl.total ? ' ' + Math.round(100 * (dl.received || 0) / dl.total) + '%' : ''; return 'Downloading TNT ' + (u.latest_version || '') + pct; }
+      case 'verifying': return 'Verifying TNT ' + (u.latest_version || '') + '…';
+      case 'installing': return 'Installing TNT ' + (u.latest_version || '') + '… TNT will close and reopen.';
+      case 'available': case 'ready': return 'Update available: TNT ' + (u.latest_version || '') + (u.error ? ' · ' + u.error : '');
+      case 'error': return 'Last check failed: ' + (u.error || 'unknown error') + '.';
+      case 'up_to_date': return 'Up to date. ' + cur + when + '.';
+      default: return cur + when + '.';
+    }
+  }
+  function renderSettingsUpdate() {
+    const u = updateState();
+    const el = $('#settings-update');
+    if (el) { const t = updateSettingsText(u, state.now); if (el.textContent !== t) el.textContent = t; }
+    const btn = $('#settings-update-check');
+    const busyNow = !!(u && UPDATE_BUSY_STATES.indexOf(u.state) >= 0);
+    if (btn) btn.disabled = busyNow || !(u && u.enabled);
+  }
   async function loadSettings() {
     try {
       state.settings = await api.settings();
@@ -567,7 +683,7 @@
   }
 
   /* ============================================================== render */
-  function renderAll() { renderHeader(); renderTiles(); }
+  function renderAll() { renderHeader(); renderTiles(); renderUpdateBanner(); }
 
   function overallText() {
     const st = state.status;
@@ -621,7 +737,7 @@
   const PING_TILE_MAX = 6;   // lights shown on the Ping tile (3 columns x 2 rows)
   const SLUGGISH_MS = 100;   // header says "looking sluggish" only from this 1-minute average up
   // the Tools tile names the tools under the DHCP server, in the order of their cards on the Tools page
-  const TOOLS_TILE_ITEMS = ['LAN throughput', 'Traceroute', 'Subnet calc', 'WiFi passwords'];
+  const TOOLS_TILE_ITEMS = ['LAN throughput', 'Port forward', 'Traceroute', 'TFTP server', 'Subnet calc', 'DNS', 'Packet capture', 'WiFi passwords'];
   function line(html, cls, title) { return '<div class="tile-line ' + (cls || '') + '"' + (title ? ' title="' + esc(title) + '"' : '') + '>' + html + '</div>'; }
   /** The most serious problem of a status.netinfo adapter (its `warnings` codes, labelled like the Network info
    *  page) as a badge for the Network info tile; '' without one. The informational grey ones stay on the page. */
@@ -756,7 +872,7 @@
       } else html = line('Nothing found yet — hit Scan', 'muted');
       if (el.dataset.html !== html) { el.innerHTML = html; el.dataset.html = html; }
     }
-    // Tools: the DHCP server's state, then the other tools by name
+    // Tools: the DHCP server's state, the TFTP server's while it runs or has an error, then the other tools by name
     {
       const el = tileEls.tools;
       const d = st && st.dhcp;
@@ -773,8 +889,17 @@
             '', 'Pool ' + (p.start || '?') + '–' + (p.end || '?')) +
             line('on ' + esc(d.adapter || 'adapter') + ' · since ' + esc(relTime(d.since_ts, now)), 'muted');
         } else html = line('<span class="strong">DHCP server</span> <span class="muted">off</span>');
-        // two columns where the tile is wide enough (rows of four or fewer), one where it is not: the list stays as
-        // tall as the other tiles' three lines instead of stretching its row (5 lines were 192 px next to 155 px)
+        // the TFTP server (status.tftp, its summary) gets a line of its own while it runs: green "on", yellow "uploads on". Its
+        // error (a start that failed, or a network change that stopped it) is only set while it is off, so the red "error" line
+        // shows then, with the error as the hover title, until the server starts again
+        const t = st.tftp;
+        if (t && (t.running || t.error)) {
+          const badge = t.error ? '<span class="badge red">error</span>' : t.uploads ? '<span class="badge yellow">uploads on</span>' : '<span class="badge green">on</span>';
+          html += line('<span class="strong">TFTP server</span> ' + badge, '', t.error ? String(t.error) : '');
+        }
+        // two columns where the tile is wide enough (rows of four or fewer), one where it is not: the seven names take four
+        // lines instead of seven (the tile's row is 192 px at 1366 px, 219 px with the TFTP line, next to the first row's
+        // 155 px; one per line is taller)
         html += '<div class="tile-tools">' + TOOLS_TILE_ITEMS.map((name) => line(esc(name), 'tile-tool')).join('') + '</div>';
       }
       if (el.dataset.html !== html) { el.innerHTML = html; el.dataset.html = html; }
@@ -795,7 +920,9 @@
           for (let i = 1; i <= 4; i++) bars += '<span' + (i <= t.bars ? ' class="on"' : '') + '></span>';
           bars += '</span>';
           html += line('<span class="strong tile-ellipsis" title="' + esc(t.name) + '">' + esc(t.name) + '</span>');
-          html += line(bars + '<span class="strong">' + esc(wc.dbmText(t.rssi)) + '</span><span class="muted">' + (t.connected ? 'connected' : 'strongest') + '</span>');
+          // the link speed of the connection sits between the signal and "connected"
+          html += line(bars + '<span class="strong">' + esc(wc.dbmText(t.rssi)) + '</span>' + (t.rate ? '<span class="strong">' + esc(wc.mbpsText(t.rate)) + '</span>' : '') +
+            '<span class="muted">' + (t.connected ? 'connected' : 'strongest') + '</span>');
         } else html += line('Nothing in range right now', 'muted');
       } else if (sum.kind === 'waiting' || sum.kind === 'starting') {
         html = line(esc(sum.headline), 'muted');
@@ -1016,7 +1143,7 @@
     ipv6T.input.setAttribute('aria-label', 'Show IPv6 addresses');
     body.appendChild(group('Appearance', [
       settingRow('Theme', 'Remembered on this PC and in the service settings.', themeT),
-      settingRow('IPv6 addresses', 'Show IPv6 addresses and subnets on the Network info page.', ipv6T),
+      settingRow('IPv6 addresses', 'Show IPv6 addresses and subnets on the Network info page, and IPv6 addresses in DNS lookups on the Tools page.', ipv6T),
     ]));
 
     // IP location (DB-IP Lite): on by default; the service downloads the data
@@ -1033,6 +1160,38 @@
     body.appendChild(group('IP location', [
       settingRow('Location and ISP', 'Shows the internet provider and city of the public address on Network info and a Location column in Traceroute. The service downloads DB-IP’s free IP location data (CC BY 4.0): about 65 MB a month, about 140 MB on disk. Addresses are looked up on this PC only.', geoT),
       h('div', { class: 'geo-status' }, h('span', { id: 'settings-geoip', role: 'status' }, geoipStatusText()), geoRetry, geoAttribution(), geoLicence()),
+    ]));
+
+    // Updates (GitHub releases): check, notify and self-install; the download is verified (SHA-256) before it runs
+    const up = s.update || {};
+    const upOn = up.enabled !== false;
+    const upT = toggle({ checked: upOn, on: 'On', off: 'Off', accent: 'var(--green)',
+      onChange: (v, input) => saveSettings({ update: { enabled: v } }, v ? 'Update checks on' : 'Update checks off').then((ok) => { if (!ok) input.checked = !v; }) });
+    upT.input.setAttribute('aria-label', 'Check for updates');
+    const upAutoT = toggle({ checked: up.auto_install === true, on: 'Auto', off: 'Ask', accent: 'var(--green)',
+      onChange: (v, input) => saveSettings({ update: { auto_install: v } }, v ? 'Updates install automatically' : 'Updates ask before installing').then((ok) => { if (!ok) input.checked = !v; }) });
+    upAutoT.input.setAttribute('aria-label', 'Install updates automatically');
+    const upEvery = h('input', { class: 'input', type: 'number', min: '1', max: '168', step: '1', value: String(up.check_interval_h || 24), style: { width: '120px' }, 'aria-label': 'Check interval in hours' });
+    upEvery.addEventListener('change', () => {
+      const v = Math.max(1, Math.min(168, parseInt(upEvery.value, 10) || 24));
+      upEvery.value = String(v);
+      saveSettings({ update: { check_interval_h: v } }, 'Checking every ' + v + ' h');
+    });
+    const upChannel = h('select', { class: 'input', 'aria-label': 'Update channel' },
+      [['stable', 'Stable releases'], ['prerelease', 'Include pre-releases']].map(([v, l]) => h('option', { value: v, selected: (up.channel || 'stable') === v }, l)));
+    upChannel.addEventListener('change', () => saveSettings({ update: { channel: upChannel.value } }, 'Channel: ' + upChannel.options[upChannel.selectedIndex].text));
+    const upCheck = h('button', { class: 'btn', id: 'settings-update-check', type: 'button' }, 'Check now');
+    upCheck.addEventListener('click', () => {
+      upCheck.disabled = true;
+      api.updateCheck().then(() => renderSettingsUpdate(), () => toast('Could not check for updates', 'error'))
+        .then(() => renderSettingsUpdate());
+    });
+    body.appendChild(group('Updates', [
+      settingRow('Check for updates', 'Watches this project’s GitHub releases page. When a newer release is out, a banner offers to install it. The installer is verified against the release’s SHA-256 checksum before it runs.', upT),
+      settingRow('When an update is found', 'Ask (show the banner and wait for you) or install automatically at the next check.', upAutoT),
+      settingRow('Check every', 'Hours between checks (1–168).', h('div', { class: 'row' }, upEvery, h('span', { class: 'muted small' }, 'h'))),
+      settingRow('Channel', 'Stable releases only, or include pre-releases for early builds.', upChannel),
+      h('div', { class: 'geo-status' }, h('span', { id: 'settings-update', role: 'status' }, updateSettingsText(updateState(), state.now)), upCheck),
     ]));
 
     // Speed tests
@@ -1333,6 +1492,80 @@
     });
   }
 
+  /* ========================================================= quick tools */
+  // The top bar's IP Release/Renew and Flush DNS run their tool on the service with one click. While it runs the button is
+  // disabled and says so ("Renewing…"); then its background flashes green (done) or red (failed or refused, with a toast:
+  // api.quick.outcome). A release/renew changes this PC's addresses: the status and the open view's netChanged hook run as
+  // soon as it answers, not after the settle delay of a net.changed event (the one the service publishes still comes).
+  const QUICK_FLASH_MS = 1600;
+  const QUICK_TOOLS = {
+    // the service answers a release/renew once every DHCP adapter is done: a couple of minutes when a DHCP server does not answer
+    renew: { id: 'btn-ip-renew', busyLabel: 'Renewing…', run: () => api.ipRenew(),
+      busyTitle: "Releasing and renewing this PC's IP addresses… this can take a couple of minutes when a DHCP server does not answer" },
+    flush: { id: 'btn-flush-dns', busyLabel: 'Flushing…', run: () => api.flushDns(), busyTitle: "Flushing this PC's DNS cache…" },
+  };
+  const quickState = { renew: { busy: false, timer: null }, flush: { busy: false, timer: null } };
+  // the service pauses monitoring around a release/renew: its monitoring.paused events are part of the renew, not news, so they
+  // show no toast while it runs and for a few seconds after it answers (the resume can arrive just after the reply)
+  const RENEW_QUIET_MS = 5000;
+  let quietPauseUntil = 0;
+
+  /** A quick tool's button while it runs: disabled, aria-busy, the short label and a tooltip saying what it waits for, kept at
+   *  the width it had. */
+  function quickBusy(btn, tool, on) {
+    const label = btn.querySelector('.quick-label');
+    if (on) {
+      btn.style.minWidth = btn.offsetWidth + 'px';
+      if (label) { label.dataset.idle = label.textContent; label.textContent = QUICK_TOOLS[tool].busyLabel; }
+      btn.title = QUICK_TOOLS[tool].busyTitle;
+      btn.setAttribute('aria-busy', 'true');
+    } else {
+      btn.style.minWidth = '';
+      if (label && label.dataset.idle !== undefined) { label.textContent = label.dataset.idle; delete label.dataset.idle; }
+      btn.removeAttribute('aria-busy');
+    }
+    btn.disabled = on;
+  }
+
+  /** The green (done) or red (failed) flash of a button's background; another flash starts it over. */
+  function quickFlash(btn, tool, ok) {
+    const st = quickState[tool];
+    btn.classList.remove('flash-ok', 'flash-bad');
+    void btn.offsetWidth;
+    btn.classList.add(ok ? 'flash-ok' : 'flash-bad');
+    if (st.timer) clearTimeout(st.timer);
+    st.timer = setTimeout(() => { st.timer = null; btn.classList.remove('flash-ok', 'flash-bad'); }, QUICK_FLASH_MS);
+  }
+
+  /** Runs a quick tool ('renew' | 'flush'); a click while it runs is ignored. */
+  async function quickRun(tool) {
+    const q = QUICK_TOOLS[tool], st = quickState[tool];
+    const btn = q ? $('#' + q.id) : null;
+    if (!btn || st.busy) return;
+    st.busy = true;
+    if (btn.dataset.idleTitle === undefined) btn.dataset.idleTitle = btn.title;
+    const hadFocus = document.activeElement === btn;
+    quickBusy(btn, tool, true);
+    if (tool === 'renew') quietPauseUntil = Infinity;
+    let result = null, error = null;
+    try { result = await q.run(); } catch (err) { error = err; }
+    st.busy = false;
+    if (tool === 'renew') quietPauseUntil = Date.now() + RENEW_QUIET_MS;
+    quickBusy(btn, tool, false);
+    if (hadFocus && document.activeElement === document.body) { try { btn.focus(); } catch (e) { /* ignore */ } }
+    const o = api.quick.outcome(tool, result, error);
+    quickFlash(btn, tool, o.ok);
+    toast(o.text, o.kind, o.ok ? 4000 : 8000);
+    const ts = result && typeof result.ts === 'number' ? result.ts : nowS();
+    btn.title = btn.dataset.idleTitle + '\nLast run ' + fmtTime(ts) + (o.ok ? ': done' : ': failed');
+    if (tool !== 'renew') return;
+    // done or not, this PC's addresses may have changed: the header, the tiles and the open page read them now
+    refreshStatus();
+    if (current.view && current.view.netChanged) {
+      try { current.view.netChanged({ source: 'renew', changes: [] }, state); } catch (e) { console.error('view netChanged failed', e); }
+    }
+  }
+
   /* ================================================================ SSE */
   let lightsDirty = false;
   function wireEvents() {
@@ -1395,10 +1628,14 @@
     ev.on('settings.changed', () => { loadSettings(); refreshStatus(); });
     // DHCP server (Tools tile): dhcp.state carries the /status summary fields, leases bump the counts
     ev.on('dhcp.state', (d) => { if (state.status && d) { state.status.dhcp = Object.assign({}, state.status.dhcp || {}, d); renderTiles(); } });
+    // TFTP server (Tools tile): tftp.state carries its summary (running, uploads, error), merged the same way
+    ev.on('tftp.state', (d) => { if (state.status && d) { state.status.tftp = Object.assign({}, state.status.tftp || {}, d); renderTiles(); } });
     // IP location: geoip.state is STATUS (the service adds its bus ts to every SSE payload; the development server does not)
     ev.on('geoip.state', (d) => { if (state.status && d) { const { ts, ...st } = d; state.status.geoip = Object.assign({}, state.status.geoip || {}, st); renderSettingsGeoip(); notifyView(); } });
+    // auto-update: update.state is STATUS (the service adds its bus ts; the development server does not)
+    ev.on('update.state', (d) => { if (state.status && d) { const { ts, ...st } = d; state.status.update = Object.assign({}, state.status.update || {}, st); renderUpdateBanner(); renderSettingsUpdate(); } });
     ev.on('dhcp.lease', () => { if (state.status && state.status.dhcp && state.status.dhcp.running) refreshStatus(); });
-    ev.on('monitoring.paused', (d) => { refreshStatus(); if (d) toast(d.paused ? 'Monitoring paused' : 'Monitoring resumed', d.paused ? 'warn' : 'ok'); });
+    ev.on('monitoring.paused', (d) => { refreshStatus(); if (d && Date.now() >= quietPauseUntil) toast(d.paused ? 'Monitoring paused' : 'Monitoring resumed', d.paused ? 'warn' : 'ok'); });
     // Reports: the full scan's progress drives the controller (which runs the Wi-Fi part); saves, renames and deletions
     // refresh the tile's counts. The stream has no replay: a (re)connect reads the job again.
     ev.on('report.progress', (d) => { if (d && d.job) fullScan.apply(d.job); });
@@ -1425,6 +1662,8 @@
 
     $('#btn-settings').addEventListener('click', openSettings);
     $('#btn-full-scan').addEventListener('click', fullScanClick);
+    $('#btn-ip-renew').addEventListener('click', () => quickRun('renew'));
+    $('#btn-flush-dns').addEventListener('click', () => quickRun('flush'));
     fullScan.subscribe(onFullScanJob);
     renderFullScanButton();
     $('#diag-refresh').addEventListener('click', loadDiagnostics);
@@ -1465,7 +1704,7 @@
     document.addEventListener('visibilitychange', () => { if (!document.hidden) { refreshStatus(); if (TNT.charts) TNT.charts.rerenderAll(); } });
   }
 
-  TNT.app = { state, refreshStatus, loadSettings, showView, openSettings, showDiagnostics, setTheme, saveBlob, overallText, setTargets,
+  TNT.app = { state, refreshStatus, loadSettings, showView, openSettings, showDiagnostics, setTheme, saveBlob, overallText, setTargets, quickRun,
     fullScan, fullScanClick, openSiteModal, nameFullScan, loadReportsInfo: scheduleReportsInfo, siteModalOpen: () => !!siteModal };
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot); else boot();
 })();

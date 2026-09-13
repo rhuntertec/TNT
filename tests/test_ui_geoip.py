@@ -85,13 +85,13 @@ def test_ip_location_markup_and_css():
         assert not re.search(r"#[0-9A-Fa-f]{3,6}\b", _css_rule(css, sel)), f"hard-coded colour in {sel}"
     assert "flex-wrap: wrap" in _css_rule(css, ".geo-status") and "flex-wrap: wrap" in _css_rule(css, ".tr-attrib")
     assert "text-overflow: ellipsis" in _css_rule(css, ".lm-sub > span.muted")
-    # the ISP / Location values are sized like the address chips (12.5 px), not the 16 px body, so provider names fit
-    # the chip column; the size is not on .lm-sub > span.muted, which also matches the 11 px tags
-    assert "font-size: 12.5px" in _css_rule(css, ".linkmap code.copy")
+    # the ISP / Location values are sized like the address chips (11.5 px), not the 16 px body, so provider names fit
+    # the chip column; the size is not on .lm-sub > span.muted, which also matches the 9.5 px tags
+    assert "font-size: 11.5px" in _css_rule(css, ".linkmap code.copy")
     geo_value = _css_rule(css, ".lm-geo > span.muted:not(.lm-tag)")
-    assert "font-size: 12.5px" in geo_value and "font-weight: 700" in geo_value
+    assert "font-size: 11.5px" in geo_value and "font-weight: 700" in geo_value
     assert "font-size" not in _css_rule(css, ".lm-sub > span.muted")
-    assert "font-size: 11px" in _css_rule(css, ".lm-tag")
+    assert "font-size: 9.5px" in _css_rule(css, ".lm-tag")
     # the link map rules stay in the link map block, the traceroute ones in the tools block
     tools = css.index("tools: traceroute, LAN throughput, subnet calculator")
     assert css.index(".lm-attrib {") < tools < css.index(".tr-note {")

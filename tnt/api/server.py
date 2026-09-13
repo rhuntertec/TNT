@@ -18,6 +18,12 @@
   Every response carries ``Server: TNT/<version>``.  Errors raised by the stdlib
   request parser itself (bad request line, 414, 431, 501, 505) are rendered in
   the same JSON error shape as route errors.
+* Downloads: a route that returns a :class:`~tnt.api.routes.FileResponse` (a saved packet
+  capture) gets 200 with ``Content-Length``, ``Content-Disposition: attachment`` and the file
+  in :data:`FILE_CHUNK_BYTES` chunks (the headers only for HEAD).  The file object is closed on
+  every path, before its last chunk goes out, so a delete right after a finished download never
+  finds it open (Windows refuses to delete an open file); a failure after the headers only
+  closes the connection.
 * ``server_bind`` skips ``socket.getfqdn()`` (a reverse-DNS lookup the stdlib
   ``HTTPServer`` performs at bind time) so the API comes up instantly even when
   DNS is unreachable - which is exactly when TNT is needed.
@@ -40,16 +46,17 @@ import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Optional, Tuple
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 from .. import DEFAULT_PORT, __version__
-from .routes import ApiError, Request, Response, Router, StreamResponse, build_routes, json_response
+from .routes import ApiError, FileResponse, Request, Response, Router, StreamResponse, build_routes, json_response
 from .sse import HEARTBEAT_S, STOP, SseHub, event_payload, format_comment, format_event
 
 log = logging.getLogger(__name__)
 
 MAX_BODY_BYTES = 1024 * 1024
+FILE_CHUNK_BYTES = 64 * 1024  # a download (FileResponse) is copied to the client in chunks of this size
 #: Request body caps above MAX_BODY_BYTES, by exact API path (a trailing slash is ignored).
 BODY_LIMITS: Dict[str, int] = {"/api/reports/scan/wifi": 2 * 1024 * 1024}
 SSE_POLL_S = 1.0  # how often an idle SSE handler checks whether its client is still there
@@ -154,6 +161,13 @@ def is_loopback(ip: str) -> bool:
 def body_limit(path: str) -> int:
     """The largest request body accepted on *path* (:data:`BODY_LIMITS`, else :data:`MAX_BODY_BYTES`)."""
     return BODY_LIMITS.get(path.rstrip("/") or "/", MAX_BODY_BYTES)
+
+
+def _close_quietly(fileobj: Any) -> None:
+    try:
+        fileobj.close()
+    except Exception:  # noqa: BLE001
+        log.debug("closing a download's file failed", exc_info=True)
 
 
 def mime_for(path: Path) -> str:
@@ -377,6 +391,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                               headers={k.lower(): v for k, v in self.headers.items()}, body=body,
                               client=client_ip, peer=peer_addr, local=local_addr, raw_query=parts.query)
                 result = handler(req)
+                if isinstance(result, FileResponse):
+                    status = self._send_file(result, send_body)
+                    return
                 if isinstance(result, StreamResponse):
                     status = 200
                     if not send_body:  # HEAD: describe the stream, do not start it
@@ -458,6 +475,49 @@ class ApiHandler(BaseHTTPRequestHandler):
             self.wfile.write(resp.body)
         self.wfile.flush()
 
+    def _send_file(self, resp: FileResponse, send_body: bool) -> int:
+        """A download: the headers, then with *send_body* the file in :data:`FILE_CHUNK_BYTES` chunks.  The file object
+        is closed on every path: before the headers for HEAD, before its last chunk is written otherwise, and in
+        ``finally`` for a client that went away or an error.  Once the headers are out a failure only closes the
+        connection (no second response can follow them)."""
+        fileobj = resp.fileobj
+        headers_sent = False
+        try:
+            if not send_body:
+                _close_quietly(fileobj)
+            self.send_response(200)
+            self.send_header("Content-Type", resp.content_type)
+            self.send_header("Content-Length", str(resp.size))
+            self.send_header("Content-Disposition", f'attachment; filename="{resp.filename}"')
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            headers_sent = True
+            remaining = resp.size if send_body else 0
+            while remaining > 0:
+                chunk = fileobj.read(min(FILE_CHUNK_BYTES, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                if remaining <= 0:
+                    _close_quietly(fileobj)     # everything is read: a delete right after the download must not find it open
+                self.wfile.write(chunk)
+            if remaining > 0:
+                self.close_connection = True    # the file shrank: the client must not wait for the missing bytes
+            self.wfile.flush()
+        except Exception as exc:  # noqa: BLE001
+            if not headers_sent:
+                raise
+            self.close_connection = True
+            if isinstance(exc, (ConnectionError, TimeoutError)):
+                log.debug("client %s went away during a download: %s", self.client_address, exc)
+            else:
+                log.warning("a download failed after its headers were sent (%s)", type(exc).__name__)
+                log.debug("download of %s failed", resp.filename, exc_info=True)
+        finally:
+            _close_quietly(fileobj)
+        return 200
+
     # -- static files ----------------------------------------------------------
     def _serve_static(self, path: str, send_body: bool) -> int:
         api = self.server.api
@@ -491,11 +551,17 @@ class ApiHandler(BaseHTTPRequestHandler):
         return 200
 
     # -- SSE -------------------------------------------------------------------
-    def serve_sse(self) -> None:
-        """Stream bus events until the client disconnects or the server stops."""
+    def serve_sse(self, admin_events: Iterable[str] = (), admin_check: Optional[Callable[[], bool]] = None) -> None:
+        """Stream bus events until the client disconnects or the server stops.
+
+        The event types in *admin_events* (``capture.state``: the packet capture job, which every capture route shows only
+        to a Windows administrator) go out only when *admin_check* says this client is one.  It is asked once per stream,
+        at the first such event; no check, or one that raises, leaves those events out."""
         api = self.server.api
         hub = api.hub
         q = hub.subscribe()
+        private = frozenset(admin_events)
+        admin: Optional[bool] = None
         self.close_connection = True
         try:
             self.send_response(200)
@@ -525,7 +591,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                     break
                 if not isinstance(ev, dict):
                     continue
-                self.wfile.write(format_event(str(ev.get("type", "event")), event_payload(ev)))
+                kind = str(ev.get("type", "event"))
+                if kind in private:
+                    if admin is None:
+                        admin = self._sse_admin(admin_check)
+                    if not admin:
+                        continue
+                self.wfile.write(format_event(kind, event_payload(ev)))
                 self.wfile.flush()
                 last_write = time.monotonic()
         except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, TimeoutError, OSError) as exc:
@@ -534,6 +606,17 @@ class ApiHandler(BaseHTTPRequestHandler):
             log.exception("SSE stream failed for %s", self.client_address)
         finally:
             hub.unsubscribe(q)
+
+    @staticmethod
+    def _sse_admin(check: Optional[Callable[[], bool]]) -> bool:
+        """Whether a stream may carry the administrator-only events; False without a check or when it raises."""
+        if check is None:
+            return False
+        try:
+            return bool(check())
+        except Exception:  # noqa: BLE001 - failing closed: the events are left out, the stream goes on
+            log.exception("the event stream's administrator check failed")
+            return False
 
     def _peer_closed(self) -> bool:
         """True when the client socket is readable and yields EOF (client went away)."""
@@ -667,6 +750,7 @@ __all__ = [
     "ApiHTTPServer",
     "ApiServer",
     "BODY_LIMITS",
+    "FILE_CHUNK_BYTES",
     "MAX_BODY_BYTES",
     "body_limit",
     "describe_port_owner",

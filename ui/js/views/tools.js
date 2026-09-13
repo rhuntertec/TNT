@@ -1,11 +1,19 @@
 /* TNT — views/tools.js
-   Field tools. The first one is a DHCP server: a big on/off switch, a status badge, adapter /
-   pool / lease settings, a "check for other DHCP servers" probe with an inline result box, a
-   loud danger modal when another server is already active, and a realtime clients table built
-   on the shared host table (same columns as Discovery plus a Lease column and a forget button).
-   Below it, in this order: LAN throughput, Traceroute, the Subnet calculator and the saved
-   Wi-Fi networks — each one a card whose body comes from js/tools/*.js
-   (create() -> { body, head, mount, update, unmount }). */
+   Field tools, mounted in one order (CARD_ORDER): LAN throughput, Port forward, Traceroute, the DHCP
+   server, the TFTP server, the Subnet calculator, DNS, Packet capture and the saved Wi-Fi networks.
+   The DHCP server is special (its own builder here): a big on/off switch, a status badge, adapter /
+   pool / lease settings, a "check for other DHCP servers" probe with an inline result box, a loud
+   danger modal when another server is already active, and a realtime clients table built on the shared
+   host table (same columns as Discovery plus a Lease column and a forget button). Every other card's
+   body comes from js/tools/*.js (create(ctx) -> { body, head, mount, update, unmount, netChanged };
+   ctx.open() opens the card, which the TFTP server's switch calls when it is turned on, and the other
+   modules ignore ctx).
+   Every card, the DHCP server's included, is collapsible and starts collapsed: its title row opens
+   and closes it (a chevron button first in the row, or a click on the title), while the controls in
+   the row (the DHCP and TFTP switches, badges, a card's head element) never do and stay usable either
+   way. The cards the user opened stay open for the rest of the window's life (leaving Tools and coming
+   back keeps them; a reload starts collapsed again). The DHCP card opens by itself when the server is
+   switched on or has a new error or warning to show, the TFTP card when its server is switched on. */
 (function () {
   'use strict';
   const TNT = window.TNT;
@@ -16,12 +24,24 @@
   let table = null;
   let extras = [];            // the mounted tool modules below the DHCP card
 
+  // the tool cards below (all but the DHCP server, which has its own builder), in their relative order
   const EXTRA_CARDS = [
     { key: 'lan', title: 'LAN throughput', icon: 'lan', create: () => TNT.tools.lan.create() },
+    { key: 'portforward', title: 'Port forward', icon: 'target', create: (ctx) => TNT.tools.portforward.create(ctx) },
     { key: 'traceroute', title: 'Traceroute', icon: 'route', create: () => TNT.tools.traceroute.create() },
+    { key: 'tftp', title: 'TFTP server', icon: 'tftp', create: (ctx) => TNT.tools.tftp.create(ctx) },
     { key: 'subnet', title: 'Subnet calculator', icon: 'network', create: () => TNT.tools.subnetcalc.create() },
+    { key: 'dns', title: 'DNS', icon: 'dns', create: () => TNT.tools.dns.create() },
+    { key: 'capture', title: 'Packet capture', icon: 'capture', create: () => TNT.tools.capture.create() },
     { key: 'wifi', title: 'Saved Wi-Fi networks', icon: 'wifi', create: () => TNT.tools.wifi.create() },
   ];
+  // the full mount order, top to bottom, the DHCP server card ('dhcp', its own builder) among the modules above
+  const CARD_ORDER = ['lan', 'portforward', 'traceroute', 'dhcp', 'tftp', 'subnet', 'dns', 'capture', 'wifi'];
+  // the cards the user opened ('dhcp' and the keys above): module level, so they stay open when Tools is left and
+  // opened again; a reload starts with every card collapsed
+  let openCards = [];
+  let cardToggles = {};       // key -> { setOpen(open), isOpen() } of the mounted cards
+  let attentionShown = null;  // the DHCP card's last alert (dhcpAttention): only a new one opens the card by itself
   let status = null;          // last full STATUS DICT from /api/dhcp/status
   let busy = false;           // a start / stop request is in flight
   let busyMode = '';          // 'checking' | 'starting' | 'stopping'
@@ -102,6 +122,69 @@
     if (!w.readdressed) return [h('strong', null, w.name), rest];
     const i = rest.indexOf(w.address);
     return [h('strong', null, w.name), rest.slice(0, i), h('code', null, w.address), rest.slice(i + w.address.length)];
+  }
+
+  /** Pure: the open card keys after opening (`open` true) or closing the card `key`; the list is never changed in place. */
+  function withCardOpen(list, key, open) {
+    const out = (list || []).filter((k) => k !== key);
+    if (open) out.push(key);
+    return out;
+  }
+
+  /* Pure: the alert that opens the DHCP card by itself, as a key ("scan:…", "error:…", "firewall:…", "warning:…"), or null:
+     a pre-start scan that failed, an error, a firewall rule that could not be added, a warning the red scan box does not
+     already show. Not the red "internet connection" box (it is there whenever the picked adapter carries the internet,
+     server on or off), nor a finished scan's list of other servers (the user asked for that one). */
+  function dhcpAttention(st, scanErr) {
+    if (scanErr) return 'scan:' + scanErr;
+    if (!st || st.available === false) return null;
+    if (st.error) return 'error:' + st.error;
+    const fw = st.firewall || {};
+    if (fw.ok === false) return 'firewall:' + (fw.error || fw.rule || '');
+    const conflictShown = !!(st.scan && (st.scan.servers || []).length) && /^another dhcp server is active/i.test(st.warning || '');
+    return st.warning && !conflictShown ? 'warning:' + st.warning : null;
+  }
+
+  /* ------------------------------------------------- collapsible cards */
+  /** Makes a card open and close: a chevron button (aria-expanded / aria-controls) goes first in its title row and a click
+   *  anywhere in the row shows or hides `body`, except on a control there (`controls`: the DHCP switch and badge, a card's
+   *  head element; any button, link, field, label or badge), which never does and stays usable while the card is closed. */
+  function makeCollapsible(card, row, body, key, title, controls) {
+    const { h } = TNT.util;
+    body.id = 'tool-body-' + key;
+    const btn = h('button', { class: 'card-toggle', type: 'button', 'aria-expanded': 'false', 'aria-controls': body.id, 'aria-label': title }, TNT.ui.icon('chevron'));
+    row.insertBefore(btn, row.firstChild);
+    row.classList.add('card-head');
+    const setOpen = (open) => {
+      body.hidden = !open;
+      btn.setAttribute('aria-expanded', String(!!open));
+      btn.title = (open ? 'Hide ' : 'Show ') + title;
+      card.classList.toggle('collapsed', !open);
+      openCards = withCardOpen(openCards, key, !!open);
+    };
+    row.addEventListener('click', (e) => {
+      const t = e.target;
+      if (!(t instanceof Element) || (controls || []).some((c) => c && c.contains(t))) return;
+      const hit = t.closest('button, a, input, select, textarea, label, .badge');
+      if (hit && hit !== btn) return;
+      setOpen(body.hidden);
+    });
+    setOpen(openCards.includes(key));
+    cardToggles[key] = { setOpen, isOpen: () => !body.hidden };
+  }
+
+  /** Opens a mounted card (the DHCP card when the server is switched on or has something new to show, a tool card through the
+   *  ctx.open() its create got). */
+  function openCard(key) {
+    const c = cardToggles[key];
+    if (c && !c.isOpen()) c.setOpen(true);
+  }
+
+  /** Opens the DHCP card for an alert it has not shown yet; the same alert again leaves a card the user closed shut. */
+  function checkAttention() {
+    const att = dhcpAttention(status, scanError);
+    if (att && att !== attentionShown) openCard('dhcp');
+    attentionShown = att;
   }
 
   /* --------------------------------------------------------- rendering */
@@ -291,6 +374,7 @@
     box.appendChild(h('div', { class: 'scan-head' }, TNT.ui.icon('warning'), 'Could not check for other DHCP servers'));
     box.appendChild(h('div', { class: 'scan-meta' }, scanError, ' · The DHCP server was not started.'));
     box.hidden = false;
+    checkAttention();
   }
 
   function renderScan(scan) {
@@ -359,6 +443,7 @@
     renderScan(st.scan);
     renderClients();
     setInputsDisabled(busy);
+    checkAttention();
   }
 
   /* ------------------------------------------------------------ actions */
@@ -563,8 +648,9 @@
   function buildDhcpCard() {
     const { h } = TNT.util;
     els.badge = h('span', { class: 'badge grey' }, 'loading');
-    els.toggle = TNT.ui.toggle({ checked: false, on: 'On', off: 'Off', accent: 'var(--green)', onChange: (checked) => { if (checked) turnOn(false); else turnOff(); } });
-    els.toggle.classList.add('lg');
+    // switching the server on opens its card (the summary, the check for other servers and the clients are what to watch)
+    // the same size switch as the TFTP server's (and every other card's controls), not a bespoke large one
+    els.toggle = TNT.ui.toggle({ checked: false, on: 'On', off: 'Off', accent: 'var(--green)', onChange: (checked) => { if (checked) { openCard('dhcp'); turnOn(false); } else turnOff(); } });
     els.toggle.input.setAttribute('aria-label', 'DHCP server on or off');
     const titleRow = h('div', { class: 'switch-row' },
       h('div', { class: 'card-title' }, TNT.ui.icon('dhcp'), 'DHCP server'), els.badge, h('span', { class: 'spacer' }), els.toggle);
@@ -599,24 +685,35 @@
     els.refreshBtn = h('button', { class: 'btn btn-sm', type: 'button', title: 'Reload the client list', on: { click: () => loadStatus() } }, TNT.ui.icon('refresh'), 'Refresh');
     const tableWrap = h('div', { class: 'table-wrap' }, h('table', { class: 'table dhcp-table' }, table.thead, table.tbody));
 
-    els.card = h('div', { class: 'card' }, titleRow, els.summary, form, els.scanBox, els.inet, els.info, els.fw, els.err,
+    const body = h('div', { class: 'dhcp-body' }, els.summary, form, els.scanBox, els.inet, els.info, els.fw, els.err,
       h('hr', { class: 'divider', style: { margin: '18px 0 14px' } }),
       h('div', { class: 'card-title' }, els.clientsTitle, els.counts, h('span', { class: 'spacer' }), els.refreshBtn),
       tableWrap);
+    els.card = h('div', { class: 'card', data: { tool: 'dhcp' } }, titleRow, body);
+    makeCollapsible(els.card, titleRow, body, 'dhcp', 'DHCP server', [els.badge, els.toggle]);
     els.unavailable = h('div', { class: 'card', hidden: true }, TNT.ui.emptyState('The DHCP server is not available on this service'));
   }
 
-  /** One `.card` per entry of EXTRA_CARDS: icon + title (+ the module's head element, e.g. a badge) over its body. */
-  function buildExtraCards() {
+  /** The tool cards in CARD_ORDER: the DHCP server card (its own builder, els.card + els.unavailable) where the key is
+   *  'dhcp', and one collapsible `.card` per EXTRA_CARDS module elsewhere — icon + title (+ the module's head element, e.g.
+   *  a badge) over its body. Every module's create gets { open } to open its own card (the TFTP server's switch does, as
+   *  the DHCP server's does). Returns the ordered card elements and fills `extras` with the mounted modules. */
+  function buildCards() {
     const { h } = TNT.util;
+    const byKey = {};
+    for (const c of EXTRA_CARDS) byKey[c.key] = c;
     const cards = [];
     extras = [];
-    for (const c of EXTRA_CARDS) {
+    for (const key of CARD_ORDER) {
+      if (key === 'dhcp') { cards.push(els.card, els.unavailable); continue; }
+      const c = byKey[key];
       let mod;
-      try { mod = c.create(); }
+      try { mod = c.create({ open: () => openCard(c.key) }); }
       catch (e) { console.error('tool card failed', c.key, e); mod = { body: TNT.ui.emptyState('This tool failed to load. See the console.'), head: null }; }
       const title = h('div', { class: 'card-title' }, TNT.ui.icon(c.icon), c.title, mod.head || null);
-      cards.push(h('div', { class: 'card tool-card', data: { tool: c.key } }, title, mod.body));
+      const card = h('div', { class: 'card tool-card', data: { tool: c.key } }, title, mod.body);
+      makeCollapsible(card, title, mod.body, c.key, c.title, [mod.head]);
+      cards.push(card);
       extras.push(mod);
     }
     return cards;
@@ -629,11 +726,12 @@
       els = {};
       status = null; busy = false; busyMode = ''; dirty = false; loading = false; loadAgain = false; netPending = false; danger = null;
       unavailable = false; scanError = null;
+      cardToggles = {}; attentionShown = null;     // openCards stays: the cards opened before are built open
       const head = h('div', { class: 'section-head' }, h('h2', null, h('span', { class: 'section-accent' }), 'Tools'));
       buildDhcpCard();
-      const cards = buildExtraCards();
+      const cards = buildCards();
       root.appendChild(head);
-      root.appendChild(h('div', { class: 'stack' }, els.card, els.unavailable, cards));
+      root.appendChild(h('div', { class: 'stack' }, cards));
       TNT.hosttable.syncTargets(TNT.state && TNT.state.targets, true);
       renderBadge();
       renderToggle();
@@ -682,7 +780,7 @@
       for (const m of extras) { try { if (m.unmount) m.unmount(); } catch (e) { /* ignore */ } }
       extras = [];
       root = null; els = {}; table = null; status = null; busy = false; busyMode = ''; loading = false; loadAgain = false; netPending = false; danger = null;
-      scanError = null;
+      scanError = null; cardToggles = {}; attentionShown = null;
     },
     // exposed for tests
     leaseText,
@@ -690,6 +788,9 @@
     applyLease,
     adapterLabel,
     internetWarning,
+    withCardOpen,
+    dhcpAttention,
+    openCards: () => openCards.slice(),
     columns: COLUMNS.map((c) => c.key),
     cards: EXTRA_CARDS.map((c) => c.title),
   };

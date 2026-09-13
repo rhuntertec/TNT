@@ -79,6 +79,19 @@ Scheduler behaviour
   network this PC is on; a run reads it when it starts (with ``ts``) and the
   stored row carries it (``add_speedtest`` ``network_id``). The published
   result dict is unchanged. Without *network_fn* nothing is tagged.
+* latency under load (ARCHITECTURE 3.6, :mod:`tnt.speedtest.quality`): with a *pinger* (the
+  engine's shared ``IcmpPinger``) every run starts a
+  :class:`~tnt.speedtest.quality.LoadLatencyProbe` toward *quality_target* (1.1.1.1) after
+  ``speedtest.start`` and measures *baseline_s* (3 s) of idle latency before the backend
+  runs, published as progress phase ``"baseline"`` (0 -> 1). A cancel during the baseline
+  ends the run at once without running the backend. The probe sees every raw progress call
+  of the backend before ``speedtest.progress`` de-duplicates them and is stopped (bounded)
+  when the backend returns. The built QUALITY goes into the result dict as ``quality`` and
+  ``raw["quality"]``, so ``raw_json`` keeps it and :meth:`SpeedScheduler._row_to_result`
+  restores ``quality`` (None for rows without one). It is None for a cancelled, failed or
+  rate-limited run. A fallback retry keeps the baseline; its loaded windows start over.
+  Without a pinger there is no probe and no baseline, ``quality`` is None and ``raw`` gains
+  nothing. ``SpeedResult`` itself is unchanged.
 """
 from __future__ import annotations
 
@@ -95,6 +108,7 @@ from .base import (
 from .cloudflare import CloudflareBackend
 from .fastcom import FastComBackend
 from .patterns import analyse_patterns
+from .quality import DEFAULT_TARGET as QUALITY_TARGET, LoadLatencyProbe, build_quality
 
 log = logging.getLogger(__name__)
 
@@ -277,16 +291,27 @@ class SpeedScheduler:
     #: ... which never spaces tests further apart than this (or the configured interval).
     MAX_EFFECTIVE_INTERVAL_MIN = 60
     IDLE_PROGRESS: Dict[str, Any] = {"phase": "idle", "pct": 0.0}
+    #: Progress steps of the idle baseline (phase "baseline") measured before the backend runs.
+    BASELINE_STEP_S = 0.2
+    #: How long the latency-under-load probe may wait for its last echoes once the backend returned.
+    QUALITY_STOP_S = 2.0
 
     def __init__(self, db: Any, config: Any, bus: Any, clock: Callable[[], float] = time.time,
                  internet_down: Optional[Callable[[], bool]] = None, poll_s: float = 1.0,
-                 network_fn: Optional[Callable[[], Optional[int]]] = None) -> None:
+                 network_fn: Optional[Callable[[], Optional[int]]] = None, *, pinger: Any = None,
+                 quality_target: str = QUALITY_TARGET, baseline_s: float = 3.0) -> None:
         self._db = db
         self._config = config
         self._bus = bus
         self._clock = clock
         self._internet_down = internet_down
         self._network_fn = network_fn       # the current network id (tnt.networks); None: results are not tagged
+        self._pinger = pinger               # the engine's IcmpPinger; None: no latency-under-load probe
+        self._quality_target = str(quality_target or QUALITY_TARGET)
+        try:
+            self._baseline_s = max(0.0, float(baseline_s))
+        except (TypeError, ValueError):
+            self._baseline_s = 3.0
         self._poll_s = max(0.005, float(poll_s))
         self._lock = threading.RLock()
         self._stop = threading.Event()
@@ -583,9 +608,10 @@ class SpeedScheduler:
         if changed:
             self._publish("speedtest.progress", {"phase": str(phase), "pct": pct})
 
-    def _attempt(self, backend: Optional[SpeedBackend], name: str, cancel: threading.Event, ts: float) -> SpeedResult:
+    def _attempt(self, backend: Optional[SpeedBackend], name: str, cancel: threading.Event, ts: float,
+                 progress: Optional[ProgressFn] = None) -> SpeedResult:
         try:
-            return run_speedtest(self._config, progress=self._on_progress, cancel=cancel, backend=backend)
+            return run_speedtest(self._config, progress=progress or self._on_progress, cancel=cancel, backend=backend)
         except Exception as exc:  # noqa: BLE001 - run_speedtest never raises, belt and braces
             log.exception("speed test crashed")
             return failed_result(name, ts, f"{type(exc).__name__}: {exc}")
@@ -607,6 +633,89 @@ class SpeedScheduler:
             return None
         return nid if isinstance(nid, int) and not isinstance(nid, bool) and nid > 0 else None
 
+    # -- latency under load ---------------------------------------------------
+    def _start_probe(self) -> Optional[LoadLatencyProbe]:
+        """A started latency-under-load probe; None without a pinger or when it cannot start (the test runs anyway)."""
+        if self._pinger is None:
+            return None
+        try:
+            probe = LoadLatencyProbe(self._pinger, target=self._quality_target)
+            probe.set_phase("baseline", 0.0)          # before the first echo, so that echo lands in the baseline
+            probe.start()
+        except Exception:  # noqa: BLE001
+            log.exception("latency under load probe could not start; the speed test runs without it")
+            return None
+        return probe
+
+    def _probe_progress(self, probe: LoadLatencyProbe) -> ProgressFn:
+        """Progress callback of a probed run: the probe sees every raw call, then the de-duplicating publisher."""
+        def progress(phase: str, frac: float) -> None:
+            try:
+                probe.set_phase(phase, frac)
+            except Exception:  # noqa: BLE001
+                log.debug("latency under load probe could not record a phase", exc_info=True)
+            self._on_progress(phase, frac)
+
+        return progress
+
+    def _run_baseline(self, progress: ProgressFn, cancel: threading.Event) -> None:
+        """Idle latency before the backend runs: *baseline_s* seconds as progress ``("baseline", 0 -> 1)``.
+        Returns at once when *cancel* is set (without reaching 1.0)."""
+        total = self._baseline_s
+        progress("baseline", 0.0)
+        started = time.monotonic()
+        while not cancel.is_set():
+            elapsed = time.monotonic() - started
+            if elapsed >= total:
+                progress("baseline", 1.0)
+                return
+            cancel.wait(min(self.BASELINE_STEP_S, total - elapsed))
+            elapsed = time.monotonic() - started
+            if elapsed < total and not cancel.is_set():
+                progress("baseline", elapsed / total)
+
+    def _finish_probe(self, probe: LoadLatencyProbe, result: SpeedResult,
+                      cancel: threading.Event) -> Optional[Dict[str, Any]]:
+        """Stop the probe (bounded; without waiting when cancelled) and grade the run. None for a cancelled, failed
+        or rate-limited run, or when grading fails."""
+        cancelled = cancel.is_set()
+        try:
+            probe.stop(0.0 if cancelled else self.QUALITY_STOP_S)
+        except Exception:  # noqa: BLE001
+            log.exception("latency under load probe did not stop cleanly")
+        if cancelled or not result.ok or is_rate_limited(result):
+            return None
+        try:
+            quality = build_quality(probe.samples(), probe.phases(), target=probe.target,
+                                    interval_ms=probe.interval_ms, payload=probe.payload)
+        except Exception:  # noqa: BLE001
+            log.exception("latency under load could not be graded")
+            return None
+        self._log_quality(quality)
+        return quality
+
+    @staticmethod
+    def _log_quality(quality: Dict[str, Any]) -> None:
+        """One INFO line with grades, labels and counts (the probe target is an address: DEBUG only)."""
+        windows = [w for w in (quality.get("windows") or {}).values() if isinstance(w, dict)]
+        sent = sum(int(w.get("sent") or 0) for w in windows)
+        received = sum(int(w.get("received") or 0) for w in windows)
+        if not quality.get("available"):
+            log.info("latency under load not graded: %d of %d probes answered", received, sent)
+            log.debug("latency under load not graded: %s", quality.get("reason"))
+            return
+        bloat = quality.get("bufferbloat") or {}
+        call = quality.get("call") or {}
+        if bloat.get("grade"):
+            increase = bloat.get("increase_ms")
+            grade = f"grade {bloat['grade']} ({bloat.get('direction')}" + \
+                (f", +{increase:.1f} ms)" if increase is not None else ")")
+        else:
+            grade = f"not graded ({bloat.get('reason')})"
+        log.info("latency under load: %s; call quality %s idle, %s busy; %d of %d probes answered", grade,
+                 (call.get("idle") or {}).get("label"), (call.get("loaded") or {}).get("label") or "n/a",
+                 received, sent)
+
     def _execute(self, trigger: str) -> None:
         """Run one test (the running flag must already be claimed via ``_begin``)."""
         ts = float(self._clock())
@@ -622,8 +731,17 @@ class SpeedScheduler:
         backend_name = str(getattr(backend, "name", DEFAULT_BACKEND))
         log.info("speed test starting (%s, backend %s)", trigger, backend_name)
         self._publish("speedtest.start", {"ts": ts, "trigger": trigger, "backend": backend_name})
+        probe: Optional[LoadLatencyProbe] = None
         try:
-            result = self._attempt(backend, backend_name, cancel, ts)
+            probe = self._start_probe()
+            progress: ProgressFn = self._on_progress
+            if probe is not None:
+                progress = self._probe_progress(probe)
+                self._run_baseline(progress, cancel)
+            if probe is not None and cancel.is_set():
+                result = failed_result(backend_name, ts, CANCELLED)      # cut short during the baseline
+            else:
+                result = self._attempt(backend, backend_name, cancel, ts, progress)
             refused: List[Dict[str, Any]] = []
             if is_rate_limited(result) and not cancel.is_set():
                 refused.append(self._refusal(result))
@@ -634,19 +752,27 @@ class SpeedScheduler:
                                 result.backend, result.error, alt_name)
                     self._publish("speedtest.start", {"ts": ts, "trigger": trigger, "backend": alt_name,
                                                       "attempt": 2, "after": result.backend})
-                    result = self._attempt(alt, alt_name, cancel, ts)
+                    # the same probe: its baseline stays, the loaded windows start over with the new phases
+                    result = self._attempt(alt, alt_name, cancel, ts, progress)
                     if is_rate_limited(result) and not cancel.is_set():
                         refused.append(self._refusal(result))
                 else:
                     log.warning("speed test rate limited by %s (%s); no other backend can run now",
                                 result.backend, result.error)
+            quality: Optional[Dict[str, Any]] = None
+            if probe is not None:
+                quality = self._finish_probe(probe, result, cancel)
+                probe = None
             d = result.to_dict()
             d["ts"] = ts
             d["trigger"] = trigger
-            if refused and not isinstance(d.get("raw"), dict):
+            if not isinstance(d.get("raw"), dict):
                 d["raw"] = {}
             if refused:
                 d["raw"]["rate_limited_attempts"] = refused
+            if self._pinger is not None:
+                d["raw"]["quality"] = quality          # kept in raw_json; _row_to_result restores d["quality"]
+            d["quality"] = quality
             cancelled = cancel.is_set() and not d.get("ok") and d.get("error") == CANCELLED
             limited = bool(is_rate_limited(result)) and not cancelled
             if cancelled:
@@ -681,6 +807,11 @@ class SpeedScheduler:
         except Exception:  # noqa: BLE001
             log.exception("speed test post-processing failed")
         finally:
+            if probe is not None:                      # something above raised before the probe was stopped
+                try:
+                    probe.stop(0.0)
+                except Exception:  # noqa: BLE001
+                    log.debug("latency under load probe did not stop", exc_info=True)
             with self._lock:
                 self._running = False
                 self._cancel = None
@@ -753,6 +884,8 @@ class SpeedScheduler:
                 pass
         d["raw"] = raw
         d["ok"] = bool(d.get("ok"))
+        quality = raw.get("quality")
+        d["quality"] = quality if isinstance(quality, dict) else None     # latency under load (tnt.speedtest.quality)
         return d
 
     def status(self) -> Dict[str, Any]:

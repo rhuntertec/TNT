@@ -31,6 +31,14 @@ evolving data:
   only to an administrator: ``STATE.wifi_admin`` is True by default so the UI works; a test can
   set it False to get the real service's 403 ``admin_required``. Like the service, a browser
   request from a page of another origin gets 403 ``forbidden`` instead;
+* the Tools page's DNS card and the top bar's quick tools (``tnt.nettools``): ``POST /api/tools/dns/lookup`` answers from
+  documentation data (``DNS_ZONE`` / ``DNS_PTR``: www.example.com is a CNAME of example.com at 203.0.113.10 and 2001:db8::10,
+  totalelectronics.com is 198.51.100.40, an IP address gets a PTR name, any other name "Non-existent domain", and the DNS
+  server 192.0.2.1 never answers) after a short wait, with the service's 400 texts; the server asked is the one given, else
+  the first DNS server of this PC's internet adapter on its network. ``POST /api/tools/dns/flush`` is ok after ~0.3 s and
+  ``POST /api/tools/ip/renew`` answers after ~1.5 s with this PC's address and adapter, the DHCP adapters it went through
+  and ``paused_monitoring``; 409 while one runs, 403 ``admin_required`` while ``STATE.wifi_admin`` is off. A browser page
+  of another origin gets 403 ``forbidden`` from all three;
 * settings persisted in memory (``ui.show_ipv6`` included); ``POST /api/export``
   returns a tiny valid PDF; ``status.map.public_ip`` carries a fake WAN address;
 * network changes: the fake PC sits on one of the synthetic networks of ``NET_PROFILE_NAMES``
@@ -80,6 +88,27 @@ evolving data:
   (development only) to see downloading/error/starting in the UI. Invented providers and cities on documentation
   addresses; the key sets, the display-name and place rules and the router-name rule are held to ``tnt/geoip.py`` and
   ``tnt/geohints.py`` by tests/test_ui.py.
+* the Network info card's checks (``tnt.natcheck``, ``tnt.switchport``, ``tnt.portcheck``): ``GET``/``POST /api/netcheck/nat``
+  (network "a" is a single NAT behind the invented "Example Router XR-1" sharing two UPnP forwards, "b" a carrier-grade NAT,
+  the others offline; a POST answers at once, or after ``STATE.nat_delay_s`` with ``running`` true and 409 meanwhile),
+  ``GET``/``POST``/``DELETE /api/netcheck/switch`` (the network's wired adapters; a listen lasts ``STATE.switch_listen_s`` and
+  hears LAB-SW-01 Port 7 with ``netcheck.switch`` events, or nothing with ``STATE.switch_found`` off) and ``POST
+  /api/netcheck/portforward`` (after ``STATE.portcheck_delay_s`` TCP 8000 answers, 9 reaches no port checker and any other
+  port does not answer; the service's gap and per-hour limits are ``STATE.portcheck_min_gap_s`` / ``portcheck_per_hour``, 0
+  switches one off). A network change clears the three results. ``STATE.pktmon_reason`` makes Packet Monitor unavailable;
+* the TFTP server card (``tnt.tftp``): ``/api/tftp/status``, ``start``, ``stop``, ``uploads``, ``settings`` and ``files`` with
+  the service's shapes and 400 texts, off at start, ``status.tftp`` its summary. A phone reads its configuration file ~1.5 s
+  after a start (``tftp.transfer``); ``STATE.tftp_port_owners`` makes a start 409 ``tftp_port_in_use``, and a network change
+  stops a running server with "stopped: the adapter changed";
+* packet capture (``tnt.capture``): ``/api/tools/capture`` and ``/api/tools/capture/files/{name}``, 403 ``admin_required``
+  while ``STATE.wifi_admin`` is off, one seeded file whose download is a tiny valid pcapng; a started capture runs
+  ``STATE.capture_s`` seconds (None: the seconds it was started with) with ``capture.state`` events (on ``/api/events`` only
+  while ``STATE.wifi_admin`` is on: the service sends the capture job to an administrator only), then lists a new file.
+  A browser page of another origin gets 403 ``forbidden`` from every POST, PUT and DELETE of these tools and the download;
+* the latency-under-load grade (``tnt.speedtest.quality``): every speed test carries ``quality`` (graded by the service's rules
+  from invented probe windows, None for a failed test), ``/api/speedtests`` rows leave it out, and a run starts with the
+  0.8 s idle ``baseline`` phase. The DNS card's record types (``type``: MX, TXT, NS, SOA, CAA and NAPTR of example.com, SRV of
+  _sip._tcp.example.com, PTR of 10.113.0.203.in-addr.arpa) answer typed lookups; Auto still reads CNAME, A and AAAA only.
 
 SSE framing: ``event: <type>`` / ``data: <json of the event's data>``; the first
 event is ``hello``; ``: ping`` comments every 15 s.
@@ -102,6 +131,7 @@ import os
 import queue
 import random
 import re
+import struct
 import threading
 import time
 import unicodedata
@@ -132,9 +162,11 @@ DEFAULTS: Dict[str, Any] = {
     "ui": {"theme": "light", "show_ipv6": False},
     "lan": {"enabled": True},
     "geoip": {"enabled": True},
+    "update": {"enabled": True, "auto_install": False, "check_interval_h": 24, "channel": "stable"},
     "targets": {"defaults_extra": ["1.1.1.1", "totalelectronics.com"]},
     "dhcp": {"adapter": "", "pool_start": "", "pool_end": "", "pool_size": 5, "lease_s": 3600,
              "static_ip": "172.16.4.100", "static_prefix": 24, "ping_check": True, "scan_wait_s": 8},
+    "tftp": {"adapter": "", "max_upload_mb": 4096},
 }
 #: settings a release removed: PUT /api/settings drops them instead of storing them (same as tnt.config._RETIRED_KEYS)
 RETIRED_SETTINGS = ("speedtest.ookla_path", "speedtest.ookla_server_id", "discovery.use_nmap", "discovery.nmap_path")
@@ -183,6 +215,13 @@ GEOIP_LOCATION_KEYS = ("text", "source", "hint", "db_text", "asn", "as_org")
 GEOIP_DOWNLOAD_KEYS = ("month", "file", "phase", "received", "total")
 GEOIP_DIAG_KEYS = ("available", "status", "files")
 GEOIP_STATES = ("disabled", "starting", "downloading", "ready", "error")
+# auto-update (tnt.updater): the key set and states are the service's (tests/test_ui.py compares them)
+UPDATE_STATUS_KEYS = ("enabled", "state", "current_version", "latest_version", "latest_ts", "notes_url",
+                      "asset", "checked_ts", "next_check_ts", "download", "error", "auto_install")
+UPDATE_STATES = ("disabled", "idle", "checking", "up_to_date", "available", "downloading", "verifying",
+                 "ready", "installing", "error")
+UPDATE_LATEST_VERSION = "1.1.0"           # the version the fake "available"/"downloading"/... states offer
+UPDATE_SETUP_BYTES = 41_500_000
 #: never looked up (LAN, CGNAT, link-local, loopback, multicast, reserved): tnt.geoip.SKIP_NETWORKS as CIDR strings, same order
 GEOIP_SKIP_NETWORKS = ("0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
                        "192.168.0.0/16", "224.0.0.0/4", "240.0.0.0/4",
@@ -518,6 +557,267 @@ WIFI_PROFILES = [
 WIFI_ADMIN_REQUIRED_MSG = "Showing saved Wi-Fi passwords needs a Windows administrator account."
 #: ... and when a browser page of another origin asks (mirrors tnt.api.routes.WIFI_CROSS_ORIGIN_MSG)
 WIFI_CROSS_ORIGIN_MSG = "Saved Wi-Fi passwords are only shown to the TNT window or a page served by this TNT service."
+#: Tools: DNS lookup, Flush DNS and IP Release/Renew (tnt.nettools; POST /api/tools/dns/lookup, /dns/flush, /ip/renew): the keys
+#: of the service's answers, in its order (tests/test_ui.py holds them to tnt.nettools)
+DNS_RESULT_KEYS = ("name", "type", "server", "resolver", "answer_name", "addresses", "aliases", "records", "authoritative", "ok",
+                   "error", "duration_ms", "ts")
+DNS_RECORD_KEYS = ("type", "name", "value", "ttl")
+#: the record types a lookup may ask for (tnt.nettools.DNS_TYPES); none (Auto) asks for A and AAAA, or PTR for an address
+DNS_TYPES = ("A", "AAAA", "CNAME", "MX", "TXT", "NS", "SOA", "SRV", "CAA", "PTR", "NAPTR")
+#: the pseudo-type "ALL" fans these out (tnt.nettools.ALL_TYPES); PTR is left out (it is only for addresses)
+DNS_ALL_TYPES = ("A", "AAAA", "CNAME", "MX", "TXT", "NS", "SOA", "SRV", "CAA", "NAPTR")
+FLUSH_RESULT_KEYS = ("ok", "method", "error", "duration_ms", "ts")
+RENEW_RESULT_KEYS = ("ok", "address", "adapter", "adapters", "warnings", "paused_monitoring", "method", "error", "duration_ms", "ts")
+RENEW_ADAPTER_KEYS = ("name", "released", "renewed", "error")
+NETTOOLS_ROUTES = ("/tools/dns/lookup", "/tools/dns/flush", "/tools/ip/renew")
+#: the fake DNS, documentation names and addresses only: name -> the answer's records in answer order (type, owner, value, ttl),
+#: the values in tnt.nettools' formats. Auto reads the CNAME, A and AAAA rows: a name listed without address records answers "No
+#: addresses found for this name", a name not listed "Non-existent domain". A typed lookup reads the CNAME rows and the rows of
+#: its type at the end of the chain ("No MX records found for this name" when there are none)
+DNS_ZONE: Dict[str, List[Tuple[str, str, str, int]]] = {
+    "www.example.com": [("CNAME", "www.example.com", "example.com", 3600), ("A", "example.com", "203.0.113.10", 300),
+                        ("AAAA", "example.com", "2001:db8::10", 300)],
+    "example.com": [("A", "example.com", "203.0.113.10", 300), ("AAAA", "example.com", "2001:db8::10", 300),
+                    ("MX", "example.com", "10 mail.example.com", 3600), ("MX", "example.com", "20 mail2.example.com", 3600),
+                    ("TXT", "example.com", "v=spf1 ip4:203.0.113.0/24 -all", 3600),
+                    ("NS", "example.com", "ns1.example.net", 86400), ("NS", "example.com", "ns2.example.net", 86400),
+                    ("SOA", "example.com", "ns1.example.net hostmaster.example.com 2026091301 7200 3600 1209600 300", 3600),
+                    ("CAA", "example.com", '0 issue "letsencrypt.org"', 3600),
+                    ("NAPTR", "example.com", '100 10 "S" "SIP+D2U" "" _sip._udp.example.com', 3600)],
+    "_sip._tcp.example.com": [("SRV", "_sip._tcp.example.com", "10 60 5060 sip.example.com", 3600)],
+    "10.113.0.203.in-addr.arpa": [("PTR", "10.113.0.203.in-addr.arpa", "example.com", 3600)],
+    "example.net": [("A", "example.net", "198.51.100.20", 600)],
+    "ns1.example.net": [("A", "ns1.example.net", "198.51.100.53", 3600)],
+    "totalelectronics.com": [("A", "totalelectronics.com", "198.51.100.40", 3600)],
+    "mail.example.com": [],
+}
+#: the PTR names of the fake addresses (a DNS server's name comes from here too); any other address is host-<address>.example.net
+DNS_PTR = {"203.0.113.10": "example.com", "2001:db8::10": "example.com", "198.51.100.20": "example.net", "198.51.100.53": "ns1.example.net",
+           "198.51.100.40": "totalelectronics.com", "10.0.0.251": "gateway.lan", "192.168.50.1": "router.site-b.example"}
+#: a DNS server that never answers
+DNS_SILENT_SERVER = "192.0.2.1"
+#: the service's texts (tnt.nettools EMPTY_NAME_TEXT, NO_SERVER_TEXT, TIMEOUT_TEXT, NO_ADDRESSES_TEXT, RCODE_TEXT[3],
+#: NO_DHCP_ADAPTER_TEXT, NO_ADDRESS_TEXT)
+DNS_NAME_REQUIRED_MSG = "Type a DNS name or IP address to look up"
+DNS_NO_SERVER_MSG = "No DNS server is configured on this PC"
+DNS_TIMEOUT_MSG = "No response from the DNS server (timed out)"
+DNS_NO_ADDRESSES_MSG = "No addresses found for this name"
+DNS_NXDOMAIN_MSG = "Non-existent domain"
+#: a typed lookup's texts (tnt.nettools NO_RECORDS_TEXT and BAD_TYPE_TEXT, both templates, and IP_TYPE_TEXT) and the route's check
+DNS_NO_RECORDS_MSG = "No {} records found for this name"
+DNS_BAD_TYPE_MSG = '"{}" is not a DNS record type (A, AAAA, CNAME, MX, TXT, NS, SOA, SRV, CAA, PTR or NAPTR)'
+DNS_IP_TYPE_MSG = "An IP address is looked up as PTR: type a DNS name to ask for other record types"
+DNS_TYPE_NOT_TEXT_MSG = "type must be text or null"
+IP_RENEW_NO_DHCP_MSG = "No adapter gets its address from DHCP"
+IP_RENEW_NO_ADDRESS_MSG = "No IPv4 address after renewing: the DHCP server did not answer"
+#: the service's 403 when a non-admin asks for a release/renew (tnt.api.routes.IP_RENEW_ADMIN_REQUIRED_MSG), its 409 while one
+#: runs (tnt.engine) and its 403 forbidden for a browser page of another origin (tnt.api.routes.QUICK_TOOLS_CROSS_ORIGIN_MSG;
+#: the real server refuses a cross-site POST before its routes, in words of its own)
+IP_RENEW_ADMIN_REQUIRED_MSG = "Releasing and renewing IP addresses needs a Windows administrator account."
+IP_RENEW_BUSY_MSG = "An IP release/renew is already running"
+#: the service's 403 when a non-admin asks to install an update (tnt.api.routes.UPDATE_ADMIN_REQUIRED_MSG)
+UPDATE_ADMIN_REQUIRED_MSG = "Installing an update needs a Windows administrator account."
+QUICK_TOOLS_CROSS_ORIGIN_MSG = "This tool only answers the TNT window or a page served by this TNT service."
+#: a host-name label, like tnt.nettools._LABEL_RE: letters, digits, "_" and "-", 1-63 characters, not starting or ending with "-"
+_DNS_LABEL_RE = re.compile(r"[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?")
+#: Network info: the NAT check (tnt.natcheck). The key tuples, texts and errors are the service's (tests/test_ui_115.py holds them to it)
+NAT_VERDICTS = ("no_nat", "single_nat", "double_nat", "cgnat", "upstream_nat", "nat_unclear_private_wan", "vpn", "offline", "unknown")
+NAT_RESULT_KEYS = ("ts", "generation", "duration_ms", "verdict", "confidence", "title", "explanation", "router", "public_ip", "trace",
+                   "port_mappings", "error")
+ROUTER_KEYS = ("gateway", "wan_ip", "wan_source", "natpmp", "upnp")
+NATPMP_KEYS = ("answered", "result", "external_ip")
+UPNP_KEYS = ("found", "server", "model", "service", "status", "external_ip", "error")
+TRACE_KEYS = ("reached_ttl", "hops")
+HOP_KEYS = ("ttl", "ip", "rtt_ms", "range")
+PORT_MAPPINGS_KEYS = ("entries", "truncated", "error")
+MAPPING_KEYS = ("protocol", "external_port", "internal_client", "internal_port", "enabled", "description", "lease_s")
+CONFIDENCES = ("high", "medium", "low")
+#: verdict -> (title, explanation), shown verbatim
+NAT_TEXT: Dict[str, Tuple[str, str]] = {
+    "no_nat": ("No NAT", "This PC has the public address itself. Nothing to forward: Windows Firewall decides what gets in."),
+    "single_nat": ("Single NAT", "One router holds the public address. Port forwards on it work, unless the ISP blocks the port."),
+    "double_nat": ("Double NAT", "Another NAT sits between this network's router and the internet (usually the ISP modem or gateway, "
+                                 "sometimes the ISP itself). Forward ports on both, or put the ISP box in bridge / IP-passthrough mode."),
+    "cgnat": ("Carrier-grade NAT (CGNAT)", "The ISP shares one public address between customers, so port forwarding from the internet "
+                                           "cannot work on IPv4. Ask the ISP for a public or static IP, or use the device's cloud/P2P "
+                                           "service or a VPN."),
+    "upstream_nat": ("NAT beyond the router", "Websites see an address the router does not have, so something beyond it translates "
+                                              "again (ISP NAT, an upstream firewall, a second line or a VPN)."),
+    "nat_unclear_private_wan": ("Probably behind another NAT", "The router reports no usable public address although the internet "
+                                                               "works. That usually means it sits behind another NAT."),
+    "vpn": ("Traffic leaves through a VPN", "This PC's internet traffic goes through a VPN, so a check would describe the VPN, not this "
+                                            "site's router. Disconnect it and check again."),
+    "offline": ("Could not check", "No internet connection (or no public address yet), so NAT cannot be checked."),
+    "unknown": ("Could not tell", "The router does not answer UPnP or NAT-PMP and the path gave no clear sign."),
+}
+NAT_NO_INTERNET_ERROR = "no internet connection"
+NAT_NO_PUBLIC_IP_ERROR = "no public address yet"
+NAT_NO_GATEWAY_ERROR = "no IPv4 gateway"
+NAT_CONTROL_NOT_ROUTER_ERROR = "the router's control address is not the router"
+NAT_MAPPINGS_NOT_SHARED_ERROR = "the router does not share its port forwards"
+NAT_BUSY_TEXT = "a NAT check is already running"
+#: the invented router of network "a" (the build contract's stand-ins), its UPnP service and the forwards it shares:
+#: (protocol, external port, internal client, internal port, enabled, description, lease s); network "b"'s carrier address
+NAT_ROUTER_SERVER = "ExampleOS/1.0 UPnP/1.1 MiniUPnPd/2.2.0"
+NAT_ROUTER_MODEL = "Example Router XR-1"
+NAT_UPNP_SERVICE = "urn:schemas-upnp-org:service:WANIPConnection:1"
+NAT_PORT_MAPPINGS = (("TCP", 8000, "10.0.0.60", 8000, True, "NVR web", 0), ("TCP", 554, "10.0.0.61", 554, True, "Camera RTSP", 0))
+NAT_CGNAT_WAN_IP = "100.64.0.10"
+NAT_PROBE_MS = 640                      # what the probes of a check take, added to a POST's own time
+#: Network info: the switch port finder (tnt.switchport, tnt.lldp) and the Packet Monitor texts it shares with capture (tnt.pktmon)
+SWITCH_JOB_KEYS = ("state", "adapter", "started_ts", "listen_s", "elapsed_s", "neighbors", "error", "reason", "generation", "ts")
+SWITCH_STATUS_KEYS = ("job", "adapters", "available", "reason")
+SWITCH_JOB_ADAPTER_KEYS = ("name", "index", "mac")
+SWITCH_WIRED_ADAPTER_KEYS = ("name", "index", "mac", "is_internet")
+SWITCH_JOB_STATES = ("idle", "listening", "done", "error", "cancelled")
+NEIGHBOR_KEYS = ("protocol", "switch_name", "switch_description", "vendor", "chassis_id", "port_id", "port_description", "vlan",
+                 "voice_vlan", "management_ips", "capabilities", "poe", "link", "ttl_s")
+SWITCH_DEFAULT_SECONDS = 65
+SWITCH_SECONDS_RANGE = (20, 120)
+SWITCH_SECONDS_TEXT = "seconds must be a whole number from 20 to 120"
+SWITCH_ADAPTER_TEXT = "adapter '{name}' is not a wired adapter that is up"
+SWITCH_NO_WIRED_TEXT = "Needs a wired (Ethernet) connection"
+SWITCH_BUSY_TEXT = "a switch port search is already running"
+SWITCH_NO_NEIGHBOR_TEXT = ("No LLDP or CDP heard in {seconds} s. The switch may not send them (unmanaged switches never do), "
+                           "or LLDP is turned off on its port.")
+PKTMON_REASONS = ("Needs Windows 10 version 2004 (build 19041) or later", "Packet Monitor (pktmon.exe) is missing from this PC",
+                  "Packet Monitor on this PC is too old for this: update Windows")
+#: who holds Packet Monitor -> the 409 the other one gets
+PKTMON_LOCK_TEXTS = {"switchport": "TNT is finding the switch port: try again when it finishes",
+                     "capture": "A packet capture is running: stop it first"}
+#: what a listen hears: the invented switch of the build contract, on a documentation management address
+MOCK_NEIGHBOR = {"protocol": "lldp", "switch_name": "LAB-SW-01", "switch_description": "Example Switch 8P", "vendor": "Example Networks",
+                 "chassis_id": "02:00:5E:10:00:02",
+                 "port_id": "Port 7", "port_description": None, "vlan": 10, "voice_vlan": 20, "management_ips": ["192.0.2.2"],
+                 "capabilities": ["bridge"], "poe": {"class": 4, "allocated_w": 24.0},
+                 "link": {"autoneg": True, "mau": 30, "text": "1000BASE-T full"}, "ttl_s": 120}
+#: Network info: the port-forward test (tnt.portcheck): keys, texts, providers and the default rate limits
+PORTCHECK_RESULT_KEYS = ("ts", "generation", "port", "protocol", "public_ip", "reachable", "provider", "detail", "nat_verdict", "error",
+                         "duration_ms")
+PORTCHECK_PROTOCOL = "tcp"
+PORTCHECK_PROVIDERS = ("portchecker.io", "globalping")
+PORTCHECK_PROVIDER_NAMES = {"portchecker.io": "portchecker.io", "globalping": "Globalping"}
+PORTCHECK_PORT_TEXT = "port must be a whole number from 1 to 65535"
+PORTCHECK_VPN_TEXT = ("This PC's internet goes through a VPN, so the test would check the VPN's address, not this site's: disconnect "
+                      "the VPN first")
+PORTCHECK_NO_IP_TEXT = ("This network's public IPv4 address is not known yet (or it has none): wait for the WAN address on the link "
+                        "map, then test again")
+PORTCHECK_BUSY_TEXT = "a port-forward test is already running"
+PORTCHECK_RATE_TEXT = "Too many tests: wait {seconds} s"
+PORTCHECKER_OPEN_DETAIL = "portchecker.io connected to the port"
+PORTCHECKER_CLOSED_DETAIL = "portchecker.io could not connect (tried twice)"
+PORTCHECK_FAILED_TEXT = "The port checkers could not be reached: {reason}"
+PORTCHECK_REASON_TIMEOUT = "did not answer in time"
+PORTCHECK_MIN_GAP_S = 5.0
+PORTCHECK_PER_HOUR = 30
+PORTCHECK_RATE_WINDOW_S = 3600.0
+#: the fake internet: something answers on TCP 8000, a test of port 9 reaches neither port checker, every other port stays shut
+PORTCHECK_OPEN_PORT = 8000
+PORTCHECK_ERROR_PORT = 9
+#: the network tools' routes (below /api) a browser page of another origin may not POST, PUT or DELETE, plus the capture downloads
+#: (tnt.api.routes._quick_tool_origin)
+NETWORK_TOOL_ROUTES = ("/netcheck/nat", "/netcheck/switch", "/netcheck/portforward", "/tools/capture", "/tftp/start", "/tftp/stop",
+                       "/tftp/uploads", "/tftp/settings")
+CAPTURE_FILES_ROUTE = "/tools/capture/files/"
+#: Tools: the TFTP server (tnt.tftp): keys, texts and limits
+TFTP_STATUS_KEYS = ("available", "running", "since_ts", "error", "warning", "adapter", "adapters", "listen", "root", "uploads", "firewall",
+                    "conflict", "transfers", "history", "counts", "settings")
+TFTP_SUMMARY_KEYS = ("available", "running", "adapter", "listen_ips", "active", "uploads", "since_ts", "error")
+TFTP_TRANSFER_KEYS = ("id", "client", "op", "file", "mode", "blksize", "windowsize", "size", "bytes", "state", "error", "started_ts",
+                      "ended_ts")
+TFTP_ADAPTER_KEYS = ("name", "index", "ip", "prefix", "type_name", "is_physical", "is_internet", "status")
+TFTP_COUNT_KEYS = ("active", "done", "unconfirmed", "failed", "cancelled", "busy")
+TFTP_SETTINGS_KEYS = ("adapter", "max_upload_mb")
+TFTP_TRANSFER_STATES = ("negotiating", "sending", "receiving", "done", "unconfirmed", "failed", "cancelled")
+TFTP_FIREWALL_RULE = "TNT TFTP server (UDP 69 in)"
+TFTP_PORT = 69
+TFTP_ROOT = "C:\\ProgramData\\TNT\\tftp"
+TFTP_HISTORY_KEEP = 50
+TFTP_MAX_UPLOAD_MB = (1, 65536)
+TFTP_MAX_UPLOAD_MB_TEXT = "max_upload_mb must be a whole number from 1 to 65536"
+TFTP_PORT_IN_USE_CODE = "tftp_port_in_use"
+TFTP_MSG_CANCELLED = "Transfer cancelled"
+#: what a network change does to a running mock server (the service names the adapter's problem)
+TFTP_STOPPED_TEXT = "stopped: the adapter changed"
+#: the files in the root folder: (name with "/", size, age in seconds at service start)
+TFTP_FILES = (("boot/pxelinux.0", 26_828, 86400 * 12), ("firmware/lab-sw-fw-2.4.1.bin", 7_843_532, 86400 * 3),
+              ("phones/SEP02005E100001.cnf.xml", 4_912, 3600 * 5))
+#: Tools: packet capture (tnt.capture): keys, choices, the file name pattern and texts; the routes' 403 (tnt.api.routes)
+CAPTURE_JOB_KEYS = ("id", "state", "adapter", "filters", "full_packets", "seconds", "size_mb", "started_ts", "elapsed_s", "bytes", "file",
+                    "error", "note", "ts")
+CAPTURE_FILE_KEYS = ("name", "size", "created_ts", "packets")
+CAPTURE_STATUS_KEYS = ("available", "reason", "adapters", "capture", "files")
+CAPTURE_ADAPTER_KEYS = ("name", "index", "mac", "type_name", "wifi")
+CAPTURE_FILTER_KEYS = ("host", "port", "protocol")
+CAPTURE_STATES = ("starting", "capturing", "converting", "done", "error", "cancelled")
+CAPTURE_RUNNING_STATES = ("starting", "capturing", "converting")
+CAPTURE_SECONDS = (10, 30, 60, 300, 900)
+CAPTURE_SECONDS_RANGE = (5, 1800)
+CAPTURE_SIZES_MB = (64, 128, 256, 512, 1024)
+CAPTURE_PROTOCOLS = ("tcp", "udp", "icmp")
+CAPTURE_FILE_RE = r"^TNT-capture-\d{8}-\d{6}\.pcapng$"
+CAPTURE_SECONDS_TEXT = "seconds must be a whole number from {lo} to {hi}"
+CAPTURE_SIZE_TEXT = "size_mb must be one of 64, 128, 256, 512 or 1024"
+CAPTURE_HOST_TEXT = "host must be an IP address"
+CAPTURE_PORT_TEXT = "port must be a whole number from 1 to 65535"
+CAPTURE_PROTOCOL_TEXT = "protocol must be tcp, udp, icmp or null"
+CAPTURE_PORT_ICMP_TEXT = "port cannot be combined with protocol icmp"
+CAPTURE_ADAPTER_TEXT = "adapter '{name}' is not up"
+CAPTURE_FULL_PACKETS_TEXT = "full_packets must be true or false"
+CAPTURE_FILE_MISSING_TEXT = "The capture file was not found"
+#: the routes' 403 for a standard user, and for a caller the service could not identify (the mock's callers always are)
+CAPTURE_ADMIN_REQUIRED_MSG = "Packet capture needs a Windows administrator account."
+CAPTURE_ADMIN_UNVERIFIED_MSG = "Packet capture needs a Windows administrator account; this request could not be verified as one."
+#: the event types /api/events sends only while STATE.wifi_admin is on (the service's routes.ADMIN_ONLY_EVENTS: the capture job)
+ADMIN_ONLY_EVENTS = frozenset({"capture.state"})
+#: the capture the mock starts with (2026-01-01 12:00:00 local time) and the ETL bytes a second of capturing adds
+CAPTURE_SEED_FILE = "TNT-capture-20260101-120000.pcapng"
+CAPTURE_RATE_BPS = {True: 180_000, False: 24_000}
+_CAPTURE_FILE = re.compile(CAPTURE_FILE_RE, re.ASCII)
+#: Speed: latency under load and call quality (tnt.speedtest.quality): keys, texts and the grading rules
+QUALITY_KEYS = ("version", "available", "reason", "target", "interval_ms", "payload_bytes", "windows", "bufferbloat", "call")
+WINDOW_KEYS = ("sent", "received", "skipped", "loss_pct", "median_ms", "mean_ms", "p95_ms", "max_ms", "jitter_ms")
+LOADED_EXTRA_KEYS = ("increase_ms", "grade", "reason", "warning")
+BUFFERBLOAT_KEYS = ("grade", "increase_ms", "direction", "text", "warning", "reason")
+CALL_KEYS = ("method", "idle", "loaded", "checks")
+SCORE_KEYS = ("r", "mos", "label")
+CHECK_KEYS = ("key", "ok", "detail")
+QUALITY_VERSION = 1
+QUALITY_TARGET = "1.1.1.1"
+QUALITY_INTERVAL_MS = 100
+QUALITY_PAYLOAD = 32
+GRADES = ("A+", "A", "B", "C", "D", "F")
+#: exclusive upper bounds of the increase under load (ms): a value on a boundary gets the worse grade
+GRADE_BOUNDS = ((5.0, "A+"), (30.0, "A"), (60.0, "B"), (200.0, "C"), (400.0, "D"))
+GRADE_TEXT = {
+    "A+": "No bufferbloat: latency stays flat while the line is busy",
+    "A": "Excellent: calls and games are unaffected by heavy use",
+    "B": "Good: small delay spikes while the line is busy",
+    "C": "Bufferbloat: calls and games may lag while someone uploads or downloads",
+    "D": "Severe bufferbloat: calls will break up while the line is busy",
+    "F": "Unusable under load: the connection stalls when it is busy",
+}
+REASON_TOO_SHORT = "phase too short to grade"
+REASON_MOST_LOST = "most probes were lost under load"
+REASON_NO_REPLIES = "{target} did not answer pings"
+REASON_NO_BASELINE = "idle latency could not be measured"
+WARNING_SOME_LOST = "some probes were lost under load"
+WARNING_DELAYED = "probes were delayed, so loss may be under-counted"
+CALL_METHOD = "estimate (simplified E-model)"
+#: inclusive lower bounds of R per label, below the last one CALL_LABEL_WORST; (key, mean ms, jitter ms, loss %, "or less")
+CALL_LABELS = ((90.0, "Excellent"), (80.0, "Good"), (70.0, "Fair"), (60.0, "Poor"), (50.0, "Bad"))
+CALL_LABEL_WORST = "Unusable"
+CALL_CHECKS = (("zoom", 150.0, 40.0, 2.0, True), ("teams", 100.0, 30.0, 1.0, False))
+QUALITY_MIN_SENT = 10
+QUALITY_MIN_RECEIVED = 8
+QUALITY_MOST_LOST_PCT = 50.0
+QUALITY_SOME_LOST_PCT = 5.0
+QUALITY_SKIPPED_WARN_SHARE = 0.10
+QUALITY_BASELINE_MIN_ANSWERED = 0.5
+QUALITY_SCOPE = {"baseline": "idle", "download": "while downloading", "upload": "while uploading"}
+#: the mock speed test's phases and seconds, and the Full Scan speed step's part of each: phase -> (base, span) of the step
+SPEED_PHASES = (("baseline", 0.8), ("latency", 1.2), ("download", 3.0), ("upload", 2.6))
+REPORT_SPEED_STEPS = {"baseline": (0.0, 0.05), "latency": (0.05, 0.1), "download": (0.15, 0.45), "upload": (0.6, 0.4)}
 #: the fake pywebview bridge for the WiFi page (development only: it lives here, never under ui/)
 MOCK_WIFI_BRIDGE = Path(__file__).resolve().parent / "mock_wifi_bridge.js"
 MOCK_WIFI_BRIDGE_URL = "/mock/wifi-bridge.js"
@@ -565,6 +865,305 @@ def cross_origin_browser_request(headers: Any, port: int) -> bool:
     if origin and origin not in {f"http://{host}:{port}" for host in ("127.0.0.1", "localhost", "[::1]")}:
         return True
     return site not in ("", "same-origin", "none")
+
+
+def dns_address(text: str) -> Optional[Any]:
+    """An IPv4 / IPv6 literal as an address object, else None."""
+    try:
+        return ipaddress.ip_address(text)
+    except ValueError:
+        return None
+
+
+def dns_validate(value: Any, what: str) -> Optional[str]:
+    """The name rules of tnt.nettools._validate: None for a missing or empty value, else the address (normalized) or the ASCII
+    host name without its trailing dot (a non-ASCII name turned into punycode with the idna codec; labels of letters, digits,
+    "_" and "-", 1-63 characters, none starting or ending with "-"; 253 characters at most, never starting with "-").
+    ValueError with the service's text (what was typed, cut to 80 characters) otherwise."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f'"{str(value)[:80]}" is not {what}')
+    text = value.strip()
+    if not text:
+        return None
+    invalid = ValueError(f'"{text[:80]}" is not {what}')
+    body = text[:-1] if text.endswith(".") else text
+    address = dns_address(body)
+    if address is not None:
+        return str(address)
+    if not body.isascii():
+        try:
+            body = body.encode("idna").decode("ascii")
+        except (UnicodeError, ValueError):
+            raise invalid from None
+    if not body or len(body) > 253 or body.startswith("-") or not all(_DNS_LABEL_RE.fullmatch(label) for label in body.split(".")):
+        raise invalid
+    return body
+
+
+def dns_query_name(value: Any) -> str:
+    """The name of POST /api/tools/dns/lookup (tnt.nettools.validate_name): ValueError, a 400, with the service's text."""
+    name = dns_validate(value, "a DNS name or IP address")
+    if name is None:
+        raise ValueError(DNS_NAME_REQUIRED_MSG)
+    return name
+
+
+def dns_query_server(value: Any) -> Optional[str]:
+    """The DNS server of a lookup, None for this PC's own (tnt.nettools.validate_server)."""
+    return dns_validate(value, "a DNS server name or IP address")
+
+
+def dns_query_type(value: Any) -> Optional[str]:
+    """The record type of a lookup (tnt.nettools.validate_type): its upper-case name from DNS_TYPES, or "ALL" (all record
+    types at once) for "all" (any case), all trimmed; None for Auto (None, empty or spaces); ValueError with the service's
+    text (what was sent, cut to 80 characters) otherwise."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        shown = value.strip()
+        if not shown:
+            return None
+        if shown.upper() in DNS_TYPES or shown.upper() == "ALL":
+            return shown.upper()
+    else:
+        shown = str(value).strip()
+    raise ValueError(DNS_BAD_TYPE_MSG.format(shown[:80]))
+
+
+def network_tool_route(p: str) -> bool:
+    """Whether ``/api<p>`` is a network tool a browser page of another origin may not POST, PUT or DELETE (or download)."""
+    return p in NETWORK_TOOL_ROUTES or (p.startswith(CAPTURE_FILES_ROUTE) and len(p) > len(CAPTURE_FILES_ROUTE))
+
+
+class ToolRefused(RuntimeError):
+    """A network tool's refusal with the service's status, code and text (tnt.api.routes.TYPED_ERRORS, the admin check):
+    ``extra`` joins the error body (a TFTP port conflict's ``owners``), ``headers`` the response (a 429's ``Retry-After``)."""
+
+    def __init__(self, status: int, code: str, message: str, extra: Optional[Dict[str, Any]] = None,
+                 headers: Optional[Dict[str, str]] = None) -> None:
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.extra = dict(extra or {})
+        self.headers = dict(headers or {})
+
+    def payload(self) -> Dict[str, Any]:
+        return dict({"error": {"code": self.code, "message": str(self)}}, **self.extra)
+
+
+def _inet_checksum(data: bytes) -> int:
+    if len(data) % 2:
+        data += b"\x00"
+    total = sum(struct.unpack(f"!{len(data) // 2}H", data))
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return ~total & 0xFFFF
+
+
+def tiny_pcapng(ts: float) -> bytes:
+    """A saved capture's bytes: a valid little-endian pcapng with one Section Header Block, one Ethernet Interface Description
+    Block and one Enhanced Packet Block (an ICMP echo request from 192.0.2.10 to 192.0.2.1, locally administered MACs) at *ts*."""
+    icmp = struct.pack("!BBHHH", 8, 0, 0, 0x7454, 1) + b"TNT mock capture"
+    icmp = icmp[:2] + struct.pack("!H", _inet_checksum(icmp)) + icmp[4:]
+    ip = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(icmp), 1, 0, 64, 1, 0, bytes([192, 0, 2, 10]), bytes([192, 0, 2, 1]))
+    ip = ip[:10] + struct.pack("!H", _inet_checksum(ip)) + ip[12:]
+    frame = bytes.fromhex("02005e100001" "02005e100002" "0800") + ip + icmp
+    shb = struct.pack("<IIIHHq", 0x0A0D0D0A, 28, 0x1A2B3C4D, 1, 0, -1) + struct.pack("<I", 28)
+    idb = struct.pack("<IIHHI", 1, 20, 1, 0, 0) + struct.pack("<I", 20)
+    micros = int(ts * 1_000_000)
+    padded = frame + b"\x00" * (-len(frame) % 4)
+    length = 32 + len(padded)
+    epb = (struct.pack("<IIIIIII", 6, length, 0, micros >> 32, micros & 0xFFFFFFFF, len(frame), len(frame)) + padded
+           + struct.pack("<I", length))
+    return shb + idb + epb
+
+
+def _whole(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return None
+
+
+def capture_start_values(body: Dict[str, Any], adapters: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """The start body of POST /api/tools/capture checked in tnt.capture.CaptureManager.start's order (a key left out takes its
+    default, a null that is sent is checked): ValueError with the service's text, else the values with ``adapter`` the row of
+    *adapters* and ``filters`` normalised (canonical address, lower-case protocol)."""
+    def get(key: str, default: Any) -> Any:
+        return body[key] if key in body else default
+
+    lo, hi = CAPTURE_SECONDS_RANGE
+    seconds = _whole(get("seconds", 60))
+    if seconds is None or not lo <= seconds <= hi:
+        raise ValueError(CAPTURE_SECONDS_TEXT.format(lo=lo, hi=hi))
+    size_mb = _whole(get("size_mb", 128))
+    if size_mb not in CAPTURE_SIZES_MB:
+        raise ValueError(CAPTURE_SIZE_TEXT)
+    host = get("host", None)
+    if host is not None:
+        if not isinstance(host, str):
+            raise ValueError(CAPTURE_HOST_TEXT)
+        text = host.strip()
+        if "%" in text or "/" in text:
+            raise ValueError(CAPTURE_HOST_TEXT)
+        try:
+            host = str(ipaddress.ip_address(text)) if text else None
+        except ValueError:
+            raise ValueError(CAPTURE_HOST_TEXT) from None
+    port = get("port", None)
+    if port is not None:
+        port = _whole(port)
+        if port is None or not 1 <= port <= 65535:
+            raise ValueError(CAPTURE_PORT_TEXT)
+    protocol = get("protocol", None)
+    if protocol is not None:
+        if not isinstance(protocol, str):
+            raise ValueError(CAPTURE_PROTOCOL_TEXT)
+        protocol = protocol.strip().lower() or None
+        if protocol is not None and protocol not in CAPTURE_PROTOCOLS:
+            raise ValueError(CAPTURE_PROTOCOL_TEXT)
+    if port is not None and protocol == "icmp":
+        raise ValueError(CAPTURE_PORT_ICMP_TEXT)
+    adapter = body.get("adapter")
+    name = (adapter if isinstance(adapter, str) else ("" if adapter is None else str(adapter))).strip()
+    row = next((a for a in adapters if a["name"] == name), None) if name else None
+    if row is None:
+        raise ValueError(CAPTURE_ADAPTER_TEXT.format(name=name[:40]))
+    full_packets = get("full_packets", True)
+    if not isinstance(full_packets, bool):
+        raise ValueError(CAPTURE_FULL_PACKETS_TEXT)
+    return {"adapter": dict(row), "filters": {"host": host, "port": port, "protocol": protocol}, "full_packets": full_packets,
+            "seconds": seconds, "size_mb": size_mb}
+
+
+def _quality_num(value: float) -> str:
+    text = f"{float(value):.1f}"
+    return text[:-2] if text.endswith(".0") else text
+
+
+def bloat_grade(increase_ms: Optional[float]) -> Optional[str]:
+    """tnt.speedtest.quality.bloat_grade: <5 A+, <30 A, <60 B, <200 C, <400 D, else F; None for None."""
+    if increase_ms is None:
+        return None
+    for bound, grade in GRADE_BOUNDS:
+        if float(increase_ms) < bound:
+            return grade
+    return "F"
+
+
+def call_quality(mean_ms: Optional[float], jitter_ms: Optional[float], loss_pct: Optional[float]) -> Dict[str, Any]:
+    """tnt.speedtest.quality.call_quality, the simplified E-model: {r, mos, label}; a missing value counts as 0."""
+    leff = max(0.0, float(mean_ms or 0.0)) + 2.0 * max(0.0, float(jitter_ms or 0.0)) + 10.0
+    r = 93.2 - leff / 40.0 if leff < 160.0 else 93.2 - (leff - 120.0) / 10.0
+    r = max(0.0, min(100.0, r - 2.5 * max(0.0, float(loss_pct or 0.0))))
+    mos = max(1.0, 1.0 + 0.035 * r + 7e-6 * r * (r - 60.0) * (100.0 - r))      # never below the bottom of the MOS scale
+    r = round(r, 2)
+    return {"r": r, "mos": round(mos, 2), "label": next((label for bound, label in CALL_LABELS if r >= bound), CALL_LABEL_WORST)}
+
+
+def _quality_checks(window: Dict[str, Any], scope: str) -> List[Dict[str, Any]]:
+    mean, jitter, loss = (float(window.get(k) or 0.0) for k in ("mean_ms", "jitter_ms", "loss_pct"))
+    checks = []
+    for key, max_mean, max_jitter, max_loss, inclusive in CALL_CHECKS:
+        verb = "is above" if inclusive else "is not below"
+        failures = [f"{what} {_quality_num(value)}{unit} {verb} {_quality_num(limit)}{unit}"
+                    for what, value, limit, unit in (("latency", mean, max_mean, " ms"), ("jitter", jitter, max_jitter, " ms"),
+                                                     ("loss", loss, max_loss, "%"))
+                    if (value > limit if inclusive else value >= limit)]
+        detail = "; ".join(failures) if failures else \
+            f"latency {_quality_num(mean)} ms, jitter {_quality_num(jitter)} ms, loss {_quality_num(loss)}%"
+        checks.append({"key": key, "ok": not failures, "detail": f"{detail} ({scope})"})
+    return checks
+
+
+def _quality_loaded(stats: Dict[str, Any], baseline_median: Optional[float]) -> Dict[str, Any]:
+    window = dict(stats)
+    window.update(dict.fromkeys(LOADED_EXTRA_KEYS))
+    sent, received, skipped, loss = stats["sent"], stats["received"], stats["skipped"], stats["loss_pct"]
+    increase = None
+    if stats["mean_ms"] is not None and baseline_median is not None:
+        increase = round(max(0.0, stats["mean_ms"] - baseline_median), 1)
+    warnings = []
+    if sent < QUALITY_MIN_SENT:
+        window["reason"] = REASON_TOO_SHORT
+    elif loss is not None and loss >= QUALITY_MOST_LOST_PCT:
+        window.update(grade="F", reason=REASON_MOST_LOST, increase_ms=increase)
+    elif received < QUALITY_MIN_RECEIVED:
+        window["reason"] = REASON_TOO_SHORT
+    else:
+        window.update(increase_ms=increase, grade=bloat_grade(increase))
+        if loss is not None and QUALITY_SOME_LOST_PCT <= loss < QUALITY_MOST_LOST_PCT:
+            warnings.append(WARNING_SOME_LOST)
+    if skipped and skipped > QUALITY_SKIPPED_WARN_SHARE * (sent + skipped):
+        warnings.append(WARNING_DELAYED)
+    window["warning"] = "; ".join(warnings) or None
+    return window
+
+
+def _quality_bufferbloat(loaded: Dict[str, Optional[Dict[str, Any]]]) -> Dict[str, Any]:
+    out: Dict[str, Any] = dict.fromkeys(BUFFERBLOAT_KEYS)
+    graded = [(name, w) for name, w in loaded.items() if w is not None and w.get("grade") in GRADES]
+    if not graded:
+        reasons = [w["reason"] for w in loaded.values() if w is not None and w.get("reason")]
+        out["reason"] = reasons[0] if reasons else REASON_TOO_SHORT
+        return out
+    direction, worst = max(graded, key=lambda item: (GRADES.index(item[1]["grade"]),
+                                                     math.inf if item[1].get("increase_ms") is None else float(item[1]["increase_ms"])))
+    warnings: List[str] = []
+    for _name, window in [(direction, worst)] + [g for g in graded if g[0] != direction]:
+        for text in str(window.get("warning") or "").split("; "):
+            if text and text not in warnings:
+                warnings.append(text)
+    out.update(grade=worst["grade"], increase_ms=worst.get("increase_ms"), direction=direction, text=GRADE_TEXT[worst["grade"]],
+               warning="; ".join(warnings) or None)
+    return out
+
+
+def _quality_call(baseline: Dict[str, Any], loaded: Dict[str, Optional[Dict[str, Any]]]) -> Dict[str, Any]:
+    idle = call_quality(baseline.get("mean_ms"), baseline.get("jitter_ms"), baseline.get("loss_pct"))
+    worst: Optional[Tuple[str, Dict[str, Any], Dict[str, Any]]] = None
+    for name, window in loaded.items():
+        if window is None or int(window.get("sent") or 0) < QUALITY_MIN_SENT:
+            continue
+        score = call_quality(window.get("mean_ms"), window.get("jitter_ms"), window.get("loss_pct"))
+        if worst is None or score["r"] < worst[2]["r"]:
+            worst = (name, window, score)
+    if worst is None:
+        return {"method": CALL_METHOD, "idle": idle, "loaded": None, "checks": _quality_checks(baseline, QUALITY_SCOPE["baseline"])}
+    name, window, score = worst
+    return {"method": CALL_METHOD, "idle": idle, "loaded": dict(score, direction=name), "checks": _quality_checks(window, QUALITY_SCOPE[name])}
+
+
+def speed_quality(baseline: Dict[str, Any], download: Optional[Dict[str, Any]], upload: Optional[Dict[str, Any]],
+                  target: str = QUALITY_TARGET, interval_ms: int = QUALITY_INTERVAL_MS, payload: int = QUALITY_PAYLOAD) -> Dict[str, Any]:
+    """A speed test's QUALITY from its probe windows (WINDOW statistics; a loaded window None when its phase never ran), graded
+    like tnt.speedtest.quality.build_quality once it has split the echoes into windows."""
+    reason = None
+    if not baseline["sent"]:
+        reason = REASON_NO_BASELINE
+    elif baseline["received"] < QUALITY_BASELINE_MIN_ANSWERED * baseline["sent"]:
+        reason = REASON_NO_REPLIES.format(target=target)
+    windows: Dict[str, Optional[Dict[str, Any]]] = {"baseline": baseline}
+    for name, stats in (("download", download), ("upload", upload)):
+        if stats is None:
+            windows[name] = None
+        elif reason is None:
+            windows[name] = _quality_loaded(stats, baseline["median_ms"])
+        else:
+            windows[name] = {**stats, **dict.fromkeys(LOADED_EXTRA_KEYS)}
+    quality: Dict[str, Any] = dict.fromkeys(QUALITY_KEYS)
+    quality.update(version=QUALITY_VERSION, available=reason is None, reason=reason, target=str(target), interval_ms=int(interval_ms),
+                   payload_bytes=int(payload), windows=windows)
+    if reason is None:
+        loaded = {"download": windows["download"], "upload": windows["upload"]}
+        quality["bufferbloat"] = _quality_bufferbloat(loaded)
+        quality["call"] = _quality_call(baseline, loaded)
+    return quality
 
 
 def ip2int(ip: str) -> int:
@@ -1842,11 +2441,60 @@ class MockState:
         self.lan_fast = False
         self.lan_peer_ts = time.time()      # the last "announcement" round (lan.peers every 10 s)
         self.lan_enabled = True             # the Tools switch (PUT /api/tools/lan/settings)
-        self.wifi_admin = True              # tests: set False to simulate a non-admin caller (403 on reveal=1)
+        self.wifi_admin = True              # tests: set False to simulate a non-admin caller (403 on reveal=1 and on IP Release/Renew)
+        # Tools: DNS lookup, Flush DNS and IP Release/Renew (tnt.nettools); tests shorten the waits
+        self.dns_delay_s = 0.15
+        self.dns_flush_s = 0.3
+        self.ip_renew_s = 1.5
+        self.ip_renew_running = False
+        # Network info: the NAT check, the switch port finder and the port-forward test; tests shorten the waits and zero the limits
+        self.nat_delay_s = 0.0                               # a POST answers at once; more keeps it running (GET running, 409)
+        self.nat_running = False
+        self.nat_last: Optional[Dict[str, Any]] = None
+        self.nat_epoch = 0                                   # bumps on every network change: a check across one is not kept
+        self.switch_listen_s = 2.0                           # how long a listen lasts before it hears the switch
+        self.switch_found = True                             # False: a listen hears no LLDP or CDP
+        self.switch_job: Optional[Dict[str, Any]] = None     # the latest search
+        self.switch_kept: Dict[str, Dict[str, Any]] = {}     # adapter MAC -> its last finished search
+        self.switch_gen = 0                                  # bumps on every start and cancel so a stale worker exits
+        self.pktmon_reason: Optional[str] = None             # a PKTMON_REASONS text: Packet Monitor unavailable to both tools
+        self.portcheck_delay_s = 1.5
+        self.portcheck_min_gap_s = PORTCHECK_MIN_GAP_S
+        self.portcheck_per_hour = PORTCHECK_PER_HOUR
+        self.portcheck_running = False
+        self.portcheck_starts: List[float] = []              # monotonic starts of the tests admitted in the last hour
+        self.portcheck_last_start: Optional[float] = None
+        self.portcheck_last: Optional[Dict[str, Any]] = None
+        # Tools: the TFTP server (off after every start of the service, uploads too) and packet capture
+        self.tftp_running = False
+        self.tftp_since: Optional[float] = None
+        self.tftp_error: Optional[str] = None
+        self.tftp_uploads = False
+        self.tftp_adapter: Optional[Dict[str, Any]] = None   # the TFTP_ADAPTER_KEYS row it serves on
+        self.tftp_listen: List[Dict[str, Any]] = []
+        self.tftp_conflict: Optional[Dict[str, Any]] = None
+        self.tftp_port_owners: List[Dict[str, Any]] = []     # tests: [{"pid", "name"}] of another program on UDP 69 (409 at start)
+        self.tftp_transfers: List[Dict[str, Any]] = []
+        self.tftp_history: List[Dict[str, Any]] = []         # newest first
+        self.tftp_counts = {k: 0 for k in TFTP_COUNT_KEYS if k != "active"}
+        self.tftp_next_id = 1
+        self.tftp_gen = 0                                    # bumps on every start and stop so a stale transfer exits
+        self.tftp_fast = False                               # tests: the phone asks within a few ms
+        self.capture_s: Optional[float] = None               # tests: how long a capture runs (None: the seconds it was started with)
+        self.capture_job: Optional[Dict[str, Any]] = None
+        self.capture_next_id = 1
+        self.capture_gen = 0
+        self.capture_stop_evt = threading.Event()             # stop and keep the running capture
+        seed_ts = time.mktime((2026, 1, 1, 12, 0, 0, 0, 0, -1))
+        self.capture_files: List[Dict[str, Any]] = [{"name": CAPTURE_SEED_FILE, "size": len(tiny_pcapng(seed_ts)), "created_ts": seed_ts,
+                                                     "packets": 1}]
         # IP location (tnt.geoip): the fake manager's state (POST /mock/geoip), the text it shows in "error" and its data month
         self.geoip_state = "ready"
         self.geoip_error = "HTTP 503 from download.db-ip.com"
         self.geoip_month = time.strftime("%Y-%m", time.gmtime())
+        # auto-update (tnt.updater): the fake manager's state (POST /mock/update {"state"}) and its error text
+        self.update_state = "available"
+        self.update_error = "HTTP 403 from api.github.com: the rate limit may be reached"
         self.public_ip_ts = time.time() - 4 * 60
         # the network this fake PC is on (NET_PROFILE_NAMES) and the change counter status.net reports
         self.net_profile = "a"
@@ -1991,15 +2639,31 @@ class MockState:
             return {"id": len(self.speedtests) + 1, "ts": ts, "ok": False, "backend": "cloudflare", "server": None,
                     "isp": None, "external_ip": None, "latency_ms": None, "jitter_ms": None,
                     "download_mbps": None, "upload_mbps": None, "packet_loss_pct": None, "duration_s": 12.1,
-                    "error": "HTTP 503 from speed.cloudflare.com"}
+                    "error": "HTTP 503 from speed.cloudflare.com", "quality": None}
         down = 118 * f * (1 + rng.gauss(0, 0.05))
         up = 31 * (0.9 if evening else 1.0) * (1 + rng.gauss(0, 0.05))
         lat = 12 + (7 if evening else 0) + rng.gauss(0, 1.4)
-        return {"id": len(self.speedtests) + 1, "ts": ts, "ok": True, "backend": "cloudflare",
-                "server": "Cloudflare AMS", "isp": "Example ISP", "external_ip": "203.0.113.5",
-                "latency_ms": round(max(3, lat), 1), "jitter_ms": round(1 + abs(rng.gauss(0, 0.8)), 2),
-                "download_mbps": round(max(1, down), 1), "upload_mbps": round(max(1, up), 1),
-                "packet_loss_pct": 0.0, "duration_s": round(16 + rng.random() * 3, 1), "error": None}
+        row = {"id": len(self.speedtests) + 1, "ts": ts, "ok": True, "backend": "cloudflare",
+               "server": "Cloudflare AMS", "isp": "Example ISP", "external_ip": "203.0.113.5",
+               "latency_ms": round(max(3, lat), 1), "jitter_ms": round(1 + abs(rng.gauss(0, 0.8)), 2),
+               "download_mbps": round(max(1, down), 1), "upload_mbps": round(max(1, up), 1),
+               "packet_loss_pct": 0.0, "duration_s": round(16 + rng.random() * 3, 1), "error": None}
+        row["quality"] = self._speed_quality(row["latency_ms"], row["jitter_ms"], evening)
+        return row
+
+    @staticmethod
+    def _speed_quality(lat: float, jitter: float, evening: bool) -> Dict[str, Any]:
+        """The latency-under-load result of a test (no draws of the shared random generator): idle at the test's latency,
+        loaded 9 / 21 ms higher (grade A), in the evening 24 / 47 ms higher with an echo lost each way (grade B)."""
+        def window(sent: int, received: int, mean: float, spread: float) -> Dict[str, Any]:
+            return {"sent": sent, "received": received, "skipped": 0, "loss_pct": round(100.0 * (sent - received) / sent, 1),
+                    "median_ms": round(mean - 0.4, 1), "mean_ms": round(mean, 1), "p95_ms": round(mean + 2 * spread, 1),
+                    "max_ms": round(mean + 3 * spread, 1), "jitter_ms": round(spread, 1)}
+
+        baseline = dict(window(30, 30, lat + 0.4, jitter), median_ms=lat)
+        down, up = (24.0, 47.0) if evening else (9.0, 21.0)
+        lost = 1 if evening else 0
+        return speed_quality(baseline, window(44, 44 - lost, lat + down, jitter * 1.8), window(38, 38 - lost, lat + up, jitter * 2.4))
 
     # (ip, hostname, mac, vendor, rtt_ms, open_ports, device_type) - the device_type values are what
     # tnt.discovery.classify_device would return for these rows (10.0.0.251 is the mock gateway)
@@ -2278,8 +2942,9 @@ class MockState:
                     "interval_min": self.settings["speedtest"]["interval_min"], "progress": dict(self.speed_progress)}
 
     def speed_history(self, start: float, end: float, limit: Optional[int]) -> List[Dict[str, Any]]:
+        """The tests in [start, end), newest first; like the service's list, a row has no ``quality``."""
         with self.lock:
-            rows = [r for r in self.speedtests if start <= r["ts"] < end]
+            rows = [{k: v for k, v in r.items() if k != "quality"} for r in self.speedtests if start <= r["ts"] < end]
             rows.sort(key=lambda r: r["ts"], reverse=True)
             return rows[:limit] if limit else rows
 
@@ -2288,7 +2953,7 @@ class MockState:
             if self.speed_running:
                 return False
             self.speed_running = True
-            self.speed_progress = {"phase": "latency", "pct": 0.0}
+            self.speed_progress = {"phase": "baseline", "pct": 0.0}
         threading.Thread(target=self._speed_worker, name="mock-speed", daemon=True).start()
         return True
 
@@ -2306,9 +2971,8 @@ class MockState:
 
     def _speed_worker(self) -> None:
         self.hub.publish("speedtest.start", {"backend": "cloudflare"})
-        phases = [("latency", 1.2), ("download", 3.0), ("upload", 2.6)]
         try:
-            for phase, dur in phases:
+            for phase, dur in SPEED_PHASES:
                 t0 = time.time()
                 while time.time() - t0 < dur:
                     pct = min(1.0, (time.time() - t0) / dur)
@@ -2846,6 +3510,70 @@ class MockState:
         self.hub.publish("geoip.state", status)
         return state
 
+    # -- auto-update (tnt.updater) ---------------------------------------
+    def _update_enabled(self) -> bool:
+        with self.lock:
+            return bool((self.settings.get("update") or {}).get("enabled", True))
+
+    def _update_auto(self) -> bool:
+        with self.lock:
+            return bool((self.settings.get("update") or {}).get("auto_install", False))
+
+    def update_status(self) -> Dict[str, Any]:
+        """status.update / GET /api/update, shaped like tnt.updater.UpdateManager.status() (exactly
+        UPDATE_STATUS_KEYS) for ``update_state``; the disabled shape as soon as the setting is off."""
+        with self.lock:
+            st: Dict[str, Any] = dict.fromkeys(UPDATE_STATUS_KEYS)
+            st.update(current_version=VERSION, auto_install=self._update_auto())
+            if not self._update_enabled():
+                st.update(enabled=False, state="disabled")
+                return st
+            now = time.time()
+            state = self.update_state
+            # a stable next check (like the geoip mock) so two reads of the same state compare equal
+            st.update(enabled=True, state=state, checked_ts=self.started_ts, next_check_ts=self.started_ts + 24 * 3600)
+            setup = f"TNT-Setup-{UPDATE_LATEST_VERSION}.exe"
+            offering = state in ("available", "downloading", "verifying", "ready", "installing")
+            if offering:
+                st.update(latest_version=UPDATE_LATEST_VERSION, latest_ts=self.started_ts - 2 * 3600,
+                          notes_url=f"https://github.com/rhuntertec/TNT/releases/tag/v{UPDATE_LATEST_VERSION}",
+                          asset={"name": setup, "bytes": UPDATE_SETUP_BYTES})
+            if state == "downloading":
+                st["download"] = {"received": int(UPDATE_SETUP_BYTES * 0.4), "total": UPDATE_SETUP_BYTES, "phase": "download"}
+            elif state == "verifying":
+                st["download"] = {"received": UPDATE_SETUP_BYTES, "total": UPDATE_SETUP_BYTES, "phase": "verify"}
+            elif state == "error":
+                st.update(error=self.update_error, next_check_ts=now + 60)
+            return st
+
+    def update_check(self) -> Dict[str, Any]:
+        """POST /api/update/check: pretend to look and land on "available" (or stay disabled)."""
+        with self.lock:
+            if not self._update_enabled():
+                return self.update_status()
+            self.update_state = "available"
+            status = self.update_status()
+        self.hub.publish("update.state", status)
+        return status
+
+    def update_install(self) -> Dict[str, Any]:
+        """POST /api/update/install: begin the (fake) download; the UI watches update.state for progress."""
+        with self.lock:
+            self.update_state = "downloading"
+            status = self.update_status()
+        self.hub.publish("update.state", status)
+        return status
+
+    def update_set_state(self, state: str) -> str:
+        """POST /mock/update: move the fake manager to another UPDATE_STATES state (not "disabled": the setting)."""
+        if state not in UPDATE_STATES[1:]:
+            raise ValueError(f"unknown update state {state!r}; one of: {', '.join(UPDATE_STATES[1:])}")
+        with self.lock:
+            self.update_state = state
+            status = self.update_status()
+        self.hub.publish("update.state", status)
+        return state
+
     # -- Tools: traceroute -----------------------------------------------
     @staticmethod
     def _hop_stats(rtts: List[Optional[float]]) -> Dict[str, Any]:
@@ -3071,6 +3799,694 @@ class MockState:
             })
         return {"available": True, "interfaces": [dict(WIFI_INTERFACE)], "profiles": profiles,
                 "error": None, "source": "wlanapi", "ts": time.time()}
+
+    # -- Tools: DNS lookup, Flush DNS, IP Release/Renew (tnt.nettools) ----
+    def dns_lookup(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        """POST /api/tools/dns/lookup like the service: the name and the server checked (ValueError, a 400, with its text), then
+        after a short wait the DNS_RESULT from DNS_ZONE / DNS_PTR. The server asked is the one given (a name is found in the fake
+        data first), else the first DNS server of this PC's internet adapter on the network it is on. ``type`` null or empty is
+        Auto; another type reads the CNAME rows and the rows of that type, like tnt.nettools' typed lookup."""
+        name, server, record_type = body.get("name"), body.get("server"), body.get("type")
+        # the route's own checks first (tnt.api.routes.tools_dns_lookup), then tnt.nettools.validate_lookup's order
+        if name is not None and not isinstance(name, str):
+            raise ValueError("name must be text")
+        if server is not None and not isinstance(server, str):
+            raise ValueError("server must be text or null")
+        if record_type is not None and not isinstance(record_type, str):
+            raise ValueError(DNS_TYPE_NOT_TEXT_MSG)
+        name = dns_query_name(name or "")
+        server = dns_query_server(server)
+        rtype = dns_query_type(record_type)
+        if rtype not in (None, "PTR", "ALL") and dns_address(name) is not None:
+            raise ValueError(DNS_IP_TYPE_MSG)
+        t0 = time.time()
+        out: Dict[str, Any] = {"name": name, "type": rtype, "server": server, "resolver": {"name": None, "address": None}, "answer_name": None,
+                               "addresses": [], "aliases": [], "records": [], "authoritative": None, "ok": False, "error": None}
+
+        def done(**fields: Any) -> Dict[str, Any]:
+            out.update(fields)
+            out["duration_ms"] = int(round((time.time() - t0) * 1000))
+            out["ts"] = time.time()
+            return out
+
+        time.sleep(self.dns_delay_s)
+        if server is None:
+            with self.lock:
+                nic = net_internet_nic(net_profile(self.net_profile))
+            asked = nic["dns"][0] if nic and nic["dns"] else None
+            if asked is None:
+                return done(error=DNS_NO_SERVER_MSG)
+            out["resolver"] = {"name": DNS_PTR.get(asked), "address": asked}
+        elif dns_address(server) is not None:
+            out["resolver"] = {"name": None, "address": server}
+        else:
+            found = [value for rtype, _, value, _ in DNS_ZONE.get(server.lower(), []) if rtype == "A"]
+            if not found:
+                return done(error=f'Could not find the DNS server "{server}"')
+            out["resolver"] = {"name": server, "address": found[0]}
+        if out["resolver"]["address"] == DNS_SILENT_SERVER:
+            time.sleep(self.dns_delay_s)
+            return done(error=DNS_TIMEOUT_MSG)
+        addr = dns_address(name)
+        if addr is not None:
+            # an address is a reverse (PTR) lookup: the answer is its name, the address the one looked up
+            plain = ipaddress.ip_address(str(addr).split("%", 1)[0])
+            ptr = DNS_PTR.get(str(plain)) or "host-" + re.sub(r"[.:]", "-", str(plain)) + ".example.net"
+            return done(answer_name=ptr, addresses=[str(plain)], records=[{"type": "PTR", "name": plain.reverse_pointer, "value": ptr, "ttl": 3600}],
+                        authoritative=False, ok=True)
+        rows = DNS_ZONE.get(name.lower())
+        if rows is None:
+            return done(error=DNS_NXDOMAIN_MSG)
+        if rtype == "ALL":
+            # every type in DNS_ALL_TYPES at once: the CNAME chain, then the chain end's records of each type, merged and deduped
+            hops = [row for row in rows if row[0] == "CNAME"]
+            end = hops[-1][2] if hops else name
+            tail = DNS_ZONE.get(end.lower(), []) if hops else rows
+            merged: List[Dict[str, Any]] = []
+            seen: set = set()
+
+            def add_row(row: Tuple[str, str, str, int]) -> None:
+                value = row[2] if row[0] in ("TXT", "CAA", "NAPTR") else row[2].lower()
+                key = (row[0], row[1].lower(), value)
+                if key not in seen:
+                    seen.add(key)
+                    merged.append(dict(zip(DNS_RECORD_KEYS, row)))
+
+            for row in hops:
+                add_row(row)
+            for t in DNS_ALL_TYPES:
+                if t == "CNAME":
+                    continue
+                for row in tail:
+                    if row[0] == t:
+                        add_row(row)
+            aliases = [row[1] for row in hops]
+            addresses = [r["value"] for r in merged if r["type"] == "A"] + [r["value"] for r in merged if r["type"] == "AAAA"]
+            if not merged:
+                return done(answer_name=end, aliases=aliases, records=merged, authoritative=False, error=DNS_NO_ADDRESSES_MSG)
+            return done(answer_name=end, addresses=addresses, aliases=aliases, records=merged, authoritative=False, ok=True)
+        if rtype is not None:
+            # every answer is listed; found = the records of the type owned by a name on the CNAME chain (for CNAME, the chain's own)
+            hops = [row for row in rows if row[0] == "CNAME"]
+            end = hops[-1][2] if hops else name
+            tail = [] if rtype == "CNAME" else [row for row in (DNS_ZONE.get(end.lower(), []) if hops else rows) if row[0] == rtype]
+            answers = [dict(zip(DNS_RECORD_KEYS, row)) for row in hops + tail]
+            names = {name.lower()} | {row[2].lower() for row in hops}
+            found = [r["value"] for r in answers if r["type"] == rtype and r["name"].lower() in names]
+            fields: Dict[str, Any] = {"records": answers, "aliases": [row[1] for row in hops]}
+            if found or hops:
+                fields["answer_name"] = found[0] if rtype == "PTR" and found else end
+            if not found:
+                return done(error=DNS_NO_RECORDS_MSG.format(rtype), **fields)
+            if rtype in ("A", "AAAA"):
+                fields["addresses"] = list(dict.fromkeys(found))
+            return done(authoritative=False, ok=True, **fields)
+        rows = [row for row in rows if row[0] in ("CNAME", "A", "AAAA")]
+        records = [dict(zip(DNS_RECORD_KEYS, row)) for row in rows]
+        aliases = [r["name"] for r in records if r["type"] == "CNAME"]
+        answer = next((r["value"] for r in reversed(records) if r["type"] == "CNAME"), name)
+        addresses = [r["value"] for r in records if r["type"] == "A"] + [r["value"] for r in records if r["type"] == "AAAA"]
+        if not addresses:
+            return done(answer_name=answer, aliases=aliases, records=records, authoritative=False, error=DNS_NO_ADDRESSES_MSG)
+        return done(answer_name=answer, addresses=addresses, aliases=aliases, records=records, authoritative=False, ok=True)
+
+    def dns_flush(self) -> Dict[str, Any]:
+        """POST /api/tools/dns/flush: the service empties the Windows DNS cache; here it is ok after a short wait."""
+        t0 = time.time()
+        time.sleep(self.dns_flush_s)
+        return {"ok": True, "method": "native", "error": None, "duration_ms": int(round((time.time() - t0) * 1000)), "ts": time.time()}
+
+    def ip_renew(self) -> Dict[str, Any]:
+        """POST /api/tools/ip/renew: one release/renew at a time (RuntimeError, a 409). Like the service it releases and renews
+        every connected DHCP adapter of the network the fake PC is on, with ping monitoring paused meanwhile (paused_monitoring:
+        it was running), and answers the internet adapter's address. A DHCP adapter no server answers on (network "a"'s
+        self-assigned Ethernet 2) is a warning; with none renewed it is not ok."""
+        with self.lock:
+            if self.ip_renew_running:
+                raise RuntimeError(IP_RENEW_BUSY_MSG)
+            self.ip_renew_running = True
+            paused = not self.paused
+        t0 = time.time()
+        try:
+            time.sleep(self.ip_renew_s)
+            with self.lock:
+                prof = net_profile(self.net_profile)
+            adapters: List[Dict[str, Any]] = []
+            warnings: List[str] = []
+            for a in prof["adapters"]:
+                if a["status"] != "up" or not a["dhcp_enabled"]:
+                    continue
+                answered = bool(a["ipv4"]) and not a["ipv4"][0]["address"].startswith("169.254.")
+                adapters.append({"name": a["name"], "released": True, "renewed": answered, "error": None if answered else "No DHCP server answered"})
+                if not answered:
+                    warnings.append(f"{a['name']}: no DHCP server answered, it kept a self-assigned address")
+            if not adapters:
+                error = IP_RENEW_NO_DHCP_MSG
+            elif not any(x["renewed"] for x in adapters):
+                error = IP_RENEW_NO_ADDRESS_MSG
+            else:
+                error = None
+            nic = net_internet_nic(prof)
+            renewed_nic = error is None and nic is not None and any(x["name"] == nic["name"] and x["renewed"] for x in adapters)
+            return {"ok": error is None, "address": nic["ipv4"][0]["address"] if renewed_nic else None,
+                    "adapter": nic["name"] if renewed_nic else None, "adapters": adapters, "warnings": warnings, "paused_monitoring": paused,
+                    "method": "native", "error": error, "duration_ms": int(round((time.time() - t0) * 1000)), "ts": time.time()}
+        finally:
+            with self.lock:
+                self.ip_renew_running = False
+
+    # -- Network info: NAT check, switch port, port-forward test --------
+    def nat_view(self) -> Dict[str, Any]:
+        """GET /api/netcheck/nat: the result kept for this network and whether a check runs."""
+        with self.lock:
+            return {"result": copy.deepcopy(self.nat_last), "running": self.nat_running}
+
+    def _nat_result(self, ts: float, profile: Optional[str] = None, generation: Optional[int] = None) -> Dict[str, Any]:
+        """A NAT_RESULT for the network the fake PC is on (or *profile*, with its *generation*): "a" a single NAT, "b" a
+        carrier-grade NAT, the others offline with the service's error (no internet adapter, or no public address)."""
+        name = self.net_profile if profile is None else profile
+        prof = net_profile(name)
+        result: Dict[str, Any] = {"ts": ts, "generation": self.net_generation if generation is None else generation, "duration_ms": 0,
+                                  "verdict": "offline", "confidence": None,
+                                  "title": NAT_TEXT["offline"][0], "explanation": NAT_TEXT["offline"][1],
+                                  "router": {"gateway": None, "wan_ip": None, "wan_source": None,
+                                             "natpmp": {"answered": False, "result": None, "external_ip": None},
+                                             "upnp": dict(dict.fromkeys(UPNP_KEYS), found=False)},
+                                  "public_ip": None, "trace": None, "port_mappings": None, "error": None}
+        public = prof["public_ip"]
+        if prof["internet_nic_index"] is None or not public:
+            result["error"] = NAT_NO_INTERNET_ERROR if prof["internet_nic_index"] is None else NAT_NO_PUBLIC_IP_ERROR
+            return result
+        router = result["router"]
+        router["gateway"] = prof["default_gateway"]
+        if name == "b":
+            verdict, wan, source = "cgnat", NAT_CGNAT_WAN_IP, "natpmp"          # the router answers NAT-PMP only
+        else:
+            verdict, wan, source = "single_nat", public, "upnp"
+            router["upnp"] = {"found": True, "server": NAT_ROUTER_SERVER, "model": NAT_ROUTER_MODEL, "service": NAT_UPNP_SERVICE,
+                              "status": "Connected", "external_ip": public, "error": None}
+            result["port_mappings"] = {"entries": [dict(zip(MAPPING_KEYS, row)) for row in NAT_PORT_MAPPINGS], "truncated": False,
+                                       "error": None}
+        router.update(wan_ip=wan, wan_source=source, natpmp={"answered": True, "result": 0, "external_ip": wan})
+        result.update(verdict=verdict, confidence="high", title=NAT_TEXT[verdict][0], explanation=NAT_TEXT[verdict][1], public_ip=public,
+                      duration_ms=NAT_PROBE_MS + int(round((time.time() - ts) * 1000)))
+        return result
+
+    def nat_run(self) -> Dict[str, Any]:
+        """POST /api/netcheck/nat: check now (after nat_delay_s), 409 while a check runs. Like NatChecker.run the result describes
+        the network the check started on and carries that generation; an offline result is not kept, nor one a network change
+        overtook."""
+        with self.lock:
+            if self.nat_running:
+                raise ToolRefused(409, "conflict", NAT_BUSY_TEXT)
+            self.nat_running = True
+            epoch, delay, profile, generation = self.nat_epoch, self.nat_delay_s, self.net_profile, self.net_generation
+        t0 = time.time()
+        try:
+            if delay > 0:
+                time.sleep(delay)
+            with self.lock:
+                result = self._nat_result(t0, profile, generation)
+                if result["verdict"] != "offline" and self.nat_epoch == epoch:
+                    self.nat_last = copy.deepcopy(result)
+            return result
+        finally:
+            with self.lock:
+                self.nat_running = False
+
+    @staticmethod
+    def _wired_adapters(prof: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """The adapters a switch port can be looked up on (tnt.switchport: Ethernet, physical, up)."""
+        return [{"name": a["name"], "index": a["index"], "mac": a["mac"], "is_internet": a["index"] == prof["internet_nic_index"]}
+                for a in prof["adapters"] if a["if_type"] == 6 and a["is_physical"] and a["status"] == "up"]
+
+    def _pktmon_holder(self) -> Optional[str]:
+        """Who holds Packet Monitor (tnt.pktmon.LOCK): "switchport" while a search listens, "capture" while a capture runs."""
+        if self.switch_job is not None and self.switch_job["state"] == "listening":
+            return "switchport"
+        if self.capture_job is not None and self.capture_job["state"] in CAPTURE_RUNNING_STATES:
+            return "capture"
+        return None
+
+    def _switch_job_locked(self) -> Dict[str, Any]:
+        """The latest search, else the newest kept one, else an idle job (a copy)."""
+        if self.switch_job is not None:
+            return copy.deepcopy(self.switch_job)
+        if self.switch_kept:
+            return copy.deepcopy(max(self.switch_kept.values(), key=lambda j: j.get("ts") or 0.0))
+        return dict(dict.fromkeys(SWITCH_JOB_KEYS), state="idle", neighbors=[], generation=self.net_generation)
+
+    def switch_status(self) -> Dict[str, Any]:
+        """GET /api/netcheck/switch (SWITCH_STATUS)."""
+        with self.lock:
+            return {"job": self._switch_job_locked(), "adapters": self._wired_adapters(net_profile(self.net_profile)),
+                    "available": self.pktmon_reason is None, "reason": self.pktmon_reason}
+
+    def switch_start(self, adapter: Any, seconds: Any) -> Dict[str, Any]:
+        """POST /api/netcheck/switch, checked in tnt.switchport's order: Packet Monitor, the adapter (by name, else the internet
+        adapter when it is wired, else the first wired one), the seconds (null: 65, clamped to 20-120), one search at a time and
+        the lock a running capture holds. Answers the listening job."""
+        with self.lock:
+            if self.pktmon_reason:
+                raise ToolRefused(409, "unavailable", self.pktmon_reason)
+            wired = self._wired_adapters(net_profile(self.net_profile))
+            if adapter is not None and not isinstance(adapter, str):
+                raise ValueError(SWITCH_ADAPTER_TEXT.format(name=str(adapter)[:40]))
+            name = (adapter or "").strip()
+            chosen = next((a for a in wired if a["name"] == name), None) if name else next((a for a in wired if a["is_internet"]),
+                                                                                           wired[0] if wired else None)
+            if chosen is None:
+                if name:
+                    raise ValueError(SWITCH_ADAPTER_TEXT.format(name=name[:40]))
+                raise ToolRefused(409, "unavailable", SWITCH_NO_WIRED_TEXT)
+            if seconds is None:
+                seconds = SWITCH_DEFAULT_SECONDS
+            if isinstance(seconds, bool) or not (isinstance(seconds, int) or (isinstance(seconds, float) and seconds.is_integer())):
+                raise ValueError(SWITCH_SECONDS_TEXT)
+            listen_s = max(SWITCH_SECONDS_RANGE[0], min(SWITCH_SECONDS_RANGE[1], int(seconds)))
+            if self.switch_job is not None and self.switch_job["state"] == "listening":
+                raise ToolRefused(409, "conflict", SWITCH_BUSY_TEXT)
+            holder = self._pktmon_holder()
+            if holder:
+                raise ToolRefused(409, "conflict", PKTMON_LOCK_TEXTS[holder])
+            now = time.time()
+            job = {"state": "listening", "adapter": {k: chosen[k] for k in SWITCH_JOB_ADAPTER_KEYS}, "started_ts": now, "listen_s": listen_s,
+                   "elapsed_s": 0.0, "neighbors": [], "error": None, "reason": None, "generation": self.net_generation, "ts": now}
+            self.switch_job = job
+            self.switch_gen += 1
+            gen = self.switch_gen
+            snap = copy.deepcopy(job)
+        self.hub.publish("netcheck.switch", {"job": snap})
+        threading.Thread(target=self._switch_worker, args=(gen, job), name="mock-switchport", daemon=True).start()
+        return snap
+
+    def _switch_worker(self, gen: int, job: Dict[str, Any]) -> None:
+        """The listen: its progress every half second, then after switch_listen_s the switch it heard (kept for the adapter)."""
+        t0 = time.time()
+        while True:
+            with self.lock:
+                if self.switch_gen != gen:
+                    return
+                listen, elapsed = self.switch_listen_s, time.time() - t0
+                job.update(elapsed_s=round(min(elapsed, listen), 1), ts=time.time())
+                snap = copy.deepcopy(job)
+            if elapsed >= listen:
+                break
+            self.hub.publish("netcheck.switch", {"job": snap})
+            time.sleep(max(0.02, min(0.5, listen - elapsed)))
+        with self.lock:
+            if self.switch_gen != gen:
+                return
+            found, now = self.switch_found, time.time()
+            job.update(state="done", neighbors=[copy.deepcopy(MOCK_NEIGHBOR)] if found else [],
+                       reason=None if found else SWITCH_NO_NEIGHBOR_TEXT.format(seconds=job["listen_s"]), generation=self.net_generation, ts=now)
+            self.switch_kept[job["adapter"]["mac"]] = copy.deepcopy(job)
+            snap = copy.deepcopy(job)
+        self.hub.publish("netcheck.switch", {"job": snap})
+
+    def switch_stop(self) -> Dict[str, Any]:
+        """DELETE /api/netcheck/switch: cancel a listen (nothing is kept); the latest job either way."""
+        with self.lock:
+            job = self.switch_job
+            if job is None or job["state"] != "listening":
+                return self._switch_job_locked()
+            self.switch_gen += 1
+            now = time.time()
+            job.update(state="cancelled", elapsed_s=round(now - job["started_ts"], 1), ts=now)
+            snap = copy.deepcopy(job)
+        self.hub.publish("netcheck.switch", {"job": snap})
+        return snap
+
+    def _portcheck_wait(self, now: float) -> float:
+        """Seconds until another test may start (tnt.portcheck.PortChecker._rate_wait, between monotonic starts); 0 turns a limit off."""
+        self.portcheck_starts = [s for s in self.portcheck_starts if now - s < PORTCHECK_RATE_WINDOW_S]
+        starts, last, wait = self.portcheck_starts, self.portcheck_last_start, 0.0
+        if self.portcheck_min_gap_s > 0 and last is not None and now - last < self.portcheck_min_gap_s:
+            wait = self.portcheck_min_gap_s - (now - last)
+        if self.portcheck_per_hour > 0 and len(starts) >= self.portcheck_per_hour:
+            wait = max(wait, starts[len(starts) - int(self.portcheck_per_hour)] + PORTCHECK_RATE_WINDOW_S - now)
+        return wait
+
+    def portcheck_test(self, port: Any) -> Dict[str, Any]:
+        """POST /api/netcheck/portforward, refused in tnt.portcheck's order before anything runs: the port (400), a VPN, no fresh
+        public address, a test running (409), the rate limits (429 with Retry-After). After portcheck_delay_s PORTCHECK_OPEN_PORT
+        answers, PORTCHECK_ERROR_PORT reaches neither port checker and any other port does not answer."""
+        if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+            raise ValueError(PORTCHECK_PORT_TEXT)
+        with self.lock:
+            verdict = (self.nat_last or {}).get("verdict")
+            if verdict == "vpn":
+                raise ToolRefused(409, "vpn", PORTCHECK_VPN_TEXT)
+            generation = self.net_generation
+            public = self._public_ip_view(time.time())
+            if not public["ip"] or public["ts"] is None or (self.net_changed_ts is not None and public["ts"] < self.net_changed_ts):
+                raise ToolRefused(409, "no_public_ip", PORTCHECK_NO_IP_TEXT)
+            if self.portcheck_running:
+                raise ToolRefused(409, "conflict", PORTCHECK_BUSY_TEXT)
+            start = time.monotonic()
+            wait = self._portcheck_wait(start)
+            if wait > 0:
+                seconds = max(1, math.ceil(round(wait, 6)))
+                raise ToolRefused(429, "rate_limited", PORTCHECK_RATE_TEXT.format(seconds=seconds), headers={"Retry-After": str(seconds)})
+            self.portcheck_running = True
+            self.portcheck_last_start = start
+            self.portcheck_starts.append(start)
+            ip, delay = public["ip"], self.portcheck_delay_s
+        ts = time.time()
+        try:
+            time.sleep(max(0.0, delay))
+            names = PORTCHECK_PROVIDER_NAMES
+            if port == PORTCHECK_ERROR_PORT:
+                reason = f"{names['portchecker.io']} {PORTCHECK_REASON_TIMEOUT}, {names['globalping']} {PORTCHECK_REASON_TIMEOUT}"
+                reachable, provider, detail, error = None, "globalping", None, PORTCHECK_FAILED_TEXT.format(reason=reason)
+            elif port == PORTCHECK_OPEN_PORT:
+                reachable, provider, detail, error = True, "portchecker.io", PORTCHECKER_OPEN_DETAIL, None
+            else:
+                reachable, provider, detail, error = False, "portchecker.io", PORTCHECKER_CLOSED_DETAIL, None
+            result = {"ts": ts, "generation": generation, "port": port, "protocol": PORTCHECK_PROTOCOL, "public_ip": ip,
+                      "reachable": reachable, "provider": provider, "detail": detail, "nat_verdict": verdict, "error": error,
+                      "duration_ms": max(0, int(round((time.monotonic() - start) * 1000)))}
+            with self.lock:
+                if self.net_generation == generation:
+                    self.portcheck_last = copy.deepcopy(result)
+            return result
+        finally:
+            with self.lock:
+                self.portcheck_running = False
+
+    # -- Tools: TFTP server (tnt.tftp) -----------------------------------
+    @staticmethod
+    def _tftp_candidates(prof: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """The adapters it can serve on (tnt.tftp._candidates): up, with an IPv4 address."""
+        return [a for a in prof["adapters"] if a["status"] == "up" and a["ipv4"]]
+
+    @staticmethod
+    def _tftp_adapter_row(a: Dict[str, Any], prof: Dict[str, Any]) -> Dict[str, Any]:
+        first = a["ipv4"][0]
+        return {"name": a["name"], "index": a["index"], "ip": first["address"], "prefix": first["prefix"], "type_name": a["type_name"],
+                "is_physical": a["is_physical"], "is_internet": a["index"] == prof["internet_nic_index"], "status": a["status"]}
+
+    @staticmethod
+    def _tftp_pick(wanted: str, candidates: List[Dict[str, Any]], prof: Dict[str, Any]) -> Dict[str, Any]:
+        """tnt.tftp._pick_adapter: the named adapter, else the first physical Ethernet, else the internet adapter, else the first."""
+        if wanted:
+            match = next((a for a in candidates if a["name"] == wanted), None)
+            if match is None:
+                raise ValueError(f"adapter '{wanted}' is not up or has no IPv4 address")
+            return match
+        pick = (next((a for a in candidates if a["if_type"] == 6 and a["is_physical"]), None)
+                or next((a for a in candidates if a["index"] == prof["internet_nic_index"]), None) or (candidates[0] if candidates else None))
+        if pick is None:
+            raise ValueError("no network adapter is up with an IPv4 address")
+        return pick
+
+    def tftp_summary(self) -> Dict[str, Any]:
+        """status.tftp and the tftp.state event (TftpServer.summary)."""
+        with self.lock:
+            running = self.tftp_running
+            return {"available": True, "running": running, "adapter": self.tftp_adapter["name"] if running and self.tftp_adapter else None,
+                    "listen_ips": [e["ip"] for e in self.tftp_listen] if running else [], "active": len(self.tftp_transfers),
+                    "uploads": self.tftp_uploads, "since_ts": self.tftp_since, "error": self.tftp_error}
+
+    def tftp_status(self) -> Dict[str, Any]:
+        """GET /api/tftp/status (TftpServer.status): while it is off, the adapter a start would pick (or the reason there is none)."""
+        with self.lock:
+            prof = net_profile(self.net_profile)
+            candidates = self._tftp_candidates(prof)
+            settings = self.settings["tftp"]
+            adapter, warning = (self.tftp_adapter if self.tftp_running else None), None
+            if adapter is None:
+                try:
+                    adapter = self._tftp_adapter_row(self._tftp_pick(settings["adapter"], candidates, prof), prof)
+                except ValueError as exc:
+                    warning = None if self.tftp_running else str(exc)
+            return {"available": True, "running": self.tftp_running, "since_ts": self.tftp_since, "error": self.tftp_error, "warning": warning,
+                    "adapter": copy.deepcopy(adapter), "adapters": [self._tftp_adapter_row(a, prof) for a in candidates],
+                    "listen": copy.deepcopy(self.tftp_listen), "root": TFTP_ROOT, "uploads": self.tftp_uploads,
+                    "firewall": {"rule": TFTP_FIREWALL_RULE, "ok": None, "error": None}, "conflict": copy.deepcopy(self.tftp_conflict),
+                    "transfers": copy.deepcopy(self.tftp_transfers), "history": copy.deepcopy(self.tftp_history),
+                    "counts": {k: len(self.tftp_transfers) if k == "active" else self.tftp_counts[k] for k in TFTP_COUNT_KEYS},
+                    "settings": {k: settings[k] for k in TFTP_SETTINGS_KEYS}}
+
+    def tftp_files(self) -> List[Dict[str, Any]]:
+        """GET /api/tftp/files: TFTP_FILES, sorted by name like TftpServer.files."""
+        rows = [{"name": name, "size": size, "mtime": self.started_ts - age} for name, size, age in TFTP_FILES]
+        return sorted(rows, key=lambda f: f["name"].casefold())
+
+    def tftp_start(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        """POST /api/tftp/start {"adapter", "uploads"} with the service's 400s; the status unchanged while it runs, 409
+        ``tftp_port_in_use`` with the owners while tftp_port_owners lists any. A phone reads its file soon after a start."""
+        adapter, uploads = body.get("adapter"), body.get("uploads", False)
+        if not isinstance(uploads, bool):
+            raise ValueError("uploads must be true or false")
+        if adapter is not None and not isinstance(adapter, str):
+            raise ValueError("adapter must be a name or null")
+        with self.lock:
+            if self.tftp_running:
+                return self.tftp_status()
+            self.tftp_error, self.tftp_conflict = None, None
+            prof = net_profile(self.net_profile)
+            wanted = self.settings["tftp"]["adapter"] if adapter is None else adapter.strip()
+            chosen = self._tftp_pick(wanted, self._tftp_candidates(prof), prof)
+            owners = [dict(o) for o in self.tftp_port_owners]
+            refused = None
+            if owners:
+                self.tftp_error = f"UDP port {TFTP_PORT} is already used by {', '.join(str(o['name']) for o in owners)}"
+                self.tftp_conflict = {"port": TFTP_PORT, "owners": owners}
+                refused = ToolRefused(409, TFTP_PORT_IN_USE_CODE, self.tftp_error, extra={"owners": owners})
+            else:
+                self.tftp_running, self.tftp_since, self.tftp_uploads = True, time.time(), uploads
+                self.tftp_adapter = self._tftp_adapter_row(chosen, prof)
+                self.tftp_listen = [{"ip": e["address"], "port": TFTP_PORT} for e in chosen["ipv4"]]
+                self.tftp_gen += 1
+            gen, fast = self.tftp_gen, self.tftp_fast
+        self.hub.publish("tftp.state", self.tftp_summary())
+        if refused is not None:
+            raise refused
+        threading.Thread(target=self._tftp_worker, args=(gen, fast), name="mock-tftp", daemon=True).start()
+        return self.tftp_status()
+
+    def tftp_stop(self) -> Dict[str, Any]:
+        """POST /api/tftp/stop: transfers end cancelled and uploads switch off; the error of a stop for a network change stays."""
+        ended: List[Dict[str, Any]] = []
+        with self.lock:
+            was = self.tftp_running
+            self.tftp_running, self.tftp_uploads, self.tftp_since, self.tftp_adapter, self.tftp_listen = False, False, None, None, []
+            self.tftp_gen += 1
+            now = time.time()
+            for tr in self.tftp_transfers:
+                tr.update(state="cancelled", error=TFTP_MSG_CANCELLED, ended_ts=now)
+                self.tftp_counts["cancelled"] += 1
+                ended.append(copy.deepcopy(tr))
+            self.tftp_history = (list(reversed(self.tftp_transfers)) + self.tftp_history)[:TFTP_HISTORY_KEEP]
+            self.tftp_transfers = []
+        for tr in ended:
+            self.hub.publish("tftp.transfer", {"transfer": tr})
+        if was:
+            self.hub.publish("tftp.state", self.tftp_summary())
+        return self.tftp_status()
+
+    def tftp_set_uploads(self, on: Any) -> Dict[str, Any]:
+        """POST /api/tftp/uploads {"on"} (never saved)."""
+        if not isinstance(on, bool):
+            raise ValueError("on must be true or false")
+        with self.lock:
+            changed = self.tftp_uploads != on
+            self.tftp_uploads = on
+        if changed:
+            self.hub.publish("tftp.state", self.tftp_summary())
+        return self.tftp_status()
+
+    def tftp_update_settings(self, patch: Any) -> Dict[str, Any]:
+        """PUT /api/tftp/settings {"adapter", "max_upload_mb"} with TftpServer.update_settings' checks and texts."""
+        if not isinstance(patch, dict):
+            raise ValueError("settings patch must be an object")
+        unknown = sorted(str(k) for k in patch if k not in TFTP_SETTINGS_KEYS)
+        if unknown:
+            raise ValueError(f"unknown TFTP setting '{unknown[0][:40]}'")
+        new: Dict[str, Any] = {}
+        with self.lock:
+            if "adapter" in patch:
+                value = patch.get("adapter")
+                if value is not None and not isinstance(value, str):
+                    raise ValueError("adapter must be a name or empty")
+                name = (value or "").strip()
+                if name and name not in [a["name"] for a in self._tftp_candidates(net_profile(self.net_profile))]:
+                    raise ValueError(f"adapter '{name[:40]}' is not up or has no IPv4 address")
+                new["adapter"] = name
+            if "max_upload_mb" in patch:
+                value = patch.get("max_upload_mb")
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    raise ValueError(TFTP_MAX_UPLOAD_MB_TEXT)
+                try:
+                    mb = int(value)
+                except (ValueError, OverflowError):
+                    raise ValueError(TFTP_MAX_UPLOAD_MB_TEXT) from None
+                if mb != value or not TFTP_MAX_UPLOAD_MB[0] <= mb <= TFTP_MAX_UPLOAD_MB[1]:
+                    raise ValueError(TFTP_MAX_UPLOAD_MB_TEXT)
+                new["max_upload_mb"] = mb
+            old = copy.deepcopy(self.settings["tftp"])
+            self.settings["tftp"].update(new)
+            changed = changed_keys({"tftp": old}, {"tftp": self.settings["tftp"]})
+        if changed:
+            self.hub.publish("settings.changed", {"changed": changed})
+        if new:
+            self.hub.publish("tftp.state", self.tftp_summary())
+        return self.tftp_status()
+
+    def _tftp_worker(self, gen: int, fast: bool) -> None:
+        """A phone on the served subnet reads its configuration file (TFTP_FILES[2]) a moment after a start: tftp.transfer as it
+        goes, tftp.state when it begins and ends."""
+        try:
+            time.sleep(0.05 if fast else 1.5)
+            name, size, _age = TFTP_FILES[2]
+            with self.lock:
+                if self.tftp_gen != gen or not self.tftp_listen:
+                    return
+                own = self.tftp_listen[0]["ip"]
+                tr = {"id": self.tftp_next_id, "client": ".".join(own.split(".")[:3] + ["62"]), "op": "read", "file": name, "mode": "octet",
+                      "blksize": 1468, "windowsize": 1, "size": size, "bytes": 0, "state": "negotiating", "error": None,
+                      "started_ts": time.time(), "ended_ts": None}
+                self.tftp_next_id += 1
+                self.tftp_transfers.append(tr)
+                snap = copy.deepcopy(tr)
+            self.hub.publish("tftp.transfer", {"transfer": snap})
+            self.hub.publish("tftp.state", self.tftp_summary())
+            for sent in list(range(tr["blksize"], size, tr["blksize"])) + [size]:
+                time.sleep(0.02 if fast else 0.3)
+                with self.lock:
+                    if self.tftp_gen != gen:
+                        return
+                    tr.update(state="sending", bytes=sent)
+                    snap = copy.deepcopy(tr)
+                self.hub.publish("tftp.transfer", {"transfer": snap})
+            with self.lock:
+                if self.tftp_gen != gen:
+                    return
+                tr.update(state="done", ended_ts=time.time())
+                self.tftp_transfers = [t for t in self.tftp_transfers if t is not tr]
+                self.tftp_history = ([tr] + self.tftp_history)[:TFTP_HISTORY_KEEP]
+                self.tftp_counts["done"] += 1
+                snap = copy.deepcopy(tr)
+            self.hub.publish("tftp.transfer", {"transfer": snap})
+            self.hub.publish("tftp.state", self.tftp_summary())
+        except Exception:  # noqa: BLE001
+            log.exception("tftp worker failed")
+
+    # -- Tools: packet capture (tnt.capture) -----------------------------
+    def capture_adapters(self) -> List[Dict[str, Any]]:
+        """The adapters a capture can run on (CaptureManager.adapters): up and physical."""
+        with self.lock:
+            prof = net_profile(self.net_profile)
+        return [{"name": a["name"], "index": a["index"], "mac": a["mac"], "type_name": a["type_name"], "wifi": a["if_type"] == 71}
+                for a in prof["adapters"] if a["status"] == "up" and a["is_physical"]]
+
+    def _capture_files_locked(self) -> List[Dict[str, Any]]:
+        return sorted(copy.deepcopy(self.capture_files), key=lambda f: (f["created_ts"], f["name"]), reverse=True)
+
+    def capture_status(self) -> Dict[str, Any]:
+        """GET /api/tools/capture (CAPTURE_STATUS): the saved files newest first."""
+        adapters = self.capture_adapters()
+        with self.lock:
+            return {"available": self.pktmon_reason is None, "reason": self.pktmon_reason, "adapters": adapters,
+                    "capture": copy.deepcopy(self.capture_job), "files": self._capture_files_locked()}
+
+    def capture_start(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        """POST /api/tools/capture: the body checked like the service (400), then Packet Monitor (409 unavailable) and its lock
+        (409 conflict while a capture runs or a switch port search listens). Answers the capturing job; it runs capture_s seconds."""
+        values = capture_start_values(body, self.capture_adapters())
+        with self.lock:
+            if self.pktmon_reason:
+                raise ToolRefused(409, "unavailable", self.pktmon_reason)
+            holder = self._pktmon_holder()
+            if holder:
+                raise ToolRefused(409, "conflict", PKTMON_LOCK_TEXTS[holder])
+            now = time.time()
+            job = {"id": self.capture_next_id, "state": "capturing", "adapter": values["adapter"], "filters": values["filters"],
+                   "full_packets": values["full_packets"], "seconds": values["seconds"], "size_mb": values["size_mb"], "started_ts": now,
+                   "elapsed_s": 0.0, "bytes": 0, "file": None, "error": None, "note": None, "ts": now}
+            self.capture_next_id += 1
+            self.capture_job = job
+            self.capture_gen += 1
+            self.capture_stop_evt.clear()
+            gen = self.capture_gen
+            run_s = float(self.capture_s) if self.capture_s is not None else float(values["seconds"])
+            snap = copy.deepcopy(job)
+        self.hub.publish("capture.state", {"capture": snap})
+        threading.Thread(target=self._capture_worker, args=(gen, job, run_s), name="mock-capture", daemon=True).start()
+        return snap
+
+    def _capture_worker(self, gen: int, job: Dict[str, Any], run_s: float) -> None:
+        """Capturing (capture.state with the time and the ETL size every half second) until run_s or a stop, then converting,
+        then done with its new file listed."""
+        t0 = time.time()
+        rate = CAPTURE_RATE_BPS[bool(job["full_packets"])]
+        stopped = False
+        while not stopped and time.time() - t0 < run_s:
+            with self.lock:
+                if self.capture_gen != gen:
+                    return
+                elapsed = time.time() - t0
+                job.update(elapsed_s=round(elapsed, 1), bytes=int(elapsed * rate), ts=time.time())
+                snap = copy.deepcopy(job)
+            self.hub.publish("capture.state", {"capture": snap})
+            stopped = self.capture_stop_evt.wait(max(0.02, min(0.5, run_s - elapsed)))
+        with self.lock:
+            if self.capture_gen != gen:
+                return
+            elapsed = time.time() - t0
+            job.update(state="converting", elapsed_s=round(elapsed, 1), bytes=int(elapsed * rate), ts=time.time())
+            snap = copy.deepcopy(job)
+        self.hub.publish("capture.state", {"capture": snap})
+        time.sleep(min(0.3, max(0.02, run_s / 10)))
+        with self.lock:
+            if self.capture_gen != gen:
+                return
+            taken, stamp = {f["name"] for f in self.capture_files}, job["started_ts"]
+            name = time.strftime("TNT-capture-%Y%m%d-%H%M%S.pcapng", time.localtime(stamp))
+            while name in taken:                             # like the service: a clash moves the name on by a second
+                stamp += 1
+                name = time.strftime("TNT-capture-%Y%m%d-%H%M%S.pcapng", time.localtime(stamp))
+            now = time.time()
+            size = len(tiny_pcapng(now))
+            self.capture_files.append({"name": name, "size": size, "created_ts": now, "packets": 1})
+            job.update(state="done", file=name, bytes=size, ts=now)
+            snap = copy.deepcopy(job)
+        self.hub.publish("capture.state", {"capture": snap})
+
+    def capture_stop(self) -> Optional[Dict[str, Any]]:
+        """DELETE /api/tools/capture: end the capture early and keep it (it converts, then lists its file); waits up to 1 s for it
+        to leave capturing. The job, None before the first capture."""
+        with self.lock:
+            job = self.capture_job
+            if job is None or job["state"] != "capturing":
+                return copy.deepcopy(job)
+            self.capture_stop_evt.set()
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            with self.lock:
+                if job["state"] != "capturing":
+                    break
+            time.sleep(0.02)
+        with self.lock:
+            return copy.deepcopy(self.capture_job)
+
+    def _capture_file_locked(self, name: str) -> Dict[str, Any]:
+        row = next((f for f in self.capture_files if f["name"] == name), None) if _CAPTURE_FILE.fullmatch(name or "") else None
+        if row is None:
+            raise ToolRefused(404, "not_found", CAPTURE_FILE_MISSING_TEXT)
+        return row
+
+    def capture_download(self, name: str) -> bytes:
+        """GET /api/tools/capture/files/{name}: the saved capture (a tiny pcapng); 404 for a name that is not one."""
+        with self.lock:
+            return tiny_pcapng(self._capture_file_locked(name)["created_ts"])
+
+    def capture_delete(self, name: str) -> List[Dict[str, Any]]:
+        """DELETE /api/tools/capture/files/{name}: the files left; 404 for a name that is not one."""
+        with self.lock:
+            self.capture_files.remove(self._capture_file_locked(name))
+            return self._capture_files_locked()
 
     # -- networks (tnt.networks) ------------------------------------------
     def _seed_networks(self, now: float) -> None:
@@ -3532,7 +4948,7 @@ class MockState:
                     running, prog = self.speed_running, dict(self.speed_progress)
                 if not running:
                     break
-                base = {"latency": (0.0, 0.15), "download": (0.15, 0.45), "upload": (0.6, 0.4)}.get(prog.get("phase"), (0.0, 0.0))
+                base = REPORT_SPEED_STEPS.get(prog.get("phase"), (0.0, 0.0))
                 self._report_step(job_id, "speed", "running", "Running the speed test", 1 + 28 * (base[0] + base[1] * float(prog.get("pct") or 0)))
                 cancel.wait(0.4)
         with self.lock:
@@ -3731,6 +5147,13 @@ class MockState:
             new.setdefault("lan", {})["enabled"] = bool(new.get("lan", {}).get("enabled", True))
             self.lan_enabled = new["lan"]["enabled"]        # one truth for the Tools switch
             new.setdefault("geoip", {})["enabled"] = bool(new.get("geoip", {}).get("enabled", True))
+            tftp = new.setdefault("tftp", {})          # like tnt.config: the cap truncated and clamped (4096 for junk), the name trimmed
+            try:
+                mb = tftp.get("max_upload_mb", 4096)
+                tftp["max_upload_mb"] = 4096 if isinstance(mb, bool) else max(TFTP_MAX_UPLOAD_MB[0], min(TFTP_MAX_UPLOAD_MB[1], int(float(mb))))
+            except (TypeError, ValueError, OverflowError):
+                tftp["max_upload_mb"] = 4096
+            tftp["adapter"] = str(tftp["adapter"]).strip() if tftp.get("adapter") is not None else ""
             new["ping"]["loaded"] = bool(new["ping"]["loaded"])
             changed = changed_keys(old, new)
             self.settings = new
@@ -3811,6 +5234,22 @@ class MockState:
                 self.dhcp_running, self.dhcp_since, self.dhcp_changed = False, None, False
                 self.dhcp_gen += 1
                 self.dhcp_error = f"stopped: {stopped}"
+            # the network tools: the NAT, switch port and port-forward results described the old network, a switch port search
+            # whose adapter went away is cancelled (a new network alone does not cancel one), a running TFTP server stops
+            self.nat_last, self.portcheck_last = None, None
+            self.nat_epoch += 1
+            job = self.switch_job
+            switch_changed = bool(self.switch_kept) or (job is not None and job["state"] != "listening")
+            self.switch_kept = {}
+            if job is not None and job["state"] != "listening":
+                self.switch_job = None
+            elif job is not None and job["adapter"]["mac"] not in {a["mac"] for a in self._wired_adapters(new)}:
+                self.switch_gen += 1
+                job.update(state="cancelled", ts=now)
+                switch_changed = True
+            tftp_stopped = self.tftp_running
+            if tftp_stopped:
+                self.tftp_error = TFTP_STOPPED_TEXT
             inet, was = net_internet_nic(new), net_internet_nic(old)
             nets = lambda p: sorted({e["network"] for a in p["adapters"] if a["status"] == "up" for e in a["ipv4"]})  # noqa: E731
             dns = lambda p: sorted((a["name"], tuple(net_fingerprint(a)["dns"]["servers"]), net_fingerprint(a)["dns"]["suffix"])  # noqa: E731
@@ -3843,6 +5282,12 @@ class MockState:
                                         "ip": gw, "state": "up" if gw else "down"})
         if stopped:
             self.hub.publish("dhcp.state", dict(self.dhcp_summary(), running=False))
+        if switch_changed:
+            with self.lock:
+                snap = self._switch_job_locked()
+            self.hub.publish("netcheck.switch", {"job": snap})
+        if tftp_stopped:
+            self.tftp_stop()
         return payload
 
     def note_status_request(self) -> None:
@@ -3909,6 +5354,8 @@ class MockState:
                     # the Reports tile's numbers, like the service (the page itself reads /api/reports)
                     "reports": self._reports_status_locked(),
                     "geoip": self.geoip_status(),
+                    "update": self.update_status(),
+                    "tftp": self.tftp_summary(),
                     "settings": {"theme": self.settings["ui"]["theme"], "loaded": self.settings["ping"]["loaded"]}}
 
     def diagnostics(self) -> Dict[str, Any]:
@@ -3988,12 +5435,14 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:  # quiet by default
         log.debug("%s " + fmt, self.address_string(), *args)
 
-    def _json(self, payload: Any, status: int = 200) -> None:
+    def _json(self, payload: Any, status: int = 200, headers: Optional[Dict[str, str]] = None) -> None:
         body = json.dumps(payload, default=str).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-cache")
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
@@ -4092,6 +5541,8 @@ class Handler(BaseHTTPRequestHandler):
                     frame = q.get(timeout=15)
                 except queue.Empty:
                     frame = ": ping\n\n"
+                if not STATE.wifi_admin and frame.split("\n", 1)[0][7:] in ADMIN_ONLY_EVENTS:
+                    continue                    # the service sends the capture job to a Windows administrator only
                 self.wfile.write(frame.encode("utf-8"))
                 self.wfile.flush()
         except (ConnectionAbortedError, BrokenPipeError, ConnectionResetError, OSError):
@@ -4128,6 +5579,25 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(pdf)
+
+    def _capture_admin(self) -> None:
+        """Every packet capture route, after the origin check: the service's 403 for a standard user (STATE.wifi_admin off)."""
+        if not STATE.wifi_admin:
+            raise ToolRefused(403, "admin_required", CAPTURE_ADMIN_REQUIRED_MSG)
+
+    def _capture_file(self, name: str) -> None:
+        """A saved capture as the service sends a FileResponse: an attachment of its length, not cached, not sniffed (the name is
+        checked against CAPTURE_FILE_RE before any header goes out)."""
+        data = STATE.capture_download(name)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Disposition", f'attachment; filename="{name}"')
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
 
     def _reports_route(self, method: str, rest: List[str], qs: Dict[str, str]) -> None:  # noqa: C901 - flat like _route
         """/api/reports and below, like the service: the literal routes (sites, scan, scan/wifi, compare, compare/pdf) are matched
@@ -4238,6 +5708,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self._consume_body()
             self._route(method)
+        except ToolRefused as exc:
+            self._json(exc.payload(), exc.status, exc.headers)
         except ValueError as exc:
             if not bad_request:
                 log.exception("%s %s failed", method, self.path)
@@ -4267,6 +5739,12 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"state": STATE.geoip_set_state(str(self._body().get("state") or ""))})
                 with STATE.lock:
                     return self._json({"state": STATE.geoip_state, "states": list(GEOIP_STATES)})
+            if path == "/mock/update" and method in ("GET", "POST"):
+                # development only: GET the fake auto-update state, POST {"state": ...} picks another
+                if method == "POST":
+                    return self._json({"state": STATE.update_set_state(str(self._body().get("state") or ""))})
+                with STATE.lock:
+                    return self._json({"state": STATE.update_state, "states": list(UPDATE_STATES)})
             if method in ("GET", "HEAD"):
                 self._static(path)
             else:
@@ -4309,6 +5787,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(STATE.netinfo())
             if p == "/geoip":
                 return self._json(STATE.geoip_status())
+            if p == "/update":
+                return self._json(STATE.update_status())
             if p == "/geoip/lookup":
                 # validated like tnt.api.routes.geoip_lookup; a GET's ValueError would be a 500 in _handle, so a bad
                 # address is answered here. Nothing leaves the PC.
@@ -4377,6 +5857,23 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError as exc:
                     return self._error(400, "bad_request", str(exc))
                 return self._json({"vendors": {pre: OUI_VENDORS.get(pre) for pre in prefixes}})
+            if p == "/netcheck/nat":
+                return self._json(STATE.nat_view())
+            if p == "/netcheck/switch":
+                return self._json(STATE.switch_status())
+            if p == "/tftp/status":
+                return self._json(STATE.tftp_status())
+            if p == "/tftp/files":
+                return self._json({"files": STATE.tftp_files()})
+            if p == "/tools/capture":
+                self._capture_admin()
+                return self._json(STATE.capture_status())
+            if network_tool_route(p) and p.startswith(CAPTURE_FILES_ROUTE):
+                # the download, like the service: a page of another origin is refused first, then anyone but an administrator
+                if cross_origin_browser_request(self.headers, STATE.port):
+                    return self._error(403, "forbidden", QUICK_TOOLS_CROSS_ORIGIN_MSG)
+                self._capture_admin()
+                return self._capture_file(unquote(p[len(CAPTURE_FILES_ROUTE):]))
             if p == "/settings":
                 with STATE.lock:
                     return self._json(copy.deepcopy(STATE.settings))
@@ -4429,9 +5926,57 @@ class Handler(BaseHTTPRequestHandler):
                 # Retry now (tnt.api.routes.geoip_check): no body; a download in progress simply continues
                 status = STATE.geoip_check()
                 return self._json(status) if status is not None else self._error(409, "conflict", "IP location is switched off")
+            if p == "/update/check":
+                if not STATE._update_enabled():
+                    return self._error(409, "conflict", "Automatic updates are switched off")
+                return self._json(STATE.update_check())
+            if p == "/update/install":
+                # like the service: a browser page of another origin is refused first, then anyone but an administrator
+                if cross_origin_browser_request(self.headers, STATE.port):
+                    return self._error(403, "forbidden", QUICK_TOOLS_CROSS_ORIGIN_MSG)
+                if not STATE.wifi_admin:
+                    return self._error(403, "admin_required", UPDATE_ADMIN_REQUIRED_MSG)
+                with STATE.lock:
+                    off = not STATE._update_enabled()
+                    has = STATE.update_state in ("available", "ready")
+                if off:
+                    return self._error(409, "conflict", "Automatic updates are switched off")
+                if not has:
+                    return self._error(409, "conflict", "No update is available to install")
+                return self._json(STATE.update_install())
             if p == "/tools/lan/throughput":
                 try:
                     return self._json(STATE.lan_throughput(self._body()))
+                except RuntimeError as exc:
+                    return self._error(409, "conflict", str(exc))
+            if (p in NETTOOLS_ROUTES or network_tool_route(p)) and cross_origin_browser_request(self.headers, STATE.port):
+                # like the service: a browser page of another origin may not run the network tools
+                return self._error(403, "forbidden", QUICK_TOOLS_CROSS_ORIGIN_MSG)
+            if p == "/netcheck/nat":
+                return self._json({"result": STATE.nat_run(), "running": False})
+            if p == "/netcheck/switch":
+                body = self._body()
+                return self._json({"job": STATE.switch_start(body.get("adapter"), body.get("seconds"))})
+            if p == "/netcheck/portforward":
+                return self._json(STATE.portcheck_test(self._body().get("port")))
+            if p == "/tools/capture":
+                self._capture_admin()
+                return self._json({"capture": STATE.capture_start(self._body())})
+            if p == "/tftp/start":
+                return self._json(STATE.tftp_start(self._body()))
+            if p == "/tftp/stop":
+                return self._json(STATE.tftp_stop())
+            if p == "/tftp/uploads":
+                return self._json(STATE.tftp_set_uploads(self._body().get("on")))
+            if p == "/tools/dns/lookup":
+                return self._json(STATE.dns_lookup(self._body()))      # a bad name or server: ValueError -> 400 in _handle
+            if p == "/tools/dns/flush":
+                return self._json(STATE.dns_flush())
+            if p == "/tools/ip/renew":
+                if not STATE.wifi_admin:
+                    return self._error(403, "admin_required", IP_RENEW_ADMIN_REQUIRED_MSG)
+                try:
+                    return self._json(STATE.ip_renew())
                 except RuntimeError as exc:
                     return self._error(409, "conflict", str(exc))
             if p == "/easter/detonate":
@@ -4483,6 +6028,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(404, "not_found", f"no route for POST {path}")
 
         if method == "PUT":
+            if network_tool_route(p) and cross_origin_browser_request(self.headers, STATE.port):
+                return self._error(403, "forbidden", QUICK_TOOLS_CROSS_ORIGIN_MSG)
+            if p == "/tftp/settings":
+                return self._json(STATE.tftp_update_settings(self._body()))
             if p == "/settings":
                 return self._json(STATE.update_settings(self._body()))
             if p == "/dhcp/settings":
@@ -4514,6 +6063,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(404, "not_found", f"no route for PUT {path}")
 
         if method == "DELETE":
+            if network_tool_route(p) and cross_origin_browser_request(self.headers, STATE.port):
+                return self._error(403, "forbidden", QUICK_TOOLS_CROSS_ORIGIN_MSG)
+            if p == "/netcheck/switch":
+                return self._json({"job": STATE.switch_stop()})
+            if p == "/tools/capture":
+                self._capture_admin()
+                return self._json({"capture": STATE.capture_stop()})
+            if network_tool_route(p) and p.startswith(CAPTURE_FILES_ROUTE):
+                self._capture_admin()
+                return self._json({"files": STATE.capture_delete(unquote(p[len(CAPTURE_FILES_ROUTE):]))})
             if len(parts) == 2 and parts[0] == "targets":
                 if STATE.remove_target(int(parts[1])):
                     return self._json({"removed": True})

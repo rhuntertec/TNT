@@ -12,7 +12,11 @@ add_target(host, label) -> dict, remove_target(id) -> bool, netinfo_summary() ->
 and, optionally, ``netwatch`` (a ``tnt.netwatch.NetWatcher``: ``state() -> dict``) and
 ``reports`` (a ``tnt.reports.ReportManager``; missing or ``None`` makes every ``/api/reports``
 route 503) and ``geoip`` (a ``tnt.geoip.GeoIpManager``: ``status() / lookup(ip) / check_now() /
-locate_hop(...) / origin()``; missing or ``None`` makes every ``/api/geoip`` route 503).
+locate_hop(...) / origin()``; missing or ``None`` makes every ``/api/geoip`` route 503) and ``update``
+(a ``tnt.updater.UpdateManager``: ``status() / check_now() / request_install()``; missing or ``None`` makes
+every ``/api/update`` route 503) and
+``ip_release_renew() -> dict`` (missing makes ``POST /api/tools/ip/renew`` 503) and ``natcheck``, ``portcheck``,
+``switchport``, ``capture`` and ``tftp`` (the network tools below; missing or ``None`` makes their routes 503).
 
 Site reports (``/api/reports*``, ARCHITECTURE 3.19): the literal paths (``sites``, ``scan``,
 ``scan/wifi``, ``compare``, ``compare/pdf``) are registered before ``{id}`` and ``{id}/pdf``
@@ -51,6 +55,38 @@ is identified and its token checked (``tnt.peer``), and a standard or unverifiab
 403 ``admin_required``.  A browser page of another origin is refused before that check (403
 ``forbidden``), so no web page can make an administrator's browser fetch the keys.  The keys
 never leave this loopback API.
+The quick tools (``tnt.nettools``, lazily imported, so a broken import is a 503): ``POST /api/tools/dns/lookup``
+``{"name", "server"?, "type"?}`` is DNS_RESULT (``type`` null or empty is Auto; a bad name, server or record type, and an
+IP address asked for any type but PTR, are 400 with the validator's text), ``POST
+/api/tools/dns/flush`` is FLUSH_RESULT and ``POST /api/tools/ip/renew`` is RENEW_RESULT from
+``engine.ip_release_renew()`` (503 when the engine has none, 409 while one runs).  All three refuse a browser page of
+another origin first (403 ``forbidden``, :data:`QUICK_TOOLS_CROSS_ORIGIN_MSG`); the renew then needs a Windows
+administrator, checked like the Wi-Fi keys (403 ``admin_required``, failing closed).
+The network tools (ARCHITECTURE 3.23-3.25) drive ``engine.natcheck`` (``tnt.natcheck.NatChecker``: ``last() / running() /
+run()``), ``engine.portcheck`` (``tnt.portcheck.PortChecker.test(port)``), ``engine.switchport``
+(``tnt.switchport.SwitchPortFinder``: ``status() / start(adapter, seconds) / stop()``), ``engine.capture``
+(``tnt.capture.CaptureManager``: ``status() / start(**body) / stop() / open_file(name) / delete_file(name)``) and
+``engine.tftp`` (``tnt.tftp.TftpServer``: ``status() / summary() / start(adapter, uploads) / stop() / set_uploads(on) /
+update_settings(patch) / files()``).  ``GET /api/netcheck/nat`` is ``{"result": NAT_RESULT|null, "running"}`` and ``POST``
+(no body) runs a check, ``{"result", "running": false}``.  ``GET /api/netcheck/switch`` is SWITCH_STATUS, ``POST``
+``{"adapter", "seconds"}`` starts listening and ``DELETE`` cancels (both ``{"job"}``).  ``POST /api/netcheck/portforward``
+``{"port"}`` is PORTCHECK_RESULT.  ``GET /api/tools/capture`` is CAPTURE_STATUS, ``POST`` the start body (a key left out
+takes the service default) and ``DELETE`` stops and keeps the capture (both ``{"capture": JOB}``); ``GET
+/api/tools/capture/files/{name}`` is the file as a :class:`FileResponse` download and ``DELETE`` on it ``{"files"}``.
+``GET /api/tftp/status``, ``POST /api/tftp/start`` ``{"adapter", "uploads"}``, ``/api/tftp/stop``, ``/api/tftp/uploads``
+``{"on"}`` and ``PUT /api/tftp/settings`` ``{"adapter", "max_upload_mb"}`` answer the TFTP STATUS; ``GET /api/tftp/files`` is
+``{"files": [...]}`` and ``GET /api/status`` carries ``"tftp"`` (``TftpServer.summary()``, null without the component).
+Every POST/PUT/DELETE among them, and the capture download, refuses a browser page of another origin first (403
+``forbidden``, :data:`QUICK_TOOLS_CROSS_ORIGIN_MSG`).  Every capture route then needs a Windows administrator, checked
+like the Wi-Fi keys (403 ``admin_required``, :data:`CAPTURE_ADMIN_REQUIRED_MSG` / :data:`CAPTURE_ADMIN_UNVERIFIED_MSG`,
+failing closed), before the 503 for a missing component; ``GET /api/events`` leaves out :data:`ADMIN_ONLY_EVENTS`
+(``capture.state``, the capture job) for anyone else, with the same check asked once per stream.  The services' typed
+errors are answered before
+:func:`_tool_call` (:data:`TYPED_ERRORS`, :func:`_typed_call`): ``PktmonBusy`` 409 ``conflict``, ``PktmonUnavailable``
+409 ``unavailable``, ``RateLimited`` 429 ``rate_limited`` with ``Retry-After``, ``NoPublicIp`` 409 ``no_public_ip``,
+``VpnActive`` 409 ``vpn``, ``CaptureFileBusy`` 409 ``conflict``, ``CaptureFileMissing`` 404 ``not_found`` and
+``TftpPortInUse`` 409 ``{"error": {"code": "tftp_port_in_use", "message"}, "owners": [{"pid", "name"}]}``; a busy text
+("already running") stays 409 ``conflict``.
 ``GET /api/oui?prefix=AA:BB:CC&prefix=...`` (1-256 prefixes, repeated and/or comma separated;
 ``:``, ``-`` or no separator) names the vendors of 24-bit OUIs through ``tnt.oui.vendor_for_oui``
 for the WiFi tile. The Wi-Fi survey itself runs in ``TNT.exe`` (Windows gives BSSID lists only to
@@ -135,6 +171,7 @@ _STATUS_CODES = {
     409: "conflict",
     413: "payload_too_large",
     415: "unsupported_media_type",
+    429: "rate_limited",
     500: "internal_error",
     503: "unavailable",
 }
@@ -263,6 +300,18 @@ class StreamResponse:
 
     def __init__(self, serve: Callable[[Any], None]) -> None:
         self.serve = serve
+
+
+class FileResponse:
+    """A download returned by a route: ``tnt.api.server`` sends *size* bytes of the open binary *fileobj* as an attachment
+    called *filename* and closes it on every path (a HEAD request, a client that went away, an error).  The name is kept
+    to letters, digits, ``.``, ``_`` and ``-`` so it cannot break the ``Content-Disposition`` header."""
+
+    def __init__(self, fileobj: Any, size: int, filename: str, content_type: str = "application/octet-stream") -> None:
+        self.fileobj = fileobj
+        self.size = max(0, int(size))
+        self.filename = re.sub(r"[^A-Za-z0-9._-]", "_", str(filename or ""))[:200] or "download"
+        self.content_type = content_type
 
 
 def json_response(payload: Any, status: int = 200, headers: Optional[Dict[str, str]] = None) -> Response:
@@ -470,6 +519,8 @@ DHCP_CONFLICT_CODE = "dhcp_server_present"
 DHCP_CONFLICT_MESSAGE = "Another DHCP server is active on this network"
 DHCP_SETTINGS_KEYS = ("adapter", "pool_start", "pool_end", "pool_size", "lease_s", "ping_check")
 LAN_SETTINGS_KEYS = ("enabled",)
+#: ``POST /api/tools/capture``: the body keys handed to ``CaptureManager.start`` (a key left out takes its default).
+CAPTURE_START_KEYS = ("adapter", "seconds", "size_mb", "full_packets", "host", "port", "protocol")
 
 
 def _dhcp_conflict(exc: BaseException) -> Optional[Tuple[int, Dict[str, Any]]]:
@@ -553,6 +604,44 @@ def _tool_call(what: str, fn: Callable[[], Any]) -> Any:
             raise ApiError(409, "conflict", str(exc)) from exc
         log.error("%s failed: %s", what, exc)
         raise ApiError(500, "internal_error", str(exc) or f"{what} failed") from exc
+
+
+TFTP_PORT_IN_USE_CODE = "tftp_port_in_use"
+#: The network tools' typed errors, by module and class name: ``(HTTP status, error code)``.  Most are RuntimeErrors
+#: that :func:`_tool_call` would answer with 500, so :func:`_typed_call` answers them first.
+TYPED_ERRORS: Dict[str, Dict[str, Tuple[int, str]]] = {
+    "tnt.pktmon": {"PktmonBusy": (409, "conflict"), "PktmonUnavailable": (409, "unavailable")},
+    "tnt.portcheck": {"RateLimited": (429, "rate_limited"), "NoPublicIp": (409, "no_public_ip"), "VpnActive": (409, "vpn")},
+    "tnt.tftp": {"TftpPortInUse": (409, TFTP_PORT_IN_USE_CODE)},
+    "tnt.capture": {"CaptureFileBusy": (409, "conflict"), "CaptureFileMissing": (404, "not_found")},
+}
+
+
+def _typed_call(what: str, fn: Callable[[], Any], *modules: str) -> Any:
+    """:func:`_tool_call` with the :data:`TYPED_ERRORS` of *modules* (imported lazily, 503 when one cannot be) answered
+    first: ``ApiError(status, code, str(exc))``, with ``Retry-After: <retry_after_s>`` for a 429.  ``TftpPortInUse`` is
+    ``(409, {"error": {"code", "message"}, "owners": [...]})``, like :func:`_dhcp_conflict`."""
+    typed: List[Tuple[type, int, str]] = []
+    for name in modules:
+        mod = _lazy(name)
+        for cls_name, (status, code) in TYPED_ERRORS[name].items():
+            cls = getattr(mod, cls_name, None)
+            if isinstance(cls, type) and issubclass(cls, BaseException):
+                typed.append((cls, status, code))
+
+    def run() -> Any:
+        try:
+            return fn()
+        except tuple(cls for cls, _status, _code in typed) as exc:
+            _cls, status, code = next(entry for entry in typed if isinstance(exc, entry[0]))
+            if code == TFTP_PORT_IN_USE_CODE:
+                owners = getattr(exc, "owners", None)
+                return status, {"error": {"code": code, "message": str(exc)},
+                                "owners": [dict(o) for o in owners if isinstance(o, dict)] if isinstance(owners, (list, tuple)) else []}
+            headers = {"Retry-After": str(int(getattr(exc, "retry_after_s", 1)))} if status == 429 else None
+            raise ApiError(status, code, str(exc), headers) from exc
+
+    return _tool_call(what, run)
 
 
 #: Query values that mean "no" (anything else, the empty string included, keeps the default).
@@ -654,6 +743,24 @@ WIFI_ADMIN_UNVERIFIED_MSG = ("Showing saved Wi-Fi passwords needs a Windows admi
                              "this request could not be verified as one.")
 #: 403 message when a browser asks for the keys from a page that is not served by this API.
 WIFI_CROSS_ORIGIN_MSG = "Saved Wi-Fi passwords are only shown to the TNT window or a page served by this TNT service."
+#: 403 message of the quick tools (DNS lookup, Flush DNS, IP release/renew) and the network tools (NAT check, switch port,
+#: port-forward test, packet capture, TFTP server) for a browser page of another origin.
+QUICK_TOOLS_CROSS_ORIGIN_MSG = "This tool only answers the TNT window or a page served by this TNT service."
+#: 403 messages of IP release/renew for a standard user and for a caller that could not be verified.
+IP_RENEW_ADMIN_REQUIRED_MSG = "Releasing and renewing IP addresses needs a Windows administrator account."
+IP_RENEW_ADMIN_UNVERIFIED_MSG = ("Releasing and renewing IP addresses needs a Windows administrator account; "
+                                 "this request could not be verified as one.")
+#: 403 messages of the update install for a standard user and for a caller that could not be verified.
+UPDATE_ADMIN_REQUIRED_MSG = "Installing an update needs a Windows administrator account."
+UPDATE_ADMIN_UNVERIFIED_MSG = ("Installing an update needs a Windows administrator account; "
+                               "this request could not be verified as one.")
+#: 403 messages of every packet capture route for a standard user and for a caller that could not be verified.
+CAPTURE_ADMIN_REQUIRED_MSG = "Packet capture needs a Windows administrator account."
+CAPTURE_ADMIN_UNVERIFIED_MSG = ("Packet capture needs a Windows administrator account; "
+                                "this request could not be verified as one.")
+#: Event types GET /api/events sends only to a Windows administrator, as every packet capture route answers only one:
+#: ``capture.state`` carries the capture job (adapter, host / port / protocol filters, file name) and the saved files.
+ADMIN_ONLY_EVENTS = frozenset({"capture.state"})
 
 
 def _cross_origin_browser_request(req: Request, api: Any) -> bool:
@@ -691,6 +798,20 @@ def _wifi_reveal_check(api: Any) -> Optional[Callable[[Any, Any], str]]:
     return reveal_allowed
 
 
+def _admin_decision(req: Request, api: Any, what: str) -> str:
+    """``"allowed"``, ``"denied"`` or ``"unknown"`` for the caller of *req*, from :func:`_wifi_reveal_check` (the
+    Wi-Fi keys, IP release/renew and packet capture).  No check, or one that raises, is ``"unknown"``: the callers fail
+    closed."""
+    check = _wifi_reveal_check(api)
+    if check is None:
+        return "unknown"
+    try:
+        return str(check(req.peer, req.local))
+    except Exception:  # noqa: BLE001 - a failing check refuses, never 500s
+        log.exception("%s check raised", what)
+        return "unknown"
+
+
 # ---------------------------------------------------------------------------
 # route table
 # ---------------------------------------------------------------------------
@@ -721,6 +842,8 @@ def build_routes(engine: Any, api: Any) -> Router:
         dhcp = getattr(engine, "dhcp", None)
         reports = getattr(engine, "reports", None)
         geoip = getattr(engine, "geoip", None)
+        updater = getattr(engine, "update", None)
+        tftp = getattr(engine, "tftp", None)
         watch = _net_state(engine)
         nic = (net.get("internet_nic") if isinstance(net, dict) else None) or {}
         return {
@@ -728,6 +851,8 @@ def build_routes(engine: Any, api: Any) -> Router:
             "dhcp": _safe_call("dhcp.summary()", dhcp.summary, None) if dhcp is not None else None,
             "reports": _safe_call("reports.status()", reports.status, None) if reports is not None else None,
             "geoip": _safe_call("geoip.status()", geoip.status, None) if geoip is not None else None,
+            "update": _safe_call("update.status()", updater.status, None) if updater is not None else None,
+            "tftp": _safe_call("tftp.summary()", tftp.summary, None) if tftp is not None else None,
             "version": getattr(engine, "version", ""),
             "started_ts": started,
             "uptime_s": round(now - started, 1) if started else 0.0,
@@ -796,6 +921,37 @@ def build_routes(engine: Any, api: Any) -> Router:
         if not gm.check_now():
             raise ApiError(409, "conflict", "IP location is switched off")
         return gm.status()
+
+    # -- auto-update (GitHub releases) ---------------------------------------
+    @r.get("/api/update")
+    def update_status(req: Request) -> Any:
+        return _need(engine, "update", "Automatic updates").status()
+
+    @r.post("/api/update/check")
+    def update_check(req: Request) -> Any:
+        """Check GitHub now (no body); 409 when updates are switched off."""
+        um = _need(engine, "update", "Automatic updates")
+        if not um.check_now():
+            raise ApiError(409, "conflict", "Automatic updates are switched off")
+        return um.status()
+
+    @r.post("/api/update/install")
+    def update_install(req: Request) -> Any:
+        """Download, verify (SHA-256) and launch the installer for the available update (no body). Only for
+        a Windows administrator (the Wi-Fi key check, failing closed); 409 when none is available or one is
+        already installing."""
+        _quick_tool_origin(req, "Install update")
+        decision = _admin_decision(req, api, "Install update")
+        if decision != "allowed":
+            log.info("update install refused for %s (%s)", req.client or "?", decision)
+            raise ApiError(403, "admin_required",
+                           UPDATE_ADMIN_REQUIRED_MSG if decision == "denied" else UPDATE_ADMIN_UNVERIFIED_MSG)
+        um = _need(engine, "update", "Automatic updates")
+        try:
+            um.request_install()
+        except RuntimeError as exc:
+            raise ApiError(409, "conflict", str(exc)) from None
+        return um.status()
 
     # -- targets ------------------------------------------------------------
     @r.get("/api/targets")
@@ -1109,19 +1265,200 @@ def build_routes(engine: Any, api: Any) -> Router:
             if _cross_origin_browser_request(req, api):
                 log.info("saved Wi-Fi passwords not revealed to %s (cross-origin browser request)", req.client or "?")
                 raise ApiError(403, "forbidden", WIFI_CROSS_ORIGIN_MSG)
-            check = _wifi_reveal_check(api)
-            decision = "unknown"
-            if check is not None:
-                try:
-                    decision = check(req.peer, req.local)
-                except Exception:  # noqa: BLE001 - a failing check refuses, never 500s
-                    log.exception("Wi-Fi reveal check raised")
-                    decision = "unknown"
+            decision = _admin_decision(req, api, "Wi-Fi reveal")
             if decision != "allowed":
                 log.info("saved Wi-Fi passwords not revealed to %s (%s)", req.client or "?", decision)
                 msg = WIFI_ADMIN_REQUIRED_MSG if decision == "denied" else WIFI_ADMIN_UNVERIFIED_MSG
                 raise ApiError(403, "admin_required", msg)
         return _tool_call("wifi.list_profiles()", lambda: mod.list_profiles(reveal=reveal))
+
+    # -- quick tools: DNS lookup (Tools page), Flush DNS and IP release/renew (top bar) ----------
+    def _quick_tool_origin(req: Request, what: str) -> None:
+        if _cross_origin_browser_request(req, api):
+            log.info("%s refused for %s (cross-origin browser request)", what, req.client or "?")
+            raise ApiError(403, "forbidden", QUICK_TOOLS_CROSS_ORIGIN_MSG)
+
+    @r.post("/api/tools/dns/lookup")
+    def tools_dns_lookup(req: Request) -> Any:
+        """``{"name": str, "server": str|null, "type": str|null}`` -> DNS_RESULT: ``tnt.nettools.dns_lookup`` asks
+        the DNS server directly, like nslookup (``ok`` false with ``error`` when it finds nothing).  ``type`` null,
+        absent or empty is Auto (A + AAAA for a name, PTR for an address); a bad name, server or type, or an address
+        with a type other than PTR, is a 400 with the validator's text."""
+        _quick_tool_origin(req, "DNS lookup")
+        body = req.json_object()
+        name, server, record_type = body.get("name"), body.get("server"), body.get("type")
+        if name is not None and not isinstance(name, str):
+            raise ApiError(400, "bad_request", "name must be text")
+        if server is not None and not isinstance(server, str):
+            raise ApiError(400, "bad_request", "server must be text or null")
+        if record_type is not None and not isinstance(record_type, str):
+            raise ApiError(400, "bad_request", "type must be text or null")
+        mod = _lazy("tnt.nettools", "DNS lookup")
+        return _tool_call("nettools.dns_lookup()",
+                          lambda: mod.dns_lookup(name or "", server, record_type=record_type))
+
+    @r.post("/api/tools/dns/flush")
+    def tools_dns_flush(req: Request) -> Any:
+        """No body -> FLUSH_RESULT (``ok`` may be false; the reason is in ``error``)."""
+        _quick_tool_origin(req, "Flush DNS")
+        mod = _lazy("tnt.nettools", "Flush DNS")
+        return _tool_call("nettools.flush_dns()", mod.flush_dns)
+
+    @r.post("/api/tools/ip/renew")
+    def tools_ip_renew(req: Request) -> Any:
+        """No body -> RENEW_RESULT from ``engine.ip_release_renew()``.  Only for a Windows administrator (the Wi-Fi
+        key check, failing closed); 409 while one runs."""
+        _quick_tool_origin(req, "IP release/renew")
+        decision = _admin_decision(req, api, "IP release/renew")
+        if decision != "allowed":
+            log.info("IP release/renew refused for %s (%s)", req.client or "?", decision)
+            raise ApiError(403, "admin_required",
+                           IP_RENEW_ADMIN_REQUIRED_MSG if decision == "denied" else IP_RENEW_ADMIN_UNVERIFIED_MSG)
+        renew = getattr(engine, "ip_release_renew", None)
+        if not callable(renew):
+            raise ApiError(503, "unavailable", "IP release/renew is not available")
+        return _tool_call("engine.ip_release_renew()", renew)
+
+    # -- network checks (Network info): NAT check, switch port, port-forward test -------------------
+    @r.get("/api/netcheck/nat")
+    def netcheck_nat(req: Request) -> Any:
+        nat = _need(engine, "natcheck", "the NAT check")
+        return {"result": nat.last(), "running": bool(nat.running())}
+
+    @r.post("/api/netcheck/nat")
+    def netcheck_nat_run(req: Request) -> Any:
+        """No body -> ``{"result": NAT_RESULT, "running": false}``; synchronous, 409 while another check runs."""
+        _quick_tool_origin(req, "NAT check")
+        nat = _need(engine, "natcheck", "the NAT check")
+        return {"result": _tool_call("natcheck.run()", nat.run), "running": False}
+
+    @r.get("/api/netcheck/switch")
+    def netcheck_switch(req: Request) -> Any:
+        finder = _need(engine, "switchport", "the switch port finder")
+        return _tool_call("switchport.status()", finder.status)
+
+    @r.post("/api/netcheck/switch")
+    def netcheck_switch_start(req: Request) -> Any:
+        """``{"adapter": str|null, "seconds": int|null}`` -> ``{"job": JOB}`` (listening); null or absent means the internet
+        adapter when it is wired, else the first wired one, and 65 s."""
+        _quick_tool_origin(req, "Switch port search")
+        finder = _need(engine, "switchport", "the switch port finder")
+        body = req.json_object()                    # an empty body is {}
+        job =_typed_call("switchport.start()", lambda: finder.start(adapter=body.get("adapter"), seconds=body.get("seconds")),
+                          "tnt.pktmon")
+        return {"job": job}
+
+    @r.delete("/api/netcheck/switch")
+    def netcheck_switch_stop(req: Request) -> Any:
+        """Cancel a search (nothing is kept) -> ``{"job": JOB}``."""
+        _quick_tool_origin(req, "Switch port search")
+        finder = _need(engine, "switchport", "the switch port finder")
+        return {"job": _typed_call("switchport.stop()", finder.stop, "tnt.pktmon")}
+
+    @r.post("/api/netcheck/portforward")
+    def netcheck_portforward(req: Request) -> Any:
+        """``{"port": int}`` -> PORTCHECK_RESULT (the port goes to the service as sent; it blocks for up to about 47 s)."""
+        _quick_tool_origin(req, "Port-forward test")
+        checker = _need(engine, "portcheck", "the port-forward test")
+        body = req.json_object()
+        return _typed_call("portcheck.test()", lambda: checker.test(body.get("port")), "tnt.portcheck")
+
+    # -- packet capture (Tools page) ------------------------------------------------------------------
+    def _capture(req: Request) -> Any:
+        """The capture manager for *req*: a browser page of another origin is refused on every route but the status
+        read, then anyone who is not a Windows administrator (failing closed), then 503 without the component."""
+        if req.method != "GET" or req.params.get("name") is not None:
+            # the download too: a page of another origin must not make a browser save a capture
+            _quick_tool_origin(req, "Packet capture")
+        decision = _admin_decision(req, api, "Packet capture")
+        if decision != "allowed":
+            log.info("packet capture refused (%s)", decision)
+            raise ApiError(403, "admin_required",
+                           CAPTURE_ADMIN_REQUIRED_MSG if decision == "denied" else CAPTURE_ADMIN_UNVERIFIED_MSG)
+        return _need(engine, "capture", "packet capture")
+
+    @r.get("/api/tools/capture")
+    def capture_status(req: Request) -> Any:
+        mgr = _capture(req)
+        return _tool_call("capture.status()", mgr.status)
+
+    @r.post("/api/tools/capture")
+    def capture_start(req: Request) -> Any:
+        """``{"adapter", "seconds"?, "size_mb"?, "full_packets"?, "host"?, "port"?, "protocol"?}`` -> ``{"capture": JOB}``.
+        A key left out takes the service default; a null that is sent is checked like any other value."""
+        mgr = _capture(req)
+        body = req.json_object()
+        kwargs = {k: body[k] for k in CAPTURE_START_KEYS if k in body}
+        kwargs["adapter"] = body.get("adapter")
+        return {"capture": _typed_call("capture.start()", lambda: mgr.start(**kwargs), "tnt.pktmon", "tnt.capture")}
+
+    @r.delete("/api/tools/capture")
+    def capture_stop(req: Request) -> Any:
+        """End the capture early and keep it -> ``{"capture": JOB|null}``."""
+        mgr = _capture(req)
+        return {"capture": _typed_call("capture.stop()", mgr.stop, "tnt.pktmon", "tnt.capture")}
+
+    @r.get("/api/tools/capture/files/{name}")
+    def capture_file(req: Request) -> Any:
+        """A saved capture as a download (:class:`FileResponse`, HEAD included); 404 for a name that is not one."""
+        mgr = _capture(req)
+        name = req.params.get("name", "")
+        fh, size = _typed_call("capture.open_file()", lambda: mgr.open_file(name), "tnt.capture")
+        try:
+            return FileResponse(fh, size, name)
+        except Exception:  # noqa: BLE001 - never leave the file open (it could not be deleted)
+            fh.close()
+            raise
+
+    @r.delete("/api/tools/capture/files/{name}")
+    def capture_file_delete(req: Request) -> Any:
+        """Delete a saved capture -> ``{"files": [FILE]}``; 409 while it is being downloaded."""
+        mgr = _capture(req)
+        name = req.params.get("name", "")
+        return {"files": _typed_call("capture.delete_file()", lambda: mgr.delete_file(name), "tnt.capture")}
+
+    # -- TFTP server (Tools page) ---------------------------------------------------------------------
+    @r.get("/api/tftp/status")
+    def tftp_status(req: Request) -> Any:
+        tftp = _need(engine, "tftp", "the TFTP server")
+        return _tool_call("tftp.status()", tftp.status)
+
+    @r.post("/api/tftp/start")
+    def tftp_start(req: Request) -> Any:
+        """``{"adapter": str|null, "uploads": bool}`` -> STATUS (the adapter for this run only; uploads off when absent).
+        Another program on UDP 69 is 409 ``tftp_port_in_use`` with its ``owners``."""
+        _quick_tool_origin(req, "TFTP server")
+        tftp = _need(engine, "tftp", "the TFTP server")
+        body = req.json_object()                    # an empty body is {}
+        return _typed_call("tftp.start()", lambda: tftp.start(adapter=body.get("adapter"), uploads=body.get("uploads", False)),
+                           "tnt.tftp")
+
+    @r.post("/api/tftp/stop")
+    def tftp_stop(req: Request) -> Any:
+        _quick_tool_origin(req, "TFTP server")
+        tftp = _need(engine, "tftp", "the TFTP server")
+        return _tool_call("tftp.stop()", tftp.stop)
+
+    @r.post("/api/tftp/uploads")
+    def tftp_uploads(req: Request) -> Any:
+        """``{"on": bool}`` -> STATUS (never saved: uploads are off after every service start)."""
+        _quick_tool_origin(req, "TFTP server")
+        tftp = _need(engine, "tftp", "the TFTP server")
+        body = req.json_object()
+        return _tool_call("tftp.set_uploads()", lambda: tftp.set_uploads(body.get("on")))
+
+    @r.put("/api/tftp/settings")
+    def tftp_settings(req: Request) -> Any:
+        """``{"adapter", "max_upload_mb"}`` (either or both) -> STATUS; the service refuses any other key (400)."""
+        _quick_tool_origin(req, "TFTP server")
+        tftp = _need(engine, "tftp", "the TFTP server")
+        patch = req.json_object()
+        return _tool_call("tftp.update_settings()", lambda: tftp.update_settings(patch))
+
+    @r.get("/api/tftp/files")
+    def tftp_files(req: Request) -> Any:
+        tftp = _need(engine, "tftp", "the TFTP server")
+        return {"files": list(_tool_call("tftp.files()", tftp.files) or [])}
 
     # -- vendors for the WiFi tile ------------------------------------------
     @r.get("/api/oui")
@@ -1463,6 +1800,9 @@ def build_routes(engine: Any, api: Any) -> Router:
     # -- SSE ----------------------------------------------------------------
     @r.get("/api/events")
     def events(req: Request) -> Any:
-        return StreamResponse(lambda handler: handler.serve_sse())
+        # ADMIN_ONLY_EVENTS go to a Windows administrator only: the packet capture routes' check, asked once per stream when
+        # the first such event comes (failing closed)
+        return StreamResponse(lambda handler: handler.serve_sse(
+            ADMIN_ONLY_EVENTS, lambda: _admin_decision(req, api, "Packet capture") == "allowed"))
 
     return r

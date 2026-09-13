@@ -263,6 +263,22 @@
     return pts.slice(a, b);
   }
 
+  /** Merge link speed readings ([[ts, Mbps]], 0 = not connected) into the cached list, by the rules of mergeHistory. */
+  function mergeLink(cache, incoming, cutoff, maxPoints) {
+    return mergeHistory({ link: Array.isArray(cache) ? cache : [] }, { link: Array.isArray(incoming) ? incoming : [] }, cutoff, maxPoints).link || [];
+  }
+
+  /** This PC's Wi-Fi link now: {tx, rx, bssid, ssid} of the first connected interface that reports a speed (Mbps; tx is
+   *  this PC to the access point, the "Speed" of the Windows Wi-Fi status dialog), else null. */
+  function currentLink(s) {
+    for (const iface of (s && Array.isArray(s.interfaces) ? s.interfaces : [])) {
+      if (!iface || !iface.connected_bssid || !(Number(iface.tx_rate_mbps) > 0)) continue;
+      return { tx: Number(iface.tx_rate_mbps), rx: Number(iface.rx_rate_mbps) > 0 ? Number(iface.rx_rate_mbps) : null,
+        bssid: iface.connected_bssid, ssid: iface.connected_ssid || null };
+    }
+    return null;
+  }
+
   /** [t0, t1] of the chart for a range in seconds (0 = the whole session). The window starts no earlier
    *  than the oldest reading shown (`earliestTs`), so a range longer than the history collected so far
    *  fills the chart instead of squeezing every line against its right edge; it spans at least
@@ -376,7 +392,8 @@
   }
 
   /** The dashboard tile: {kind, headline, detail, networks, aps, top} (top = the connected network, or
-   *  the strongest one: {name, rssi, cls, bars, connected, band, channel}). */
+   *  the strongest one: {name, rssi, cls, bars, connected, band, channel, rate}; rate = the link speed in Mbps
+   *  of the connected access point, null for any other). */
   function tileSummary(survey, bridge, callError) {
     if (bridge === 'waiting') return { kind: 'waiting', headline: 'Loading…', detail: '' };
     if (bridge === 'none') return { kind: 'nobridge', headline: 'Open in the TNT window', detail: 'The Wi-Fi survey runs in the TNT app' };
@@ -391,8 +408,10 @@
     const nets = groupNetworks(live);
     const pick = live.find((a) => a.connected) || live.slice().sort((a, b) => b.rssi - a.rssi)[0] || null;
     const WC = W();
+    // the link speed belongs to the connection: only the connected access point carries one
+    const link = pick && pick.connected ? currentLink(survey) : null;
     const top = pick ? { name: networkName(pick), rssi: pick.rssi, cls: WC ? WC.signalClass(pick.rssi) : 'grey', bars: WC ? WC.signalBars(pick.rssi) : 0,
-      connected: !!pick.connected, band: pick.band, channel: pick.channel } : null;
+      connected: !!pick.connected, band: pick.band, channel: pick.channel, rate: link && link.bssid === pick.bssid ? link.tx : null } : null;
     return { kind: survey.state === 'starting' && !aps.length ? 'starting' : 'ok', headline: survey.state === 'starting' && !aps.length ? 'Starting the survey…' : '',
       detail: '', networks: nets.length, aps: live.length, top };
   }
@@ -517,6 +536,7 @@
   let unsubs = [];
   let data = null;               // the survey applied to the page
   let history = {};              // bssid -> [[ts, dBm]] merged from every read
+  let linkHistory = [];          // [[ts, Mbps]] of this PC's own Wi-Fi link (0: not connected), merged the same way
   let historyComplete = null;    // the cache holds every reading from this ts on (null = refetch)
   let historyStarted = null;     // the session (started_ts) the cache belongs to
   let lastReadSeen = null;       // last_read_ts of the survey applied last (the incremental baseline)
@@ -567,11 +587,12 @@
     let reset = false;
     if (historyStarted !== r.started_ts) {      // a new session (Clear, or TNT.exe restarted)
       reset = historyStarted !== null || historyComplete !== null;
-      history = {}; historyComplete = null; historyStarted = r.started_ts;
+      history = {}; linkHistory = []; historyComplete = null; historyStarted = r.started_ts;
     }
     lastReadSeen = typeof r.last_read_ts === 'number' ? r.last_read_ts : null;
     const needFrom = rangeS ? now - rangeS : (r.started_ts || 0);
     history = mergeHistory(history, r.history || {}, needFrom - 60, MAX_POINTS);
+    linkHistory = mergeLink(linkHistory, r.link_history, needFrom - 60, MAX_POINTS);
     if (historyComplete == null) {
       const from = asked == null ? (r.started_ts || 0) : Math.max(r.started_ts || 0, now - asked);
       // a session that changed under an incremental read may hold older readings: fetch them next time
@@ -625,7 +646,7 @@
     const r = await survey.call('wifi_clear');
     if (!root) return;
     if (!r || r.ok === false) { TNT.ui.toast('Could not clear the survey' + (r && r.error ? ': ' + r.error : ''), 'error'); return; }
-    history = {}; historyComplete = null; historyStarted = null; lastReadSeen = null; data = null; selected = null; listSig = '';
+    history = {}; linkHistory = []; historyComplete = null; historyStarted = null; lastReadSeen = null; data = null; selected = null; listSig = '';
     netOrder = []; tableOrder = []; resetListScroll = true;
     if (els.netList) els.netList.scrollTop = 0;
     if (survey.last) survey.last = null;
@@ -995,7 +1016,14 @@
         tip: (ts, v) => '<div class="t">' + esc(networkName(ap)) + '</div>' + esc(bssid) + ' · ' + WC.dbmText(v) + '<div class="muted">' + TNT.util.fmtTime(ts) + ' · ' + esc((ap.band ? ap.band + ' GHz ' : '') + 'ch ' + ap.channel) + '</div>' });
     }
     const starting = data && data.state === 'starting';
-    charts.signal.setData({ series, t0, t1, dim: !!selected, empty: starting ? 'Starting the survey…' : 'No readings in this range yet' });
+    // this PC's own link speed on a right-hand axis: a TNT window that sends no link_history gets neither
+    const hasLink = !!(data && Array.isArray(data.link_history));
+    const link = hasLink ? { points: pointsInRange(linkHistory, t0 - gap, t1 + 1),
+      tip: (ts, v) => '<div class="t">Link speed</div>' + esc(WC.mbpsText(v)) + ' from this PC to the access point<div class="muted">' + TNT.util.fmtTime(ts) + '</div>' } : null;
+    charts.signal.setData({ series, link, t0, t1, dim: !!selected, empty: starting ? 'Starting the survey…' : 'No readings in this range yet' });
+    const current = hasLink ? currentLink(data) : null;
+    els.linkKey.hidden = !hasLink;
+    els.sigCanvas.setAttribute('aria-label', 'Signal strength of every access point over time' + (current ? '; link speed ' + WC.mbpsText(current.tx) : ''));
     renderLegend(nets);
     // spectrum, one chart per band
     for (const band of WC.BAND_KEYS) {
@@ -1095,10 +1123,14 @@
 
     // signal strength
     els.legend = h('div', { class: 'legend survey-legend' });
-    const sigCanvas = h('canvas', { class: 'survey-signal-canvas', role: 'img', 'aria-label': 'Signal strength of every access point over time' });
+    const sigCanvas = els.sigCanvas = h('canvas', { class: 'survey-signal-canvas', role: 'img', 'aria-label': 'Signal strength of every access point over time' });
+    // the key of the dashed link speed line (this PC's own connection, on the right-hand axis), while the window sends one
+    els.linkKey = h('span', { class: 'survey-link-key muted small', hidden: true,
+      title: "This PC's Wi-Fi link speed to its access point (the transmit rate, the Speed of the Windows Wi-Fi status), on the right-hand axis in Mbps" },
+      h('span', { class: 'survey-link-sw', 'aria-hidden': 'true' }), 'Link speed');
     const sigCard = h('div', { class: 'card survey-signal-card' },
       h('div', { class: 'card-title' }, TNT.ui.icon('ping'), 'Signal strength',
-        els.signalSpan = h('span', { class: 'muted small survey-signal-span' }), h('span', { class: 'spacer' }), els.legend),
+        els.signalSpan = h('span', { class: 'muted small survey-signal-span' }), els.linkKey, h('span', { class: 'spacer' }), els.legend),
       h('div', { class: 'chart-wrap' }, sigCanvas));
 
     // spectrum
@@ -1134,7 +1166,7 @@
     mount(el) {
       root = el;
       data = survey.last && Array.isArray(survey.last.aps) ? survey.last : null;
-      history = {}; historyComplete = null; historyStarted = null; lastReadSeen = null; listSig = ''; legendSig = ''; busyToggle = false;
+      history = {}; linkHistory = []; historyComplete = null; historyStarted = null; lastReadSeen = null; listSig = ''; legendSig = ''; busyToggle = false;
       filterText = ''; revealSelected = !!selected; resetListScroll = false;
       build();
       unsubs.push(survey.hook(() => { if (root) schedule(0); }));
@@ -1154,11 +1186,11 @@
       charts = { signal: null, bands: {} };
       if (table) table.destroy();
       table = null;
-      root = null; els = {}; history = {}; historyComplete = null; historyStarted = null; lastReadSeen = null; data = null;
+      root = null; els = {}; history = {}; linkHistory = []; historyComplete = null; historyStarted = null; lastReadSeen = null; data = null;
       netOrder = []; tableOrder = [];
     },
     // exposed for tests
-    networkKey, networkName, groupNetworks, sortNetworks, filterNetworks, fnv1a, createColorBook, mergeHistory, pointsInRange,
+    networkKey, networkName, groupNetworks, sortNetworks, filterNetworks, fnv1a, createColorBook, mergeHistory, pointsInRange, mergeLink, currentLink,
     rangeWindow, historyRequest, channelText, phyText, securityClass, vendorText, vendorPrefixes, stateInfo, tileSummary,
     stickyOrder, keepOrder, listKeyTarget, hiddenLabel, sixGhzEmptyText,
     columns: COLUMNS.map((c) => c.key), RANGES, POLL_MS, TILE_POLL_MS, LATENCY_NOTE, EMPTY_6GHZ, EMPTY_6GHZ_CAPABLE, SORT_MARGIN_DB,

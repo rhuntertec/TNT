@@ -152,9 +152,28 @@ svg.icon { width: 1.25em; height: 1.25em; stroke: currentColor; fill: none; stro
    scan runs; tabular figures and a minimum width keep "Discovery 57%" from nudging the pill at every percent */
 .topbar-scan { --pct: 0%; min-width: 132px; padding: 0 16px 0 12px; font-variant-numeric: tabular-nums; }
 .topbar-scan.running { background: linear-gradient(90deg, color-mix(in srgb, var(--green) 45%, var(--paper)) var(--pct), var(--paper) var(--pct)); }
+/* IP Release/Renew and Flush DNS, left of Full Scan: ordinary top bar buttons (flex: none). While one runs it is disabled
+   with a yellow tint, its short label ("Renewing…") and a moving icon; when it is done its background flashes green
+   (.flash-ok) or red (.flash-bad) for about 1.5 s, app.js taking the class off again. Below 1200 px they are round icon
+   buttons (the aria-label names them), so the header stays one row (see the responsive section) */
+.topbar-quick { padding: 0 16px 0 12px; }
+.btn.topbar-quick[aria-busy="true"] { opacity: 1; cursor: progress; background: color-mix(in srgb, var(--yellow) 40%, var(--paper)); }
+.topbar-quick[aria-busy="true"] [data-icon="renew"] svg.icon { animation: quick-spin 1.2s linear infinite; }
+.topbar-quick[aria-busy="true"] [data-icon="flush"] svg.icon { animation: pulse 1.2s ease-in-out infinite; }
+.btn.flash-ok { animation: flash-ok 1.5s ease-out; }
+.btn.flash-bad { animation: flash-bad 1.5s ease-out; }
 
 /* ---------- layout ---------- */
 .page { max-width: 1440px; margin: 0 auto; padding: 24px; display: flex; flex-direction: column; gap: 20px; min-width: 0; }
+/* auto-update banner: a card-styled strip above the tiles when a newer release is out (js/app.js renderUpdateBanner) */
+.update-banner { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap;
+  padding: 12px 16px; border: 3px solid var(--ink); border-radius: 16px; box-shadow: 4px 4px 0 var(--shadow);
+  background: color-mix(in srgb, var(--green) 20%, var(--paper)); }
+.update-banner-msg { display: flex; align-items: center; gap: 10px; min-width: 0; font-size: 15px; }
+.update-banner-msg svg.icon { width: 22px; height: 22px; flex: none; }
+.update-banner-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.update-banner-link { font-weight: 800; color: var(--ink); text-decoration: underline; text-underline-offset: 2px; white-space: nowrap; }
+.update-banner-link:hover { color: var(--blue); }
 /* The tiles: every tile in every row has the same width, whatever their number. One row while each
    tile still gets room for its head, otherwise balanced rows of equal columns; never a span. A wrapping
    flex row whose tiles take 1/N of the width minus the gaps; the rules in the responsive section pick
@@ -455,6 +474,30 @@ code.copy.stale { color: var(--ink-soft); border-style: dashed; }
 .findings li { display: flex; gap: 10px; align-items: flex-start; padding: 10px 14px; background: var(--paper-2); border: 2px solid var(--outline-25); border-radius: 14px; font-weight: 700; font-size: 15px; }
 .findings li .spark-icon { flex: none; margin-top: 2px; }
 
+/* ---------- speed: latency under load ---------- */
+/* the "Latency under load" card between Latest result and History (js/views/speed.js qualityView): a big sticker chip with the
+   bufferbloat grade (A+ / A / B green, C yellow, D / F red, a grey "—" when nothing was graded) beside the lines that explain it,
+   the Zoom / Teams check badges and a muted details line; tokens only */
+.quality-row { display: flex; align-items: flex-start; gap: 14px 20px; flex-wrap: wrap; min-width: 0; }
+.grade-chip { display: inline-flex; align-items: center; justify-content: center; flex: none; min-width: 76px; height: 76px; padding: 0 12px;
+  border: 3px solid var(--ink); border-radius: var(--radius); box-shadow: 4px 4px 0 var(--shadow); background: var(--paper-2); color: var(--ink);
+  font-size: 38px; font-weight: 900; letter-spacing: -0.02em; line-height: 1; font-variant-numeric: tabular-nums; user-select: none; }
+.grade-chip.green { background: color-mix(in srgb, var(--green) 45%, var(--paper)); }
+.grade-chip.yellow { background: color-mix(in srgb, var(--yellow) 55%, var(--paper)); }
+/* dark theme: dark ink on a brighter yellow, as .badge.yellow */
+[data-theme="dark"] .grade-chip.yellow { background: color-mix(in srgb, var(--yellow) 75%, var(--paper)); color: var(--ink-on-accent); }
+.grade-chip.red { background: color-mix(in srgb, var(--red) 40%, var(--paper)); }
+.grade-chip.grey { color: var(--ink-soft); }
+.quality-body { display: flex; flex-direction: column; gap: 6px; flex: 1 1 260px; min-width: 0; font-size: 15px; font-weight: 700; line-height: 1.4; }
+.quality-headline { font-size: 18px; }
+/* the warning under the grade text: muted small, in the warn tone of .tool-summary.warn */
+.quality-warning { display: flex; align-items: flex-start; gap: 6px; color: color-mix(in srgb, var(--yellow) 55%, var(--ink)); }
+.quality-warning svg.icon { flex: none; width: 16px; height: 16px; margin-top: 1px; }
+.quality-call { font-weight: 800; }
+.quality-checks { gap: 6px 8px; }
+.quality-checks .badge { text-transform: none; letter-spacing: 0; font-size: 13px; }
+.quality-details { overflow-wrap: anywhere; }
+
 /* ---------- discovery ---------- */
 .table td.ports { white-space: normal; min-width: 170px; line-height: 1.2; }
 
@@ -531,6 +574,43 @@ code.copy.stale { color: var(--ink-soft); border-style: dashed; }
 .adapter-warn svg.icon { flex: none; width: 18px; height: 18px; margin-top: 1px; }
 .subnet { display: flex; flex-direction: column; gap: 8px; }
 .subnet-title { display: flex; align-items: center; gap: 8px; font-weight: 800; font-size: 14px; }
+
+/* ---------- network info: NAT & switch port ---------- */
+/* one cell of the adapter grid right after the live link map (js/netcheck.js): two sections split by a dashed rule, each a
+   head row (its label; for NAT the verdict badge, the muted confidence and "Check again"), then its lines, a folded Details box
+   and muted notes. Whatever comes from the router or the switch wraps instead of widening the card; tokens only */
+.netcheck-card { display: flex; flex-direction: column; }
+.netcheck-card > .card-title { margin-bottom: 2px; }
+.nc-section { display: flex; flex-direction: column; gap: 8px; min-width: 0; padding: 12px 0; }
+.nc-section + .nc-section { border-top: 2px dashed var(--outline-25); }
+.nc-section:last-child { padding-bottom: 0; }
+.nc-section .tool-summary { margin: 0; }
+.nc-section .fuse-wrap { min-width: 0; }
+.nc-head { display: flex; align-items: center; gap: 6px 10px; flex-wrap: wrap; min-width: 0; min-height: 36px; }
+.nc-verdict { display: inline-flex; align-items: center; gap: 4px 8px; flex-wrap: wrap; min-width: 0; }
+/* the verdict's title is the badge ("Carrier-grade NAT (CGNAT)"): it wraps on a narrow card rather than overflow it */
+.nc-verdict .badge { height: auto; min-height: 24px; white-space: normal; }
+.nc-explain { font-size: 14px; font-weight: 700; line-height: 1.45; }
+.nc-waiting { font-weight: 700; }
+.nc-details-btn { align-self: flex-start; }
+.nc-details-btn svg.icon { transition: transform 0.15s ease-out; }
+.nc-details-btn[aria-expanded="true"] svg.icon { transform: rotate(90deg); }
+.nc-details { display: flex; flex-direction: column; gap: 8px; min-width: 0; padding: 10px 12px; background: var(--paper-2); border: 2px solid var(--outline-25); border-radius: 14px; }
+/* "Router's own internet address" is a long key: the key column takes at most 40 % and wraps */
+.nc-details .kv { grid-template-columns: minmax(80px, 40%) minmax(0, 1fr); gap: 6px 12px; font-size: 14px; }
+.nc-details .kv .k { font-size: 12px; overflow-wrap: anywhere; }
+.nc-details .kv .v { overflow-wrap: anywhere; }
+.btn.nc-show-btn { height: 28px; padding: 0 10px; font-size: 13px; box-shadow: 2px 2px 0 var(--shadow); }
+.nc-forwards .table { font-size: 13px; }
+.nc-forwards .table th, .nc-forwards .table td { padding: 6px 10px; }
+.nc-forwards .table td.wrap { min-width: 120px; overflow-wrap: anywhere; }
+/* the self-traceroute: one hop per line ("2 198.51.100.1 (public)") */
+.nc-path { display: flex; flex-direction: column; gap: 2px; min-width: 0; font-family: var(--mono); font-size: 13px; }
+.nc-note { line-height: 1.4; }
+.nc-result { font-size: 16px; line-height: 1.35; overflow-wrap: anywhere; }
+.nc-switch-body { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.nc-actions { display: flex; align-items: center; gap: 8px 10px; flex-wrap: wrap; min-width: 0; }
+.nc-actions select.input { flex: 0 1 220px; }
 
 /* ---------- modals ---------- */
 .modal-backdrop {
@@ -614,26 +694,35 @@ code.copy.stale { color: var(--ink-soft); border-style: dashed; }
 /* transform-only on purpose: if the animation timeline stalls (hidden window, throttled
    WebView) the dialog must never be left invisible at an opacity-0 first frame. */
 @keyframes modal-in { from { transform: translateY(12px) scale(0.98); } }
+/* the top bar's quick tools: a button background that flashes green or red and fades back to paper, the turning renew arrows */
+@keyframes flash-ok { 0%, 55% { background: color-mix(in srgb, var(--green) 50%, var(--paper)); } 100% { background: var(--paper); } }
+@keyframes flash-bad { 0%, 55% { background: color-mix(in srgb, var(--red) 45%, var(--paper)); } 100% { background: var(--paper); } }
+@keyframes quick-spin { to { transform: rotate(360deg); } }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.001s !important; animation-iteration-count: 1 !important; transition-duration: 0.001s !important; }
+  /* no flash: a quick tool's button keeps a static tint for as long as app.js leaves the class on (about 1.5 s) */
+  .btn.flash-ok { background: color-mix(in srgb, var(--green) 40%, var(--paper)); }
+  .btn.flash-bad { background: color-mix(in srgb, var(--red) 35%, var(--paper)); }
 }
 
 /* ---------- live link map (Network info) ---------- */
 /* Fixed geometry: every node is one 54 px row (icon | name | chip column) and every link is a
    54 px row whose 48 px bar has a 3 px gap to the icon boxes above and below it, so nothing
    moves when the window resizes or a chip's text changes length. */
-.linkmap-body { display: flex; flex-direction: column; align-items: stretch; gap: 0; padding: 4px 0 2px 4px; }
-.lm-node { display: grid; grid-template-columns: 52px 76px minmax(0, 1fr); align-items: center; gap: 14px; height: 54px; min-width: 0; }
-.lm-icon { display: inline-flex; align-items: center; justify-content: center; width: 52px; height: 52px; flex: none;
-  border: 3px solid var(--ink); border-radius: 16px; background: color-mix(in srgb, var(--blue) 18%, var(--paper));
+/* a touch less side padding than a normal card so the three nodes get the full width for their addresses */
+.card.linkmap { padding: 15px; }
+.linkmap-body { display: flex; flex-direction: column; align-items: stretch; gap: 0; padding: 4px 0 2px 2px; }
+.lm-node { display: grid; grid-template-columns: 48px 60px minmax(0, 1fr); align-items: center; gap: 10px; height: 54px; min-width: 0; }
+.lm-icon { display: inline-flex; align-items: center; justify-content: center; width: 48px; height: 48px; flex: none;
+  border: 3px solid var(--ink); border-radius: 15px; background: color-mix(in srgb, var(--blue) 18%, var(--paper));
   box-shadow: 3px 3px 0 var(--shadow); }
-.lm-icon svg.icon { width: 28px; height: 28px; }
-.lm-name { font-weight: 900; font-size: 16px; white-space: nowrap; }
+.lm-icon svg.icon { width: 26px; height: 26px; }
+.lm-name { font-weight: 900; font-size: 14px; white-space: nowrap; }
 .lm-chips { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; min-width: 0; }
 .lm-sub { display: flex; align-items: center; gap: 6px; max-width: 100%; min-width: 0; }
-.linkmap code.copy { font-size: 12.5px; padding: 1px 6px; max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.lm-link { display: flex; align-items: center; gap: 14px; height: 54px; padding: 3px 0 3px 21px; }
+.linkmap code.copy { font-size: 11.5px; padding: 1px 5px; max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lm-link { display: flex; align-items: center; gap: 10px; height: 54px; padding: 3px 0 3px 19px; }
 .lm-line { display: block; width: 10px; height: 100%; border-radius: 6px; border: 2px solid var(--ink); background: var(--ink-soft); transition: background 0.3s; }
 .lm-line.green { background: repeating-linear-gradient(180deg, var(--green) 0 9px, color-mix(in srgb, var(--green) 55%, white) 9px 15px); background-size: 100% 30px; animation: lm-flow 0.9s linear infinite; }
 .lm-line.yellow { background: repeating-linear-gradient(180deg, var(--yellow) 0 9px, color-mix(in srgb, var(--yellow) 55%, white) 9px 15px); background-size: 100% 30px; animation: lm-flow 1.8s linear infinite; }
@@ -647,22 +736,37 @@ code.copy.stale { color: var(--ink-soft); border-style: dashed; }
 /* the gateway's public (WAN) address: a second chip row under the LAN ip with a small muted label */
 /* the LAN / WAN tags share a fixed width so the addresses under them line up */
 .lm-wan, .lm-sub { align-items: center; }
-/* 76 px fits the widest tag, HOSTNAME (72.1 px measured in Nunito 900 at 11 px with the
-   letter-spacing); every tag uses it so the values form one column */
-.lm-tag { flex: none; width: 76px; font-weight: 900; letter-spacing: 0.08em; text-transform: uppercase; font-size: 11px; }
+/* 58 px fits the widest tag, HOSTNAME (56 px in Nunito 900 at 9.5 px); every tag uses it so the values
+   line up in one column and the address chips get the rest of the row. The tag also carries `muted`, so the
+   ellipsis rule below would clip it if it ever overflowed — the width leaves ~2 px of headroom. */
+.lm-tag { flex: none; width: 58px; font-weight: 900; letter-spacing: 0; text-transform: uppercase; font-size: 9.5px; }
 /* IP location: the Internet node's ISP / Location values ellipsize (full text on hover) and the DB-IP credit sits
    under the map while they show */
 .lm-sub > span.muted { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-/* the values match the address chips' 12.5 px (not the 16 px body) so provider names fit the chip column; the tags
-   keep their 11 px */
-.lm-geo > span.muted:not(.lm-tag) { font-size: 12.5px; font-weight: 700; }
+/* the values match the address chips' 11.5 px (not the 16 px body) so provider names fit the chip column; the tags
+   keep their 9.5 px */
+.lm-geo > span.muted:not(.lm-tag) { font-size: 11.5px; font-weight: 700; }
 .lm-attrib { display: flex; justify-content: flex-end; padding: 6px 2px 0; font-size: 12px; font-weight: 700; }
 .geo-attrib { color: var(--ink-soft); text-decoration: underline; text-underline-offset: 2px; }
 .geo-attrib:hover { color: var(--blue); }
 
-/* ---------- tools: traceroute, LAN throughput, subnet calculator, saved Wi-Fi ----------
-   the four cards under the DHCP server (js/tools/*.js); tokens only, no literal colours */
+/* ---------- tools: traceroute, LAN throughput, subnet calculator, DNS, TFTP server, packet capture, saved Wi-Fi ----------
+   the seven cards under the DHCP server (js/tools/*.js); tokens only, no literal colours */
 .tool-card .card-title .badge { margin-left: auto; }
+/* collapsible cards (every card on the Tools page, the DHCP server's too; views/tools.js): a round chevron button leads the
+   title row and turns down while the card is open; a click anywhere in the row opens or closes it, except on its switch,
+   badges and head controls; a closed card is its title row alone */
+.card-head { cursor: pointer; user-select: none; }
+.card-head .badge, .card-head .tool-head-right { cursor: auto; }
+.card-toggle { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; flex: none; margin: 0; padding: 0;
+  border: 2px solid var(--ink); border-radius: 50%; background: var(--paper-2); color: var(--ink); box-shadow: 2px 2px 0 var(--shadow);
+  cursor: pointer; transition: transform 0.12s ease-out, box-shadow 0.12s ease-out, background 0.15s; }
+.card-toggle:hover { transform: translate(-1px, -1px); box-shadow: 3px 3px 0 var(--shadow); background: color-mix(in srgb, var(--accent) 22%, var(--paper)); }
+.card-toggle:active { transform: translate(2px, 2px); box-shadow: 0 0 0 var(--shadow); }
+.card-toggle:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.card-toggle svg.icon { width: 16px; height: 16px; stroke-width: 3; transition: transform 0.15s ease-out; }
+.card-toggle[aria-expanded="true"] svg.icon { transform: rotate(90deg); }
+.card.collapsed > .card-title { margin-bottom: 0; }
 .tool-intro { color: var(--ink-soft); font-size: 14px; font-weight: 700; line-height: 1.45; margin-bottom: 12px; }
 .tool-note { color: var(--ink-soft); font-size: 12.5px; font-weight: 700; line-height: 1.4; margin: 2px 0 10px; }
 /* a control parked on the right of a tool card's title row (the LAN discovery switch) */
@@ -776,6 +880,71 @@ code.copy.stale { color: var(--ink-soft); border-style: dashed; }
 .sn-out { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-height: 24px; font-weight: 700; }
 .sn-split-list { display: flex; flex-wrap: wrap; gap: 6px; max-height: 190px; overflow: auto; align-items: center; }
 .sn-split-list code.copy { font-size: 13px; }
+
+/* DNS: the name, the record type and the optional server on one row, then the answer: who was asked (with a "non-authoritative"
+   badge), the addresses as copy chips with an IPv4 / IPv6 badge, a typed lookup's records as copy chips (and the SRV hint), the
+   aliases, and the records behind Details */
+.dns-form .field { flex: 2 1 200px; }
+.dns-form .field.wide { flex: 3 1 240px; }
+.dns-form .field.dns-type { flex: 1 1 150px; }
+.dns-values { display: flex; flex-wrap: wrap; gap: 8px 10px; margin-top: 12px; min-width: 0; }
+.dns-value { display: inline-flex; min-width: 0; max-width: 100%; }
+.dns-value code.copy { font-size: 14px; font-weight: 700; }
+/* "All record types": one row per type, a type label then that type's value chips */
+.dns-groups { display: flex; flex-direction: column; gap: 12px; margin-top: 12px; min-width: 0; }
+.dns-group { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; min-width: 0; }
+.dns-group-type { flex: 0 0 auto; }
+.tool-note.dns-hint { margin: 8px 0 0; }
+.tool-summary.dns-invalid { margin: 10px 0 0; }
+.dns-asked { display: flex; align-items: center; gap: 6px 10px; flex-wrap: wrap; font-size: 14px; font-weight: 700; color: var(--ink-soft); }
+.dns-addresses { display: flex; flex-wrap: wrap; gap: 10px 16px; margin-top: 12px; }
+.dns-addr { display: inline-flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%; }
+.dns-addr code.copy { font-size: 15px; font-weight: 700; }
+.dns-addr .badge, .dns-table .badge { height: 20px; padding: 0 7px; font-size: 11px; text-transform: none; letter-spacing: 0; }
+.dns-aliases { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; margin-top: 12px; }
+.dns-aliases .label { font-size: 12px; margin-right: 2px; }
+.dns-details { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; margin-top: 14px; }
+.dns-details > .table-wrap { align-self: stretch; }
+.dns-details-btn svg.icon { transition: transform 0.15s ease-out; }
+.dns-details-btn[aria-expanded="true"] svg.icon { transform: rotate(90deg); }
+.dns-table td.wrap { min-width: 140px; overflow-wrap: anywhere; }
+
+/* TFTP server: the head badge and switch (.tool-head-right), then the adapter, "Allow uploads" and the max upload size on one row,
+   the standing uploads note, the error / warning boxes, the folder chip, the files, a fuse per running transfer, the last
+   transfers and what the server is not for (js/tools/tftp.js) */
+.tftp-summary { margin-top: 4px; }
+.tftp-form { margin-top: 12px; }
+.tftp-form .field { flex: 1 1 150px; }
+.tftp-form .field.wide { flex: 3 1 240px; }
+.tftp-form .field.tftp-uploads { flex: 0 0 auto; }
+.tftp-uploads .toggle { height: 44px; }
+.tftp-form .field.tftp-max { flex: 0 1 150px; }
+/* always under the form, whether uploads are on or off: a slim note, not a full alert box */
+.dhcp-info.tftp-uploads-note { margin-top: 10px; padding: 8px 12px; font-size: 13px; }
+.tftp-folder { gap: 8px 10px; margin-top: 14px; min-width: 0; }
+.tftp-files-head { margin: 16px 0 8px; }
+.tftp-files .empty, .capture-files .empty { padding: 16px 12px; }
+.tftp-transfers, .tftp-history { display: flex; flex-direction: column; gap: 10px; margin-top: 16px; min-width: 0; }
+.tftp-transfers .fuse-label .l { min-width: 0; overflow-wrap: anywhere; }
+.tftp-table td.wrap { min-width: 140px; overflow-wrap: anywhere; }
+.tftp-table .badge { height: 20px; padding: 0 7px; font-size: 11px; }
+.tool-note.tftp-scope { margin: 14px 0 0; }
+
+/* packet capture: the adapter, duration and size, the optional host / port / protocol, then "Full packets" or "First 128 bytes"
+   with Start (or "Stop and save"); a fuse while it runs, the saved captures under the warning about what they hold, or the note
+   that it needs a Windows administrator in place of all of it (js/tools/capture.js) */
+.capture-form { display: flex; flex-direction: column; gap: 12px; }
+.capture-actions { gap: 10px 12px; }
+.capture-actions .seg { flex: none; }
+.capture-actions .seg button:disabled { opacity: 0.55; cursor: not-allowed; }
+.tool-summary.capture-invalid { margin: 10px 0 0; }
+.capture-progress { margin-top: 16px; }
+.capture-files-head { margin-top: 18px; }
+.dhcp-info.capture-warning { margin: 8px 0 12px; }
+.capture-table td.wrap { min-width: 200px; overflow-wrap: anywhere; font-family: var(--mono); font-size: 13.5px; }
+.capture-table td.capture-file-actions { width: auto; white-space: nowrap; }
+.capture-file-actions .btn + .btn { margin-left: 8px; }
+.dhcp-info.capture-admin { margin-top: 0; }
 
 /* saved Wi-Fi networks: the profile table (a plain .table) and its masked key chips */
 .wifi-controls { gap: 10px; margin-bottom: 12px; }
@@ -901,6 +1070,9 @@ code.copy.survey-mac { font-size: 13px; padding: 1px 6px; white-space: nowrap; o
 .survey-legend { font-size: 13px; }
 .survey-legend-chip { display: inline-flex; align-items: center; gap: 8px; min-width: 0; color: var(--ink); }
 .survey-legend-chip strong { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 320px; }
+/* the key of the link speed line: the chart draws it dashed in ink, on the right-hand Mbps axis */
+.survey-link-key { display: inline-flex; align-items: center; gap: 6px; font-weight: 700; white-space: nowrap; }
+.survey-link-sw { display: inline-block; width: 22px; height: 0; border-top: 3px dashed var(--ink); }
 canvas.survey-signal-canvas { height: 320px; }
 canvas.survey-band-canvas { height: 240px; }
 /* 2.4 GHz is the crowded band: it gets half the row, not the narrow side */
@@ -931,6 +1103,11 @@ canvas.survey-band-canvas { height: 240px; }
   .lan-phase { grid-template-columns: 78px minmax(0, 1fr); }
   .lan-result .kpi .value { font-size: 32px; }
 }
+
+/* port forward: a small TCP-port field, the result and the risk hints (tools/portforward.js) */
+.pf-form .field { flex: 0 1 150px; }
+.pf-result .muted { overflow-wrap: anywhere; }
+.pf-hints { display: flex; flex-direction: column; gap: 4px; margin: 0; padding-left: 20px; font-size: 13px; font-weight: 700; line-height: 1.4; color: var(--ink-soft); }
 
 /* ---------- easter egg: sticks of TNT ---------- */
 .brand { position: relative; }
@@ -1050,10 +1227,13 @@ body.egg-shake { animation: egg-shake 0.6s ease-out both; }
   .diag-grid { grid-template-columns: minmax(0, 1fr); }
   .adapter-grid { grid-template-columns: minmax(0, 1fr); }
 }
+/* the caption under the wordmark goes below 780 px: the header's quick tools take its room and the status pill keeps its light */
+@media (max-width: 779.98px) {
+  .brand-caption { display: none; }
+}
 @media (max-width: 700px) {
   .page { padding: 16px; gap: 16px; }
   .topbar { padding: 8px 16px; }
-  .brand-caption { display: none; }
   /* rows of two; the last tile of an odd count keeps the width of the others */
   .tiles { --tile-gap: 14px; }
   .tiles > .tile { --tile-cols: 2; }
@@ -1063,8 +1243,9 @@ body.egg-shake { animation: egg-shake 0.6s ease-out both; }
   .status-pill .status-text { max-width: 150px; overflow: hidden; text-overflow: ellipsis; }
   .toasts { right: 12px; bottom: 12px; }
 }
-@media (max-width: 520px) {
-  .topbar-right { flex-wrap: wrap; }   /* a phone-width browser: let the badge and gear drop a row */
+@media (max-width: 659.98px) {
+  /* a phone-width browser: the buttons and the badge drop a row (one row would squeeze the status pill to nothing) */
+  .topbar-right { flex-wrap: wrap; }
 }
 
 /* ---------- discovery results (sortable headers, add-as-target button, port links) ----------
@@ -1361,6 +1542,12 @@ a.pill.port-link:focus-visible { outline: 3px solid var(--accent); outline-offse
   .rpt-browser-body { max-height: 40vh; }
   .rpt-cmp-bpick { flex-wrap: wrap; }
   .rpt-cmp-bpick .rpt-cmp-filter { flex: 1 1 100%; }
+}
+/* the quick tools as round icon buttons below 1200 px (their aria-label names them): with their labels the status pill would
+   be left too little room, without them the header stays one row down to 800 px */
+@media (max-width: 1199.98px) {
+  .topbar-quick { width: 44px; padding: 0; }
+  .topbar-quick .quick-label { display: none; }
 }
 @media (max-width: 900px) {
   .topbar-scan { min-width: 0; padding: 0 12px; }

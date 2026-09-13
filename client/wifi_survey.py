@@ -60,6 +60,15 @@ only what is new. When the wall clock steps back (checked against the monotonic 
 pass and survey call), every stored time moves back with it, so the history stays in order and
 ``stale`` keeps working; a forward jump (also what a sleep looks like) is left alone.
 
+Link speed: every read pass that asks an interface for its association also takes the association's
+``ulTxRate`` / ``ulRxRate`` (kb/s): ``interfaces[].tx_rate_mbps`` / ``rx_rate_mbps``, the speed of the
+link from this PC to its access point and back (what the Windows Wi-Fi status dialog calls "Speed";
+None while not connected). The transmit rate of the first connected interface (enumeration order) also
+goes into one session-long series, ``link_history`` (``[[epoch s, Mbps], ...]``), stamped with the time
+the pass ended: 0 when no interface is associated (or the radio is off, or the adapter is gone), no point
+when the association could not be read. It has the store's bounds (one point per 5 s, at most 8640 in an
+``array('I')`` ring of kb/s) and the same ``history_s`` window and thinning as the signal history.
+
 What one survey call returns is bounded: readings from the last hour before the call
 (``HISTORY_FULL_S``) are returned as stored, so the page's 5 min / 15 min / 1 h ranges are exact,
 and older readings in the requested window are thinned to the lowest and the highest reading of
@@ -120,6 +129,8 @@ CLOCK_STEP_S = 5.0
 HISTORY_FULL_S = 3600.0
 #: ... and thins older readings to the lowest and highest of this many slices of their span.
 HISTORY_THIN_BUCKETS = 300
+#: A link speed above this (kb/s: 100 Gb/s) is a garbled structure, not a reading.
+MAX_LINK_KBPS = 100_000_000
 
 STATES = ("ok", "starting", "disabled", "no_adapter", "radio_off", "location_denied", "error")
 
@@ -501,7 +512,8 @@ class WlanSurveyApi:
             self._free(ptr)
 
     def current_connection(self, ref: GUID) -> Optional[Dict[str, Any]]:
-        """``{"ssid": bytes, "bssid": bytes}`` of the association, None when not connected."""
+        """``{"ssid": bytes, "bssid": bytes, "rx_kbps": int, "tx_kbps": int}`` of the association (the link
+        speeds in kb/s: 390000 is the "390.0 Mbps" of the Windows Wi-Fi status dialog), None when not connected."""
         rc, attrs = self._query(ref, WLAN_INTF_OPCODE_CURRENT_CONNECTION, WLAN_CONNECTION_ATTRIBUTES)
         if rc == ERROR_ACCESS_DENIED:
             raise OSError(rc, "WlanQueryInterface(current_connection) was denied")
@@ -509,52 +521,54 @@ class WlanSurveyApi:
             return None
         assoc = attrs.wlanAssociationAttributes
         n = min(int(assoc.dot11Ssid.uSSIDLength), 32)
-        return {"ssid": bytes(assoc.dot11Ssid.ucSSID)[:n], "bssid": bytes(assoc.dot11Bssid)}
+        return {"ssid": bytes(assoc.dot11Ssid.ucSSID)[:n], "bssid": bytes(assoc.dot11Bssid),
+                "rx_kbps": int(assoc.ulRxRate), "tx_kbps": int(assoc.ulTxRate)}
 
 
 # --- store -------------------------------------------------------------------------------------
 class _Series:
-    """One BSSID's history: a ring of (deciseconds since the session start, dBm) at most *cap* long."""
+    """One series: a ring of (deciseconds since the session start, value) at most *cap* long -- a BSSID's dBm
+    (``array('b')``, the default) or the link speed in kb/s (``array('I')``)."""
 
-    __slots__ = ("ts", "rssi", "head")
+    __slots__ = ("ts", "values", "head")
 
-    def __init__(self) -> None:
+    def __init__(self, typecode: str = "b") -> None:
         self.ts = array("I")
-        self.rssi = array("b")
+        self.values = array(typecode)
         self.head = 0
 
     def __len__(self) -> int:
         return len(self.ts)
 
-    def add(self, t_ds: int, rssi: int, bucket_ds: int, cap: int) -> None:
+    def add(self, t_ds: int, value: int, bucket_ds: int, cap: int) -> None:
         n = len(self.ts)
         if n:
             last = (self.head - 1) % n
             if t_ds < self.ts[last]:
                 return                          # out of order (clock stepped back): keep it monotonic
             if t_ds // bucket_ds == self.ts[last] // bucket_ds:
-                self.ts[last], self.rssi[last] = t_ds, rssi
+                self.ts[last], self.values[last] = t_ds, value
                 return
         if n < cap:
             self.ts.append(t_ds)
-            self.rssi.append(rssi)
+            self.values.append(value)
         else:
-            self.ts[self.head], self.rssi[self.head] = t_ds, rssi
+            self.ts[self.head], self.values[self.head] = t_ds, value
             self.head = (self.head + 1) % n
 
     def window(self, min_ds: Optional[float]) -> Tuple[array, array]:
-        """Copies of ``(deciseconds, dBm)`` oldest first, from *min_ds* on (None: all). The ring is two
+        """Copies of ``(deciseconds, value)`` oldest first, from *min_ds* on (None: all). The ring is two
         sorted runs (``[head:]`` then ``[:head]``), each searched in place and copied as one array slice,
         so this is cheap enough to run under the store lock."""
         n = len(self.ts)
         runs = ((self.head, n), (0, self.head)) if self.head else ((0, n),)
         low = int(math.ceil(min_ds)) if min_ds is not None and min_ds > 0 else None
-        ts, rssi = array("I"), array("b")
+        ts, values = array("I"), array(self.values.typecode)
         for lo, hi in runs:
             start = bisect.bisect_left(self.ts, low, lo, hi) if low is not None else lo
             ts.extend(self.ts[start:hi])
-            rssi.extend(self.rssi[start:hi])
-        return ts, rssi
+            values.extend(self.values[start:hi])
+        return ts, values
 
     def points(self, base_ts: float, min_ds: Optional[float]) -> List[List[Any]]:
         """``[[epoch s, dBm], ...]`` oldest first, from *min_ds* on (None: all), unthinned."""
@@ -614,6 +628,14 @@ def _as_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _rate_mbps(kbps: Any) -> Optional[float]:
+    """A link speed from ``WLAN_ASSOCIATION_ATTRIBUTES`` (kb/s) in Mbps with one decimal; None for none or nonsense."""
+    value = _as_int(kbps)
+    if not 0 < value <= MAX_LINK_KBPS:
+        return None
+    return round(value / 1000.0, 1)
+
+
 def _survey_options(options: Any) -> Tuple[bool, Optional[float]]:
     """``(active, history_s)`` from the bridge's options object; junk means passive / whole session."""
     if not isinstance(options, dict):
@@ -632,7 +654,7 @@ def blank_view(state: str = "error", error: Optional[str] = None, enabled: bool 
         "available": False, "enabled": bool(enabled), "state": state, "error": error,
         "started_ts": None, "last_read_ts": None, "last_scan_ts": None, "active": False,
         "scan_interval_s": SCAN_INTERVAL_S, "passive_interval_s": PASSIVE_INTERVAL_S,
-        "interfaces": [], "aps": [], "history": {},
+        "interfaces": [], "aps": [], "history": {}, "link_history": [],
     }
 
 
@@ -671,6 +693,7 @@ class WifiSurvey:
         self._interfaces: List[Dict[str, Any]] = []
         self._connected: set = set()
         self._aps: Dict[str, _Ap] = {}
+        self._link = _Series("I")                 # this PC's link speed in kb/s (0: not associated), see the docstring
         self._clock_ref: Optional[Tuple[float, float]] = None   # (wall, monotonic) at the last clock check
         self._read_seq = 0
         self._parse_errors = 0
@@ -774,12 +797,14 @@ class WifiSurvey:
                     self._renew_lease_locked(now_m)
                 if not self._session and may_start:
                     self._start_session_locked()
-            view, windows = self._view_locked(now, now_m, history_s)
+            view, windows, link = self._view_locked(now, now_m, history_s)
         # the point lists are built without the lock: the scanner thread never waits for a big history
         started = view["started_ts"]
         full_from = (now - HISTORY_FULL_S - started) * 10.0 if started is not None else None
         view["history"] = {bssid: history_points(started, ts, rssi, full_from) if started is not None else []
                            for bssid, (ts, rssi) in windows.items()}
+        view["link_history"] = ([[t, round(kbps / 1000.0, 1)] for t, kbps in history_points(started, link[0], link[1], full_from)]
+                                if started is not None else [])
         return view
 
     def scan_now(self) -> Dict[str, Any]:
@@ -805,9 +830,10 @@ class WifiSurvey:
             return {"ok": True, "error": None}
 
     def clear(self) -> Dict[str, Any]:
-        """Forget every AP and all history; the session restarts now."""
+        """Forget every AP and all history (the link speed's too); the session restarts now."""
         with self._lock:
             self._aps.clear()
+            self._link = _Series("I")
             self._connected = set()
             if self._enabled and not self._stopping:
                 self._session = False
@@ -921,9 +947,11 @@ class WifiSurvey:
     def _native_pass(self, do_scan: bool, do_read: bool) -> Dict[str, Any]:
         """The WLAN calls of one pass (no lock held): read the list first (it holds the previous scan's
         results), then request the scan."""
+        # link_kbps: the link speed this pass read (see the docstring): 0 = not associated, None = not known
         res: Dict[str, Any] = {"read_attempted": do_read, "scan_attempted": do_scan, "read_ok": False,
                                "scan_ok": False, "denied": False, "no_adapter": False, "radio_off": False,
-                               "error": None, "interfaces": None, "entries": [], "connection_unknown": set()}
+                               "error": None, "interfaces": None, "entries": [], "connection_unknown": set(),
+                               "link_kbps": None}
         try:
             api = self._ensure_api()
             infos = [i for i in (api.interfaces() or []) if isinstance(i, dict)]
@@ -931,6 +959,7 @@ class WifiSurvey:
             self._close_api()
             if _winerror(exc) in NO_ADAPTER_CODES:
                 res["no_adapter"] = True
+                res["link_kbps"] = 0 if do_read else None
             else:
                 res["error"] = f"Windows' Wi-Fi service could not be queried{_code_suffix(exc)}."
                 log.debug("Wi-Fi survey: the Wlan API is not usable: %s", exc)   # the state change is logged
@@ -938,12 +967,14 @@ class WifiSurvey:
         if not infos:
             res["no_adapter"] = True
             res["interfaces"] = []
+            res["link_kbps"] = 0 if do_read else None
             return res
         usable = []
         views = []
         for info in infos:
             view = {"guid": str(info.get("guid") or ""), "description": str(info.get("description") or ""),
-                    "state": str(info.get("state") or "unknown"), "connected_bssid": None, "connected_ssid": None}
+                    "state": str(info.get("state") or "unknown"), "connected_bssid": None, "connected_ssid": None,
+                    "rx_rate_mbps": None, "tx_rate_mbps": None}
             views.append(view)
             try:
                 radio = api.radio_on(info.get("ref"))
@@ -955,6 +986,7 @@ class WifiSurvey:
         res["interfaces"] = views
         if not usable:
             res["radio_off"] = True
+            res["link_kbps"] = 0 if do_read else None
             return res
         unplugged: set = set()        # id() of the views whose interface vanished while this pass ran
         powered_off: set = set()      # ... or whose radio turned out to be off (its state could not be read)
@@ -997,6 +1029,10 @@ class WifiSurvey:
                     if isinstance(conn, dict):
                         view["connected_bssid"] = wifi_ies.format_bssid(conn.get("bssid"))
                         view["connected_ssid"] = wifi_ies.decode_ssid(conn.get("ssid"))[0] or None
+                        view["rx_rate_mbps"] = _rate_mbps(conn.get("rx_kbps"))
+                        view["tx_rate_mbps"] = _rate_mbps(conn.get("tx_kbps"))
+                        if res["link_kbps"] is None and view["tx_rate_mbps"] is not None:
+                            res["link_kbps"] = _as_int(conn.get("tx_kbps"))     # the first connected interface's
         if do_scan and self._api is not None:
             for ref, view in usable:
                 if id(view) in unplugged or id(view) in powered_off:
@@ -1010,6 +1046,9 @@ class WifiSurvey:
                         res["denied"] = True
                     elif not lost(code, view):   # a busy or reconnecting adapter refuses a scan now and then
                         log.debug("WlanScan failed: %s", exc)
+        if do_read and res["link_kbps"] is None and not res["denied"] \
+                and not any(view["state"] == "connected" for _ref, view in usable):
+            res["link_kbps"] = 0                  # no interface is associated: the link is down
         # a pass that did not hear from a connected interface (a scan-only pass, a failed query) keeps the
         # association the last pass saw (_apply_locked), so "connected to <SSID>" does not blink off
         res["connection_unknown"] = {view["guid"] for _ref, view in usable
@@ -1027,6 +1066,14 @@ class WifiSurvey:
             log.info("Wi-Fi survey state: %s -> %s", self._state, state)
         self._state, self._error = state, error
 
+    def _add_link_locked(self, kbps: int, now: float) -> None:
+        """One link speed reading (kb/s, 0 = not associated) stamped *now*, coalesced like the signal history."""
+        started = self._started_ts
+        if started is None:
+            return
+        at_ds = int(round((max(started, now) - started) * 10))
+        self._link.add(at_ds, max(0, min(MAX_LINK_KBPS, int(kbps))), int(COALESCE_S * 10), self.max_points)
+
     def _apply_locked(self, res: Dict[str, Any], plan_m: float, now_m: float, now: float, req_seq: int) -> None:
         if res["read_attempted"]:
             self._last_read_mono = now_m
@@ -1036,6 +1083,8 @@ class WifiSurvey:
             self._last_scan_mono = now_m
             if self._request_seq == req_seq:
                 self._scan_requested = False
+        if res.get("link_kbps") is not None:
+            self._add_link_locked(res["link_kbps"], now)
         if res["no_adapter"]:
             res["interfaces"] = []
         if res["interfaces"] is not None:
@@ -1072,15 +1121,15 @@ class WifiSurvey:
             self._post_scan_read_at = now_m + POST_SCAN_READ_S
 
     def _carry_connection_locked(self, views: List[Dict[str, Any]], unknown: Any) -> List[Dict[str, Any]]:
-        """*views* with the association of the previous pass copied into each interface (by GUID) this pass
-        did not ask, while it still reports itself connected."""
+        """*views* with the association of the previous pass (and its link speeds) copied into each interface (by
+        GUID) this pass did not ask, while it still reports itself connected."""
         if unknown:
             before = {v.get("guid"): v for v in self._interfaces}
             for view in views:
                 old = before.get(view.get("guid"))
                 if view.get("guid") in unknown and view.get("state") == "connected" and old is not None:
-                    view["connected_bssid"] = old.get("connected_bssid")
-                    view["connected_ssid"] = old.get("connected_ssid")
+                    for key in ("connected_bssid", "connected_ssid", "rx_rate_mbps", "tx_rate_mbps"):
+                        view[key] = old.get(key)
         return views
 
     def _follow_clock_locked(self, now: float, now_m: float) -> None:
@@ -1174,9 +1223,9 @@ class WifiSurvey:
                   len(entries), len(self._aps), errors)
 
     # -- view ---------------------------------------------------------------------------
-    def _view_locked(self, now: float, now_m: float, history_s: Optional[float]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        """The survey dict without its history, and ``{bssid: (deciseconds, dBm)}`` copies of every series
-        window for :meth:`survey` to turn into point lists once the lock is released."""
+    def _view_locked(self, now: float, now_m: float, history_s: Optional[float]) -> Tuple[Dict[str, Any], Dict[str, Any], Tuple[array, array]]:
+        """The survey dict without its histories, ``{bssid: (deciseconds, dBm)}`` copies of every series window and the
+        ``(deciseconds, kb/s)`` window of the link speed, for :meth:`survey` to turn into point lists once the lock is released."""
         if not self._enabled:
             state, error = "disabled", DISABLED_TEXT
         elif not self._session:
@@ -1220,7 +1269,8 @@ class WifiSurvey:
             "interfaces": [dict(v) for v in self._interfaces],
             "aps": aps,
             "history": {},
-        }, windows
+            "link_history": [],
+        }, windows, (self._link.window(min_ds) if started is not None else (array("I"), array("I")))
 
 
 def _wait_for(seconds: float) -> float:

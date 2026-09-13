@@ -120,6 +120,12 @@ DEFAULTS: Dict[str, Any] = {
     "ui": {"theme": "light", "show_ipv6": False},   # Network info hides IPv6 addresses unless asked
     "lan": {"enabled": True},       # Tools > LAN throughput: beacon on UDP 7132, throughput server on TCP 7133
     "geoip": {"enabled": True},     # IP location + ISP (Network info, Traceroute) from DB-IP Lite: the service downloads ~65 MB a month
+    "update": {                     # auto-update from the GitHub releases page (tnt.updater)
+        "enabled": True,            # check for new releases
+        "auto_install": False,      # download + install automatically (off: notify, then the user confirms)
+        "check_interval_h": 24,     # hours between checks
+        "channel": "stable",        # stable | prerelease (include pre-releases)
+    },
     "targets": {"defaults_extra": list(DEFAULT_EXTRA_TARGETS)},
     "dhcp": {                       # Tools > DHCP server (the on/off state is NOT persisted: off after every start)
         "adapter": "",              # adapter name to serve on; "" = auto (first physical Ethernet, else the internet NIC)
@@ -131,6 +137,10 @@ DEFAULTS: Dict[str, Any] = {
         "static_prefix": 24,
         "ping_check": True,         # ping a candidate address before offering it
         "scan_wait_s": 8,           # how long the "other DHCP server" probe waits for offers
+    },
+    "tftp": {                       # Tools > TFTP server (on/off and uploads are NOT persisted: both off after every start)
+        "adapter": "",              # adapter name to serve on; "" = auto (first physical Ethernet, else the internet NIC)
+        "max_upload_mb": 4096,      # largest file a device may upload while uploads are on
     },
 }
 
@@ -164,14 +174,17 @@ _CLAMPS = {
     "discovery.max_hosts": (1, 65536),
     "retention.days": (7, 3650),
     "network.poll_s": (2, 60),
+    "update.check_interval_h": (1, 168),
     "dhcp.pool_size": (1, 250),
     "dhcp.lease_s": (120, 604800),
     "dhcp.static_prefix": (8, 30),
     "dhcp.scan_wait_s": (2, 30),
+    "tftp.max_upload_mb": (1, 65536),
 }
 _ENUMS = {
     "speedtest.backend": {"auto", "cloudflare", "fastcom"},
     "ui.theme": {"light", "dark"},
+    "update.channel": {"stable", "prerelease"},
 }
 
 Listener = Callable[[Dict[str, Any], Set[str]], None]
@@ -272,7 +285,7 @@ def validate(cfg: Dict[str, Any]) -> Dict[str, Any]:
             _set_path(out, dotted, _get_path(DEFAULTS, dotted))
     # booleans
     for dotted in ("ping.loaded", "speedtest.enabled", "discovery.resolve_hostnames", "dhcp.ping_check", "ui.show_ipv6", "lan.enabled",
-                   "geoip.enabled"):
+                   "geoip.enabled", "update.enabled", "update.auto_install"):
         _set_path(out, dotted, bool(_get_path(out, dotted)))
     # ports list
     ports = _get_path(out, "discovery.ports")
@@ -293,7 +306,7 @@ def validate(cfg: Dict[str, Any]) -> Dict[str, Any]:
     _set_path(out, "discovery.ports", clean_ports or list(DEFAULT_PORTS))
     # strings
     for dotted in ("api.host", "map.internet_host", "dhcp.adapter", "dhcp.pool_start", "dhcp.pool_end",
-                   "dhcp.static_ip"):
+                   "dhcp.static_ip", "tftp.adapter"):
         v = _get_path(out, dotted)
         _set_path(out, dotted, str(v).strip() if v is not None else "")
     if not _get_path(out, "map.internet_host"):

@@ -1370,6 +1370,29 @@ class JsBridge:
             log.exception("retry failed")
             return False
 
+    def arm_relaunch(self) -> bool:
+        """Before an update install: start a detached ``cmd.exe`` that waits, then starts TNT again once the
+        installer (run by the service) has replaced this exe. ``cmd.exe`` — not ``TNT.exe`` — survives the
+        installer's ``taskkill /IM TNT.exe``. A no-op unless this is the frozen client."""
+        try:
+            if not getattr(sys, "frozen", False):
+                return False
+            exe = sys.executable
+            if not exe or not os.path.isfile(exe):
+                return False
+            import subprocess
+
+            # ping is a portable delay: wait ~30 s for the installer to finish, then reopen the window
+            cmd = ["cmd.exe", "/c", 'ping -n 31 127.0.0.1 >nul & start "" "%s"' % exe]
+            subprocess.Popen(cmd, close_fds=True,
+                             creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            log.info("update: armed a client relaunch to follow the installer")
+            return True
+        except Exception:  # noqa: BLE001
+            log.exception("arm_relaunch failed")
+            return False
+
     # -- Wi-Fi survey (client/wifi_survey.py) --------------------------------------------------
     # The BSSID list is location data, so these answer only the TNT dashboard itself: any other page
     # the window might end up on gets a refusal. None of them blocks: the WLAN calls run on the

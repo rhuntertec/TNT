@@ -30,11 +30,13 @@
 ;      says so when the download fails or the runtime is still missing/too old afterwards
 ;    * uninstall: taskkill TNT.exe, sc stop, "TNTService.exe remove" (sc delete
 ;      as a fallback), and the Windows Firewall rules the service adds for itself
-;      ("TNT DHCP server (UDP 67 in)", "TNT LAN discovery (UDP 7132 in)",
-;      "TNT LAN throughput (TCP 7133 in)") are deleted. %ProgramData%\TNT is KEPT
-;      unless the user answers Yes to "Remove monitoring data" (or runs the
-;      uninstaller with /REMOVEDATA=1); the downloaded IP location data
-;      (%ProgramData%\TNT\geoip) is always removed
+;      ("TNT DHCP server (UDP 67 in)", "TNT TFTP server (UDP 69 in)",
+;      "TNT LAN discovery (UDP 7132 in)", "TNT LAN throughput (TCP 7133 in)") are
+;      deleted. %ProgramData%\TNT is KEPT (the TFTP server's folder
+;      %ProgramData%\TNT\tftp included) unless the user answers Yes to "Remove
+;      monitoring data" (or runs the uninstaller with /REMOVEDATA=1); the downloaded
+;      IP location data (%ProgramData%\TNT\geoip) and the saved packet captures
+;      (%ProgramData%\TNT\captures) are always removed
 ;    * launches TNT.exe after install as the signed-in (non-elevated) user
 ;    * installs LICENSE (TNT's MIT licence) and THIRD-PARTY-NOTICES.txt (the licences of the
 ;      bundled third-party components) into {app}; no license page: TNT is published under the
@@ -59,6 +61,9 @@
 ; inbound-allow rule the service creates (netsh advfirewall) the first time the DHCP server tool is switched on;
 ; must match tnt.dhcp.FIREWALL_RULE_NAME
 #define MyDhcpFirewallRule "TNT DHCP server (UDP 67 in)"
+; inbound-allow rule the service creates (remote LocalSubnet) the first time the TFTP server is switched on;
+; must match tnt.tftp.FIREWALL_RULE_NAME
+#define MyTftpFirewallRule "TNT TFTP server (UDP 69 in)"
 ; inbound-allow rules the service creates at every start for the LAN peer service (beacon on UDP 7132,
 ; throughput server on TCP 7133); must match tnt.lanpeers.BEACON_FIREWALL_RULE / THROUGHPUT_FIREWALL_RULE
 #define MyLanBeaconFirewallRule "TNT LAN discovery (UDP 7132 in)"
@@ -180,6 +185,8 @@ Filename: "{sys}\sc.exe"; Parameters: "stop {#MyServiceName}"; RunOnceId: "StopT
 Filename: "{app}\{#MyServiceExeName}"; Parameters: "remove"; RunOnceId: "RemoveTntService"; Flags: runhidden waituntilterminated
 ; the DHCP server tool's firewall rule (harmless non-zero exit when the tool was never switched on)
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#MyDhcpFirewallRule}"""; RunOnceId: "TNTDhcpFw"; Flags: runhidden waituntilterminated
+; the TFTP server's firewall rule (harmless non-zero exit when the server was never switched on)
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#MyTftpFirewallRule}"""; RunOnceId: "TNTTftpFw"; Flags: runhidden waituntilterminated
 ; the LAN peer service's rules (created at every service start while lan.enabled is on)
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#MyLanBeaconFirewallRule}"""; RunOnceId: "TNTLanBeaconFw"; Flags: runhidden waituntilterminated
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#MyLanThroughputFirewallRule}"""; RunOnceId: "TNTLanThroughputFw"; Flags: runhidden waituntilterminated
@@ -189,6 +196,8 @@ Type: filesandordirs; Name: "{app}\_service"
 Type: filesandordirs; Name: "{app}\_client"
 ; the IP location data the service downloaded (tnt.geoip); the rest of %ProgramData%\TNT is kept unless the user removes it
 Type: filesandordirs; Name: "{commonappdata}\TNT\geoip"
+; the saved packet captures (tnt.capture): they can hold passwords and private data, so they never outlive TNT
+Type: filesandordirs; Name: "{commonappdata}\TNT\captures"
 
 [Code]
 var

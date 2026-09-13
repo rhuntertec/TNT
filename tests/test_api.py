@@ -6,12 +6,14 @@ dicts; the HTTP server is started on port 0 (never 7130).  No network access.
 from __future__ import annotations
 
 import http.client
+import io
 import json
 import logging
 import os
 import queue
 import re
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -27,6 +29,12 @@ from tnt import SERVICE_DESCRIPTION, SERVICE_DISPLAY_NAME, SERVICE_NAME, __versi
 from tnt import config as tnt_config
 from tnt import db as tnt_db
 from tnt import events as tnt_events
+from tnt import capture as tnt_capture
+from tnt import natcheck as tnt_natcheck
+from tnt import pktmon as tnt_pktmon
+from tnt import portcheck as tnt_portcheck
+from tnt import switchport as tnt_switchport
+from tnt import tftp as tnt_tftp
 from tnt.api import routes as api_routes
 from tnt.api import server as api_server
 from tnt.api.routes import ApiError, Request, Router
@@ -414,6 +422,36 @@ class FakeGeoIp:
         return dict(self.location) if self.location else None
 
 
+class FakeUpdate:
+    """Stand-in for tnt.updater.UpdateManager; set as ``engine.update`` inside the update tests only."""
+
+    def __init__(self, enabled: bool = True, available: bool = True) -> None:
+        self.enabled = enabled
+        self.available = available
+        self.checks = 0
+        self.installs = 0
+        self.install_error: Optional[str] = None
+
+    def status(self) -> Dict[str, Any]:
+        if not self.enabled:
+            return {"enabled": False, "state": "disabled", "current_version": __version__, "latest_version": None,
+                    "latest_ts": None, "notes_url": None, "asset": None, "checked_ts": None, "next_check_ts": None,
+                    "download": None, "error": None, "auto_install": False}
+        return {"enabled": True, "state": "available" if self.available else "up_to_date", "current_version": __version__,
+                "latest_version": "9.9.9" if self.available else None, "latest_ts": T0, "notes_url": "https://n",
+                "asset": {"name": "TNT-Setup-9.9.9.exe", "bytes": 42} if self.available else None,
+                "checked_ts": T0, "next_check_ts": T0 + 3600, "download": None, "error": None, "auto_install": False}
+
+    def check_now(self) -> bool:
+        self.checks += 1
+        return self.enabled
+
+    def request_install(self) -> None:
+        if self.install_error is not None:
+            raise RuntimeError(self.install_error)
+        self.installs += 1
+
+
 class FakeEngine:
     def __init__(self, config: Any, db: Any, bus: Any) -> None:
         self.version = __version__
@@ -791,7 +829,7 @@ def test_status_shape(server, engine):
     status, data = call_json(server, "GET", "/api/status")
     assert status == 200
     expected = {"version", "started_ts", "uptime_s", "mode", "monitoring", "paused", "overall_light",
-                "targets", "outages", "speed", "discovery", "netinfo", "net", "settings", "map", "dhcp"}
+                "targets", "outages", "speed", "discovery", "netinfo", "net", "settings", "map", "dhcp", "tftp"}
     assert expected <= set(data)
     assert data["version"] == __version__ and data["mode"] == "console"
     assert set(data["dhcp"]) == {"available", "running", "adapter", "server_ip", "pool", "bound", "offered", "since_ts", "error"}
@@ -1320,6 +1358,67 @@ def test_geoip_routes(server, engine):
     assert status == 200 and data["state"] == "disabled"
 
 
+def test_status_update_null_without_component_and_status_with_it(server, engine):
+    from tnt import updater
+
+    status, data = call_json(server, "GET", "/api/status")
+    assert status == 200 and "update" in data and data["update"] is None
+    engine.update = FakeUpdate()
+    status, data = call_json(server, "GET", "/api/status")
+    assert status == 200 and data["update"] == engine.update.status() and set(data["update"]) == set(updater.STATUS_KEYS)
+    engine.update.enabled = False
+    status, data = call_json(server, "GET", "/api/status")
+    assert data["update"]["state"] == "disabled" and set(data["update"]) == set(updater.STATUS_KEYS)
+
+
+def test_update_status_and_check_routes(server, engine):
+    for method, path in (("GET", "/api/update"), ("POST", "/api/update/check")):
+        status, data = call_json(server, method, path)
+        assert status == 503 and data["error"]["code"] == "unavailable", path
+    um = engine.update = FakeUpdate()
+    status, data = call_json(server, "GET", "/api/update")
+    assert status == 200 and data == um.status()
+    status, data = call_json(server, "POST", "/api/update/check")
+    assert status == 200 and data == um.status() and um.checks == 1
+    um.enabled = False
+    status, data = call_json(server, "POST", "/api/update/check")
+    assert status == 409 and data["error"] == {"code": "conflict", "message": "Automatic updates are switched off"}
+
+
+def test_update_install_route_needs_an_administrator(server, engine):
+    um = engine.update = FakeUpdate()
+    server.wifi_reveal_check = lambda peer, local: "denied"
+    status, data = call_body(server, "POST", "/api/update/install")
+    assert status == 403 and data["error"] == {"code": "admin_required", "message": api_routes.UPDATE_ADMIN_REQUIRED_MSG}
+    for check in (lambda peer, local: "unknown", lambda peer, local: None):
+        server.wifi_reveal_check = check
+        status, data = call_body(server, "POST", "/api/update/install")
+        assert status == 403 and data["error"] == {"code": "admin_required", "message": api_routes.UPDATE_ADMIN_UNVERIFIED_MSG}
+    assert um.installs == 0
+    server.wifi_reveal_check = lambda peer, local: "allowed"
+    status, data = call_body(server, "POST", "/api/update/install")
+    assert status == 200 and data == um.status() and um.installs == 1
+
+
+def test_update_install_route_refuses_a_page_of_another_origin(server, engine):
+    um = engine.update = FakeUpdate()
+    server.wifi_reveal_check = lambda peer, local: "allowed"
+    status, data = call_body(server, "POST", "/api/update/install",
+                             headers={"Origin": "https://evil.example", "Sec-Fetch-Site": "cross-site"})
+    assert status == 403 and data["error"]["code"] == "forbidden"
+    assert um.installs == 0        # refused before the component is even asked
+
+
+def test_update_install_route_409_and_503(server, engine):
+    server.wifi_reveal_check = lambda peer, local: "allowed"
+    status, data = call_body(server, "POST", "/api/update/install")
+    assert status == 503 and data["error"]["code"] == "unavailable"      # no update component
+    um = engine.update = FakeUpdate()
+    um.install_error = "No update is available to install"
+    status, data = call_body(server, "POST", "/api/update/install")
+    assert status == 409 and data["error"] == {"code": "conflict", "message": "No update is available to install"}
+
+
 def test_settings_toggle_geoip(server, engine, data_dir):
     seen: List[Dict[str, Any]] = []
     engine.bus.subscribe(lambda e: seen.append(e) if e["type"] == "settings.changed" else None)
@@ -1481,6 +1580,728 @@ def test_lan_routes_503_when_component_missing(server, engine):
 # ---------------------------------------------------------------------------
 # GET /api/oui (vendor names for the WiFi tile; only 24-bit prefixes reach the service)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# quick tools: DNS lookup, Flush DNS, IP release/renew
+# ---------------------------------------------------------------------------
+DNS_RESULT = {"name": "www.example.com", "type": None, "server": None, "resolver": {"name": "dns.example.net", "address": "192.0.2.53"},
+              "answer_name": "www.example.com", "addresses": ["192.0.2.10", "2001:db8::10"], "aliases": [],
+              "records": [{"type": "A", "name": "www.example.com", "value": "192.0.2.10", "ttl": 300},
+                          {"type": "AAAA", "name": "www.example.com", "value": "2001:db8::10", "ttl": 300}],
+              "authoritative": False, "ok": True, "error": None, "duration_ms": 41, "ts": T0}
+FLUSH_RESULT = {"ok": True, "method": "native", "error": None, "duration_ms": 3, "ts": T0}
+RENEW_RESULT = {"ok": True, "address": "192.0.2.44", "adapter": "Ethernet",
+                "adapters": [{"name": "Ethernet", "released": True, "renewed": True, "error": None}], "warnings": [],
+                "paused_monitoring": False, "method": "native", "error": None, "duration_ms": 5400, "ts": T0}
+QUICK_TOOL_PATHS = ("/api/tools/dns/lookup", "/api/tools/dns/flush", "/api/tools/ip/renew")
+
+
+def call_body(srv: Any, method: str, path: str, body: Any = None, headers: Optional[Dict[str, str]] = None):
+    status, _headers, payload = call(srv, method, path, body, headers=headers)
+    return status, (json.loads(payload) if payload else None)
+
+
+@pytest.fixture
+def fake_nettools(monkeypatch):
+    """``tnt.nettools.dns_lookup`` / ``flush_dns`` replaced (validation kept): nothing reaches a DNS server or the cache."""
+    from tnt import nettools
+
+    calls: List[Any] = []
+
+    def lookup(name: Any, server: Any = None, record_type: Any = None, **kw: Any) -> Dict[str, Any]:
+        calls.append(("lookup", name, server, record_type))
+        qname, srv, rtype = nettools.validate_lookup(name, server, record_type)
+        return dict(DNS_RESULT, name=qname, type=rtype, server=srv)
+
+    def flush(**kw: Any) -> Dict[str, Any]:
+        calls.append(("flush",))
+        return dict(FLUSH_RESULT)
+
+    monkeypatch.setattr(nettools, "dns_lookup", lookup)
+    monkeypatch.setattr(nettools, "flush_dns", flush)
+    return calls
+
+
+DNS_TYPE_TEXT = '"{}" is not a DNS record type (A, AAAA, CNAME, MX, TXT, NS, SOA, SRV, CAA, PTR or NAPTR)'
+DNS_IP_TYPE_TEXT = "An IP address is looked up as PTR: type a DNS name to ask for other record types"
+
+
+def test_dns_lookup_route(server, fake_nettools):
+    from tnt import nettools
+
+    status, data = call_body(server, "POST", "/api/tools/dns/lookup", {"name": "www.example.com"})
+    assert status == 200 and data == DNS_RESULT and list(data) == list(DNS_RESULT) == list(nettools.DNS_RESULT_KEYS)
+    status, data = call_body(server, "POST", "/api/tools/dns/lookup", {"name": "www.example.com.", "server": "dns.example.net"})
+    assert status == 200 and data["name"] == "www.example.com" and data["server"] == "dns.example.net"
+    status, data = call_body(server, "POST", "/api/tools/dns/lookup", {"name": "192.0.2.10", "server": None})
+    assert status == 200 and data["server"] is None and data["type"] is None
+    # a record type is trimmed and matched in any case; null or empty is Auto; an address takes PTR
+    for body, rtype in (({"name": "example.com", "type": " mx "}, "MX"), ({"name": "example.com", "type": "naptr"}, "NAPTR"),
+                        ({"name": "example.com", "type": None}, None), ({"name": "example.com", "type": ""}, None),
+                        ({"name": "192.0.2.10", "type": "Ptr"}, "PTR"), ({"name": "example.com", "type": "all"}, "ALL"),
+                        ({"name": "192.0.2.10", "type": "ALL"}, "ALL")):
+        status, data = call_body(server, "POST", "/api/tools/dns/lookup", body)
+        assert status == 200 and data["type"] == rtype and list(data) == list(DNS_RESULT), body
+    assert fake_nettools == [("lookup", "www.example.com", None, None), ("lookup", "www.example.com.", "dns.example.net", None),
+                             ("lookup", "192.0.2.10", None, None), ("lookup", "example.com", None, " mx "),
+                             ("lookup", "example.com", None, "naptr"), ("lookup", "example.com", None, None),
+                             ("lookup", "example.com", None, ""), ("lookup", "192.0.2.10", None, "Ptr"),
+                             ("lookup", "example.com", None, "all"), ("lookup", "192.0.2.10", None, "ALL")]
+    for body, message in (({}, "Type a DNS name or IP address to look up"), ({"name": "   "}, "Type a DNS name or IP address to look up"),
+                          ({"name": "-type=any"}, '"-type=any" is not a DNS name or IP address'),
+                          ({"name": "www.example.com", "server": "-x"}, '"-x" is not a DNS server name or IP address'),
+                          ({"name": 5}, "name must be text"), ({"name": ["www.example.com"]}, "name must be text"),
+                          ({"name": "www.example.com", "server": 53}, "server must be text or null"),
+                          ({"name": "example.com", "type": 15}, "type must be text or null"),
+                          ({"name": "example.com", "type": ["MX"]}, "type must be text or null"),
+                          # the route checks the name, the server and the type in turn
+                          ({"name": 5, "server": 53, "type": 15}, "name must be text"),
+                          ({"name": "example.com", "server": 53, "type": 15}, "server must be text or null"),
+                          ({"name": "example.com", "type": "ANY"}, DNS_TYPE_TEXT.format("ANY")),
+                          ({"name": "example.com", "type": "  -type=mx "}, DNS_TYPE_TEXT.format("-type=mx")),
+                          ({"name": "192.0.2.10", "type": "MX"}, DNS_IP_TYPE_TEXT),
+                          # then the service: the name, the server, the type, and last an address with another type
+                          ({"name": "  ", "type": "ANY"}, "Type a DNS name or IP address to look up"),
+                          ({"name": "example.com", "server": "-x", "type": "ANY"}, '"-x" is not a DNS server name or IP address'),
+                          ({"name": "192.0.2.10", "type": "ANY"}, DNS_TYPE_TEXT.format("ANY")),
+                          ([1], "JSON body must be an object")):
+        status, data = call_body(server, "POST", "/api/tools/dns/lookup", body)
+        assert status == 400 and data["error"] == {"code": "bad_request", "message": message}, body
+    status, _data = call_body(server, "GET", "/api/tools/dns/lookup")
+    assert status == 405
+
+
+def test_dns_lookup_route_hands_the_type_to_the_service(server, monkeypatch):
+    """The route's call fits the real ``tnt.nettools.dns_lookup``: the type reaches it and a type it refuses is a 400.  The
+    server choice is stubbed, so no DNS server is asked even if the call were wrong."""
+    from tnt import nettools
+
+    asked: List[Any] = []
+    monkeypatch.setattr(nettools, "_resolve_server", lambda *a, **kw: asked.append(a) or (None, nettools.NO_SERVER_TEXT))
+    status, data = call_body(server, "POST", "/api/tools/dns/lookup", {"name": "example.com", "type": "caa"})
+    assert status == 200 and list(data) == list(nettools.DNS_RESULT_KEYS)
+    assert data == {**data, "name": "example.com", "type": "CAA", "ok": False, "error": nettools.NO_SERVER_TEXT}
+    for body, message in (({"name": "192.0.2.10", "type": "NAPTR"}, DNS_IP_TYPE_TEXT),
+                          ({"name": "example.com", "type": "HINFO"}, DNS_TYPE_TEXT.format("HINFO"))):
+        status, data = call_body(server, "POST", "/api/tools/dns/lookup", body)
+        assert status == 400 and data["error"] == {"code": "bad_request", "message": message}, body
+    assert len(asked) == 1, "a refused lookup never chooses a server"
+
+
+def test_dns_flush_route(server, fake_nettools, monkeypatch):
+    from tnt import nettools
+
+    status, data = call_body(server, "POST", "/api/tools/dns/flush")
+    assert status == 200 and data == FLUSH_RESULT and fake_nettools == [("flush",)]
+    monkeypatch.setattr(nettools, "flush_dns", lambda **kw: dict(FLUSH_RESULT, ok=False, error="Windows did not flush the DNS cache"))
+    status, data = call_body(server, "POST", "/api/tools/dns/flush")
+    assert status == 200 and data["ok"] is False and data["error"] == "Windows did not flush the DNS cache"
+
+
+def test_quick_tool_routes_503_when_the_module_cannot_be_imported(server, monkeypatch):
+    monkeypatch.setitem(sys.modules, "tnt.nettools", None)
+    for path, body in (("/api/tools/dns/lookup", {"name": "www.example.com"}), ("/api/tools/dns/flush", None)):
+        status, data = call_body(server, "POST", path, body)
+        assert status == 503 and data["error"]["code"] == "unavailable", path
+
+
+@pytest.mark.parametrize("path", QUICK_TOOL_PATHS)
+def test_quick_tools_refuse_a_page_of_another_origin(server, engine, fake_nettools, path):
+    ran: List[int] = []
+    engine.ip_release_renew = lambda: ran.append(1) or dict(RENEW_RESULT)
+    checks: List[Any] = []
+    server.wifi_reveal_check = lambda peer, local: checks.append(peer) or "allowed"
+    body = {"name": "www.example.com"}
+    # a cross-site POST or a foreign Origin is refused by the server's CSRF guard before routing; the route itself
+    # refuses same-site (another port on localhost), with its own message
+    for headers in ({"Sec-Fetch-Site": "cross-site"}, {"Sec-Fetch-Site": "same-site", "Origin": "http://localhost:8081"}):
+        status, data = call_body(server, "POST", path, body, headers=headers)
+        assert status == 403 and data["error"]["code"] == "forbidden"
+    status, data = call_body(server, "POST", path, body, headers={"Sec-Fetch-Site": "same-site"})
+    assert status == 403 and data["error"] == {"code": "forbidden", "message": api_routes.QUICK_TOOLS_CROSS_ORIGIN_MSG}
+    assert fake_nettools == [] and ran == [] and checks == [], "refused before anything runs, the admin check included"
+    status, _data = call_body(server, "POST", path, body,
+                              headers={"Sec-Fetch-Site": "same-origin", "Origin": f"http://127.0.0.1:{server.port}"})
+    assert status == 200
+
+
+def test_ip_renew_route_needs_an_administrator(server, engine, monkeypatch):
+    ran: List[int] = []
+    engine.ip_release_renew = lambda: ran.append(1) or dict(RENEW_RESULT)
+    seen: List[Any] = []
+    server.wifi_reveal_check = lambda peer, local: seen.append((peer, local)) or "denied"
+    status, data = call_body(server, "POST", "/api/tools/ip/renew")
+    assert status == 403 and data["error"] == {"code": "admin_required", "message": api_routes.IP_RENEW_ADMIN_REQUIRED_MSG}
+    peer, local = seen[0]
+    assert peer[0].startswith("127.") and int(local[1]) == server.port
+
+    def boom(peer: Any, local: Any) -> str:
+        raise RuntimeError("token read exploded")
+
+    for check in (lambda peer, local: "unknown", lambda peer, local: None, boom):
+        server.wifi_reveal_check = check
+        status, data = call_body(server, "POST", "/api/tools/ip/renew")
+        assert status == 403 and data["error"] == {"code": "admin_required", "message": api_routes.IP_RENEW_ADMIN_UNVERIFIED_MSG}
+    import tnt.peer
+
+    monkeypatch.setattr(tnt.peer, "reveal_allowed", lambda peer, local: "denied")
+    server.wifi_reveal_check = None                                  # the production path: tnt.peer decides
+    status, data = call_body(server, "POST", "/api/tools/ip/renew")
+    assert status == 403 and data["error"]["message"] == api_routes.IP_RENEW_ADMIN_REQUIRED_MSG
+    assert ran == []
+    server.wifi_reveal_check = lambda peer, local: "allowed"
+    status, data = call_body(server, "POST", "/api/tools/ip/renew")
+    assert status == 200 and data == RENEW_RESULT and list(data) == list(RENEW_RESULT) and ran == [1]
+
+
+def test_ip_renew_route_503_and_409(server, engine):
+    server.wifi_reveal_check = lambda peer, local: "allowed"
+    status, data = call_body(server, "POST", "/api/tools/ip/renew")
+    assert status == 503 and data["error"]["code"] == "unavailable"         # an engine without ip_release_renew
+
+    def busy() -> Dict[str, Any]:
+        raise RuntimeError("An IP release/renew is already running")
+
+    engine.ip_release_renew = busy
+    status, data = call_body(server, "POST", "/api/tools/ip/renew")
+    assert status == 409 and data["error"] == {"code": "conflict", "message": "An IP release/renew is already running"}
+
+
+# ---------------------------------------------------------------------------
+# network tools: NAT check, switch port, port-forward test, packet capture, TFTP server
+# ---------------------------------------------------------------------------
+NAT_RESULT = {**dict.fromkeys(tnt_natcheck.NAT_RESULT_KEYS), "ts": T0, "generation": 3, "duration_ms": 840,
+              "verdict": "single_nat", "confidence": "high", "title": tnt_natcheck.NAT_TEXT["single_nat"][0],
+              "explanation": tnt_natcheck.NAT_TEXT["single_nat"][1], "public_ip": "203.0.113.5"}
+SWITCH_ADAPTER = {"name": "Ethernet", "index": 21, "mac": "02:00:5e:10:00:01"}
+SWITCH_JOB = {**dict.fromkeys(tnt_switchport.SWITCH_JOB_KEYS), "state": "idle", "neighbors": [], "generation": 3}
+PORT_RESULT = {**dict.fromkeys(tnt_portcheck.PORTCHECK_RESULT_KEYS), "ts": T0, "generation": 3, "port": 8000,
+               "protocol": "tcp", "public_ip": "203.0.113.5", "reachable": True, "provider": "portchecker.io",
+               "detail": tnt_portcheck.PORTCHECKER_OPEN_DETAIL, "nat_verdict": "single_nat", "duration_ms": 1240}
+CAPTURE_NAME = "TNT-capture-20260101-120000.pcapng"
+CAPTURE_BYTES = b"\x0a\x0d\x0d\x0a" + bytes(24)
+CAPTURE_FILE = {"name": CAPTURE_NAME, "size": 4096, "created_ts": T0, "packets": 12}
+CAPTURE_JOB = {**dict.fromkeys(tnt_capture.CAPTURE_JOB_KEYS), "id": 1, "state": "capturing",
+               "adapter": dict(SWITCH_ADAPTER, type_name="Ethernet", wifi=False),
+               "filters": {"host": None, "port": None, "protocol": None}, "full_packets": True, "seconds": 60,
+               "size_mb": 128, "started_ts": T0, "elapsed_s": 0.0, "ts": T0}
+
+
+class FakeNatChecker:
+    """Stand-in for tnt.natcheck.NatChecker (last / running / run); every call is recorded."""
+
+    def __init__(self) -> None:
+        self.calls: List[Any] = []
+        self.result: Optional[Dict[str, Any]] = None
+        self.busy = False
+        self.fail_with: Optional[BaseException] = None
+
+    def last(self) -> Optional[Dict[str, Any]]:
+        self.calls.append(("last",))
+        return dict(self.result) if self.result else None
+
+    def running(self) -> bool:
+        self.calls.append(("running",))
+        return self.busy
+
+    def run(self) -> Dict[str, Any]:
+        self.calls.append(("run",))
+        if self.fail_with is not None:
+            raise self.fail_with
+        self.result = dict(NAT_RESULT)
+        return dict(self.result)
+
+
+class FakeSwitchPort:
+    """Stand-in for tnt.switchport.SwitchPortFinder (status / start / stop)."""
+
+    def __init__(self) -> None:
+        self.calls: List[Any] = []
+        self.job = dict(SWITCH_JOB)
+        self.fail_with: Optional[BaseException] = None
+
+    def status(self) -> Dict[str, Any]:
+        self.calls.append(("status",))
+        return {"job": dict(self.job), "adapters": [dict(SWITCH_ADAPTER, is_internet=True)], "available": True, "reason": None}
+
+    def start(self, adapter: Optional[str] = None, seconds: Any = 65) -> Dict[str, Any]:
+        self.calls.append(("start", adapter, seconds))
+        if self.fail_with is not None:
+            raise self.fail_with
+        self.job = dict(self.job, state="listening", adapter=dict(SWITCH_ADAPTER), started_ts=T0,
+                        listen_s=65 if seconds is None else seconds, elapsed_s=0.0, ts=T0)
+        return dict(self.job)
+
+    def stop(self) -> Dict[str, Any]:
+        self.calls.append(("stop",))
+        if self.job["state"] == "listening":
+            self.job = dict(self.job, state="cancelled")
+        return dict(self.job)
+
+
+class FakePortChecker:
+    """Stand-in for tnt.portcheck.PortChecker: the service's own port check, then PORT_RESULT."""
+
+    def __init__(self) -> None:
+        self.calls: List[Any] = []
+        self.fail_with: Optional[BaseException] = None
+
+    def test(self, port: Any) -> Dict[str, Any]:
+        self.calls.append(("test", port))
+        if self.fail_with is not None:
+            raise self.fail_with
+        return dict(PORT_RESULT, port=tnt_portcheck.validate_port(port))
+
+
+class FakeCaptureManager:
+    """Stand-in for tnt.capture.CaptureManager (status / start / stop / open_file / delete_file); ``opened`` keeps every
+    file object handed out for a download."""
+
+    def __init__(self) -> None:
+        self.calls: List[Any] = []
+        self.job: Optional[Dict[str, Any]] = None
+        self.files = [dict(CAPTURE_FILE)]
+        self.opened: List[Any] = []
+        self.fail_with: Optional[BaseException] = None
+
+    def _call(self, *call: Any) -> None:
+        self.calls.append(call)
+        if self.fail_with is not None:
+            raise self.fail_with
+
+    def status(self) -> Dict[str, Any]:
+        self._call("status")
+        return {"available": True, "reason": None, "adapters": [dict(CAPTURE_JOB["adapter"])], "capture": self.job,
+                "files": [dict(f) for f in self.files]}
+
+    def start(self, *, adapter: Any, **kwargs: Any) -> Dict[str, Any]:
+        self._call("start", adapter, kwargs)
+        self.job = dict(CAPTURE_JOB)
+        return dict(self.job)
+
+    def stop(self) -> Optional[Dict[str, Any]]:
+        self._call("stop")
+        return dict(self.job, state="done", file=CAPTURE_NAME) if self.job else None
+
+    def open_file(self, name: Any) -> Any:
+        self._call("open_file", name)
+        self.opened.append(io.BytesIO(CAPTURE_BYTES))
+        return self.opened[-1], len(CAPTURE_BYTES)
+
+    def delete_file(self, name: Any) -> List[Dict[str, Any]]:
+        self._call("delete_file", name)
+        self.files = [f for f in self.files if f["name"] != name]
+        return [dict(f) for f in self.files]
+
+
+class FakeTftpServer:
+    """Stand-in for tnt.tftp.TftpServer with the service's own argument checks."""
+
+    def __init__(self) -> None:
+        self.calls: List[Any] = []
+        self.running = False
+        self.uploads = False
+        self.settings = {"adapter": "", "max_upload_mb": 4096}
+        self.fail_with: Optional[BaseException] = None
+
+    def summary(self) -> Dict[str, Any]:
+        return {"available": True, "running": self.running, "adapter": "Ethernet" if self.running else None,
+                "listen_ips": ["192.0.2.10"] if self.running else [], "active": 0, "uploads": self.uploads,
+                "since_ts": T0 if self.running else None, "error": None}
+
+    def _view(self) -> Dict[str, Any]:
+        return {**dict.fromkeys(tnt_tftp.TFTP_STATUS_KEYS), "available": True, "running": self.running,
+                "since_ts": T0 if self.running else None, "adapter": "Ethernet" if self.running else None, "adapters": [],
+                "listen": [{"ip": "192.0.2.10", "port": 69}] if self.running else [], "root": "C:/ProgramData/TNT/tftp",
+                "uploads": self.uploads, "firewall": {"rule": tnt_tftp.FIREWALL_RULE_NAME, "ok": None, "error": None},
+                "transfers": [], "history": [], "counts": dict.fromkeys(tnt_tftp.TFTP_COUNT_KEYS, 0),
+                "settings": dict(self.settings)}
+
+    def status(self) -> Dict[str, Any]:
+        self.calls.append(("status",))
+        return self._view()
+
+    def start(self, adapter: Optional[str] = None, uploads: Any = False) -> Dict[str, Any]:
+        self.calls.append(("start", adapter, uploads))
+        if self.fail_with is not None:
+            raise self.fail_with
+        if not isinstance(uploads, bool):
+            raise ValueError("uploads must be true or false")
+        self.running, self.uploads = True, uploads
+        return self._view()
+
+    def stop(self) -> Dict[str, Any]:
+        self.calls.append(("stop",))
+        self.running = self.uploads = False
+        return self._view()
+
+    def set_uploads(self, on: Any) -> Dict[str, Any]:
+        self.calls.append(("set_uploads", on))
+        if not isinstance(on, bool):
+            raise ValueError("on must be true or false")
+        self.uploads = on
+        return self._view()
+
+    def update_settings(self, patch: Dict[str, Any]) -> Dict[str, Any]:
+        self.calls.append(("update_settings", dict(patch)))
+        unknown = sorted(str(k) for k in patch if k not in tnt_tftp.TFTP_SETTINGS_KEYS)
+        if unknown:
+            raise ValueError(f"unknown TFTP setting '{unknown[0]}'")
+        self.settings.update(patch)
+        return self._view()
+
+    def files(self) -> List[Dict[str, Any]]:
+        self.calls.append(("files",))
+        return [{"name": "boot/pxelinux.0", "size": 26828, "mtime": T0}]
+
+
+@pytest.fixture
+def network_tools(engine):
+    """The fake NAT check, switch port finder, port-forward test, capture manager and TFTP server, set on the engine."""
+    tools = {"natcheck": FakeNatChecker(), "switchport": FakeSwitchPort(), "portcheck": FakePortChecker(),
+             "capture": FakeCaptureManager(), "tftp": FakeTftpServer()}
+    for name, fake in tools.items():
+        setattr(engine, name, fake)
+    return tools
+
+
+#: Every network tool route that changes something, plus the capture download (a page of another origin must not make a
+#: browser save a capture either).  Not part of QUICK_TOOL_PATHS: those bodies and fakes differ.
+NETWORK_TOOL_CHANGES = (
+    ("POST", "/api/netcheck/nat", None),
+    ("POST", "/api/netcheck/switch", {"adapter": None, "seconds": None}),
+    ("DELETE", "/api/netcheck/switch", None),
+    ("POST", "/api/netcheck/portforward", {"port": 8000}),
+    ("POST", "/api/tools/capture", {"adapter": "Ethernet"}),
+    ("DELETE", "/api/tools/capture", None),
+    ("DELETE", f"/api/tools/capture/files/{CAPTURE_NAME}", None),
+    ("GET", f"/api/tools/capture/files/{CAPTURE_NAME}", None),
+    ("POST", "/api/tftp/start", {"adapter": None, "uploads": False}),
+    ("POST", "/api/tftp/stop", None),
+    ("POST", "/api/tftp/uploads", {"on": True}),
+    ("PUT", "/api/tftp/settings", {"max_upload_mb": 512}),
+)
+
+
+@pytest.mark.parametrize("method,path,body", NETWORK_TOOL_CHANGES)
+def test_network_tools_refuse_a_page_of_another_origin(server, network_tools, method, path, body):
+    checks: List[Any] = []
+    server.wifi_reveal_check = lambda peer, local: checks.append(peer) or "allowed"
+    # the server's CSRF guard refuses a cross-site or foreign-Origin POST/PUT/DELETE before routing; the route refuses the
+    # rest (same-site: another port on localhost) itself, with its own message
+    for headers in ({"Sec-Fetch-Site": "cross-site"}, {"Sec-Fetch-Site": "same-site", "Origin": "http://localhost:8081"},
+                    {"Sec-Fetch-Site": "same-site"}):
+        status, _headers, payload = call(server, method, path, body, headers=headers)
+        assert status == 403 and json.loads(payload)["error"]["code"] == "forbidden", headers
+    assert json.loads(payload)["error"]["message"] == api_routes.QUICK_TOOLS_CROSS_ORIGIN_MSG
+    assert [name for name, fake in network_tools.items() if fake.calls] == [] and checks == [], \
+        "refused before any component runs, the capture admin check included"
+    status, _headers, _payload = call(server, method, path, body,
+                                      headers={"Sec-Fetch-Site": "same-origin", "Origin": f"http://127.0.0.1:{server.port}"})
+    assert status == 200 and [name for name, fake in network_tools.items() if fake.calls]
+
+
+def test_typed_errors_name_real_exception_classes():
+    """The services' typed errors and their answers are exactly the contract's table, and each class exists with its base
+    (a RuntimeError one would otherwise be a 500, the LookupError one would escape _tool_call)."""
+    import importlib
+
+    expected = {
+        ("tnt.pktmon", "PktmonBusy"): (RuntimeError, 409, "conflict"),
+        ("tnt.pktmon", "PktmonUnavailable"): (RuntimeError, 409, "unavailable"),
+        ("tnt.portcheck", "RateLimited"): (RuntimeError, 429, "rate_limited"),
+        ("tnt.portcheck", "NoPublicIp"): (RuntimeError, 409, "no_public_ip"),
+        ("tnt.portcheck", "VpnActive"): (RuntimeError, 409, "vpn"),
+        ("tnt.tftp", "TftpPortInUse"): (RuntimeError, 409, "tftp_port_in_use"),
+        ("tnt.capture", "CaptureFileBusy"): (RuntimeError, 409, "conflict"),
+        ("tnt.capture", "CaptureFileMissing"): (LookupError, 404, "not_found"),
+    }
+    table = {(module, name): answer for module, classes in api_routes.TYPED_ERRORS.items() for name, answer in classes.items()}
+    assert table == {key: (status, code) for key, (_base, status, code) in expected.items()}
+    for (module, name), (base, _status, _code) in expected.items():
+        cls = getattr(importlib.import_module(module), name, None)
+        assert isinstance(cls, type) and issubclass(cls, base), (module, name)
+    assert tnt_portcheck.RateLimited("Too many tests: wait 4 s", retry_after_s=4).retry_after_s == 4
+    owners = [{"pid": 4242, "name": "exampletftpd.exe"}]
+    assert tnt_tftp.TftpPortInUse("UDP port 69 is already used by exampletftpd.exe", owners=owners).owners == owners
+    assert api_routes.TFTP_PORT_IN_USE_CODE == "tftp_port_in_use" and api_routes._STATUS_CODES[429] == "rate_limited"
+
+
+def test_netcheck_routes_503_when_components_missing(server, engine):
+    engine.natcheck = engine.switchport = engine.portcheck = None
+    for method, path, body in (("GET", "/api/netcheck/nat", None), ("POST", "/api/netcheck/nat", None),
+                               ("GET", "/api/netcheck/switch", None), ("POST", "/api/netcheck/switch", {"adapter": None}),
+                               ("DELETE", "/api/netcheck/switch", None), ("POST", "/api/netcheck/portforward", {"port": 8000})):
+        status, data = call_json(server, method, path, body)
+        assert status == 503 and data["error"]["code"] == "unavailable", (method, path)
+
+
+def test_capture_routes_503_when_component_missing(server, engine):
+    engine.capture = None
+    routes = (("GET", "/api/tools/capture", None), ("POST", "/api/tools/capture", {"adapter": "Ethernet"}),
+              ("DELETE", "/api/tools/capture", None), ("GET", f"/api/tools/capture/files/{CAPTURE_NAME}", None),
+              ("DELETE", f"/api/tools/capture/files/{CAPTURE_NAME}", None))
+    server.wifi_reveal_check = lambda peer, local: "denied"
+    for method, path, body in routes:                      # the administrator check comes first
+        status, data = call_json(server, method, path, body)
+        assert status == 403 and data["error"]["code"] == "admin_required", (method, path)
+    server.wifi_reveal_check = lambda peer, local: "allowed"
+    for method, path, body in routes:
+        status, data = call_json(server, method, path, body)
+        assert status == 503 and data["error"]["code"] == "unavailable", (method, path)
+
+
+def test_tftp_routes_503_when_component_missing(server, engine):
+    engine.tftp = None
+    for method, path, body in (("GET", "/api/tftp/status", None), ("POST", "/api/tftp/start", {"uploads": False}),
+                               ("POST", "/api/tftp/stop", None), ("POST", "/api/tftp/uploads", {"on": True}),
+                               ("PUT", "/api/tftp/settings", {"max_upload_mb": 512}), ("GET", "/api/tftp/files", None)):
+        status, data = call_json(server, method, path, body)
+        assert status == 503 and data["error"]["code"] == "unavailable", (method, path)
+    status, data = call_json(server, "GET", "/api/status")
+    assert status == 200 and data["tftp"] is None
+
+    class Broken:
+        def summary(self):
+            raise RuntimeError("no tftp for you")
+
+    engine.tftp = Broken()
+    status, data = call_json(server, "GET", "/api/status")
+    assert status == 200 and data["tftp"] is None and data["version"] == __version__
+
+
+def test_nat_check_routes(server, network_tools):
+    nat = network_tools["natcheck"]
+    status, data = call_json(server, "GET", "/api/netcheck/nat")
+    assert status == 200 and data == {"result": None, "running": False}
+    status, data = call_json(server, "POST", "/api/netcheck/nat")
+    assert status == 200 and data == {"result": NAT_RESULT, "running": False}
+    assert list(data["result"]) == list(tnt_natcheck.NAT_RESULT_KEYS)
+    nat.busy = True
+    status, data = call_json(server, "GET", "/api/netcheck/nat")
+    assert status == 200 and data == {"result": NAT_RESULT, "running": True}
+    nat.fail_with = RuntimeError(tnt_natcheck.BUSY_TEXT)
+    status, data = call_json(server, "POST", "/api/netcheck/nat")
+    assert status == 409 and data["error"] == {"code": "conflict", "message": "a NAT check is already running"}
+    nat.fail_with = RuntimeError("the check fell over")
+    status, data = call_json(server, "POST", "/api/netcheck/nat")
+    assert status == 500 and data["error"]["code"] == "internal_error"
+    assert [c for c in nat.calls if c == ("run",)] == [("run",)] * 3
+
+
+def test_switch_port_routes(server, network_tools):
+    finder = network_tools["switchport"]
+    status, data = call_json(server, "GET", "/api/netcheck/switch")
+    assert status == 200 and list(data) == list(tnt_switchport.SWITCH_STATUS_KEYS) and data["job"]["state"] == "idle"
+    status, data = call_json(server, "POST", "/api/netcheck/switch", {"adapter": "Ethernet", "seconds": 30})
+    assert status == 200 and list(data) == ["job"] and data["job"]["state"] == "listening" and data["job"]["listen_s"] == 30
+    status, data = call_json(server, "POST", "/api/netcheck/switch")         # no body: the service picks the adapter, 65 s
+    assert status == 200 and data["job"]["listen_s"] == 65
+    status, data = call_json(server, "DELETE", "/api/netcheck/switch")
+    assert status == 200 and list(data) == ["job"] and data["job"]["state"] == "cancelled"
+    assert finder.calls == [("status",), ("start", "Ethernet", 30), ("start", None, None), ("stop",)]
+    for exc, expected, code in ((tnt_pktmon.PktmonUnavailable(tnt_pktmon.MISSING_REASON), 409, "unavailable"),
+                                (tnt_pktmon.PktmonUnavailable(tnt_switchport.NO_WIRED_TEXT), 409, "unavailable"),
+                                (tnt_pktmon.PktmonBusy(tnt_pktmon.LOCK_TEXTS["capture"]), 409, "conflict"),
+                                (tnt_pktmon.PktmonBusy(tnt_pktmon.FOREIGN_SESSION_TEXT), 409, "conflict"),
+                                (RuntimeError(tnt_switchport.BUSY_TEXT), 409, "conflict"),
+                                (ValueError("seconds must be a whole number from 20 to 120"), 400, "bad_request"),
+                                (RuntimeError("the search fell over"), 500, "internal_error")):
+        finder.fail_with = exc
+        status, data = call_json(server, "POST", "/api/netcheck/switch", {"seconds": "soon"})
+        assert status == expected and data["error"] == {"code": code, "message": str(exc)}, exc
+
+
+def test_port_forward_route(server, network_tools):
+    checker = network_tools["portcheck"]
+    status, data = call_json(server, "POST", "/api/netcheck/portforward", {"port": 8000})
+    assert status == 200 and data == PORT_RESULT and list(data) == list(tnt_portcheck.PORTCHECK_RESULT_KEYS)
+    # the port reaches the service as it was sent: only the service decides what a port is
+    for body in ({"port": "8000"}, {"port": 8000.5}, {"port": True}, {"port": None}, {}):
+        status, data = call_json(server, "POST", "/api/netcheck/portforward", body)
+        assert status == 400 and data["error"] == {"code": "bad_request", "message": tnt_portcheck.PORTCHECK_PORT_TEXT}, body
+    assert checker.calls == [("test", 8000), ("test", "8000"), ("test", 8000.5), ("test", True), ("test", None), ("test", None)]
+    for exc, expected, code in ((tnt_portcheck.VpnActive(), 409, "vpn"), (tnt_portcheck.NoPublicIp(), 409, "no_public_ip"),
+                                (RuntimeError(tnt_portcheck.PORTCHECK_BUSY_TEXT), 409, "conflict")):
+        checker.fail_with = exc
+        status, data = call_json(server, "POST", "/api/netcheck/portforward", {"port": 8000})
+        assert status == expected and data["error"] == {"code": code, "message": str(exc)}, code
+    assert str(tnt_portcheck.VpnActive()) == tnt_portcheck.PORTCHECK_VPN_TEXT
+    assert str(tnt_portcheck.NoPublicIp()) == tnt_portcheck.PORTCHECK_NO_IP_TEXT
+    checker.fail_with = tnt_portcheck.RateLimited(tnt_portcheck.PORTCHECK_RATE_TEXT.format(seconds=4), retry_after_s=4)
+    status, headers, payload = call(server, "POST", "/api/netcheck/portforward", {"port": 8000})
+    assert status == 429 and headers["retry-after"] == "4"
+    assert json.loads(payload)["error"] == {"code": "rate_limited", "message": "Too many tests: wait 4 s"}
+
+
+def test_capture_routes_need_an_administrator(server, network_tools, monkeypatch):
+    mgr = network_tools["capture"]
+    routes = (("GET", "/api/tools/capture", None), ("POST", "/api/tools/capture", {"adapter": "Ethernet"}),
+              ("DELETE", "/api/tools/capture", None), ("GET", f"/api/tools/capture/files/{CAPTURE_NAME}", None),
+              ("DELETE", f"/api/tools/capture/files/{CAPTURE_NAME}", None))
+    seen: List[Any] = []
+    server.wifi_reveal_check = lambda peer, local: seen.append((peer, local)) or "denied"
+    for method, path, body in routes:
+        status, data = call_json(server, method, path, body)
+        assert status == 403 and data["error"] == {"code": "admin_required", "message": api_routes.CAPTURE_ADMIN_REQUIRED_MSG}, path
+    status, _headers, payload = call(server, "HEAD", f"/api/tools/capture/files/{CAPTURE_NAME}")
+    assert status == 403 and payload == b""
+    peer, local = seen[0]
+    assert peer[0].startswith("127.") and int(local[1]) == server.port
+
+    def boom(peer: Any, local: Any) -> str:
+        raise RuntimeError("token read exploded")
+
+    for check in (lambda peer, local: "unknown", lambda peer, local: None, boom):
+        server.wifi_reveal_check = check
+        for method, path, body in routes:
+            status, data = call_json(server, method, path, body)
+            assert status == 403 and data["error"] == {"code": "admin_required",
+                                                       "message": api_routes.CAPTURE_ADMIN_UNVERIFIED_MSG}, path
+    import tnt.peer
+
+    monkeypatch.setattr(tnt.peer, "reveal_allowed", lambda peer, local: "denied")
+    server.wifi_reveal_check = None                                  # the production path: tnt.peer decides
+    status, data = call_json(server, "GET", "/api/tools/capture")
+    assert status == 403 and data["error"]["message"] == api_routes.CAPTURE_ADMIN_REQUIRED_MSG
+    assert mgr.calls == [] and mgr.opened == []
+
+
+def test_capture_routes(server, network_tools):
+    mgr = network_tools["capture"]
+    server.wifi_reveal_check = lambda peer, local: "allowed"
+    status, data = call_json(server, "GET", "/api/tools/capture")
+    assert status == 200 and list(data) == list(tnt_capture.CAPTURE_STATUS_KEYS) and data["capture"] is None
+    start = {"adapter": "Ethernet", "seconds": 10, "size_mb": 64, "full_packets": False, "host": "192.0.2.10", "port": None,
+             "protocol": "icmp", "comment": "not a start key"}
+    status, data = call_json(server, "POST", "/api/tools/capture", start)
+    assert status == 200 and data == {"capture": CAPTURE_JOB} and list(data["capture"]) == list(tnt_capture.CAPTURE_JOB_KEYS)
+    status, data = call_json(server, "POST", "/api/tools/capture", {"seconds": None})    # keys left out take the defaults
+    assert status == 200
+    status, data = call_json(server, "DELETE", "/api/tools/capture")                     # stop and keep
+    assert status == 200 and data["capture"]["state"] == "done" and data["capture"]["file"] == CAPTURE_NAME
+    status, headers, payload = call(server, "GET", f"/api/tools/capture/files/{CAPTURE_NAME}")
+    assert status == 200 and payload == CAPTURE_BYTES and headers["content-length"] == str(len(CAPTURE_BYTES))
+    assert headers["content-disposition"] == f'attachment; filename="{CAPTURE_NAME}"'
+    status, headers, payload = call(server, "HEAD", f"/api/tools/capture/files/{CAPTURE_NAME}")
+    assert status == 200 and payload == b"" and headers["content-type"] == "application/octet-stream"
+    assert len(mgr.opened) == 2 and all(f.closed for f in mgr.opened), "the download closes its file, HEAD included"
+    status, data = call_json(server, "DELETE", f"/api/tools/capture/files/{CAPTURE_NAME}")
+    assert status == 200 and data == {"files": []}
+    assert mgr.calls == [("status",), ("start", "Ethernet", {k: v for k, v in start.items() if k not in ("adapter", "comment")}),
+                         ("start", None, {"seconds": None}), ("stop",), ("open_file", CAPTURE_NAME),
+                         ("open_file", CAPTURE_NAME), ("delete_file", CAPTURE_NAME)]
+    for exc, expected, code in ((ValueError(tnt_capture.PORT_ICMP_TEXT), 400, "bad_request"),
+                                (tnt_pktmon.PktmonUnavailable(tnt_pktmon.FOLDER_NOT_SECURED_TEXT), 409, "unavailable"),
+                                (tnt_pktmon.PktmonBusy(tnt_pktmon.LOCK_TEXTS["switchport"]), 409, "conflict")):
+        mgr.fail_with = exc
+        status, data = call_json(server, "POST", "/api/tools/capture", {"adapter": "Ethernet"})
+        assert status == expected and data["error"] == {"code": code, "message": str(exc)}, code
+    mgr.fail_with = tnt_capture.CaptureFileBusy(tnt_capture.FILE_BUSY_TEXT)
+    status, data = call_json(server, "DELETE", f"/api/tools/capture/files/{CAPTURE_NAME}")
+    assert status == 409 and data["error"] == {"code": "conflict", "message": "The file is being downloaded"}
+    mgr.fail_with = tnt_capture.CaptureFileMissing(tnt_capture.FILE_MISSING_TEXT)
+    for method in ("GET", "DELETE"):
+        status, data = call_json(server, method, "/api/tools/capture/files/TNT-capture-2026.pcapng")
+        assert status == 404 and data["error"] == {"code": "not_found", "message": "The capture file was not found"}, method
+
+
+def test_tftp_routes(server, network_tools):
+    tftp = network_tools["tftp"]
+    status, data = call_json(server, "GET", "/api/tftp/status")
+    assert status == 200 and list(data) == list(tnt_tftp.TFTP_STATUS_KEYS) and data["running"] is False
+    status, data = call_json(server, "POST", "/api/tftp/start", {"adapter": "Ethernet", "uploads": True})
+    assert status == 200 and data["running"] is True and data["uploads"] is True
+    status, data = call_json(server, "GET", "/api/status")
+    assert status == 200 and data["tftp"] == tftp.summary() and list(data["tftp"]) == list(tnt_tftp.TFTP_SUMMARY_KEYS)
+    status, data = call_json(server, "POST", "/api/tftp/stop")
+    assert status == 200 and data["running"] is False
+    status, data = call_json(server, "POST", "/api/tftp/start")                  # no body: the saved adapter, uploads off
+    assert status == 200 and data["running"] is True and data["uploads"] is False
+    status, data = call_json(server, "POST", "/api/tftp/uploads", {"on": True})
+    assert status == 200 and data["uploads"] is True
+    status, data = call_json(server, "PUT", "/api/tftp/settings", {"adapter": "Ethernet", "max_upload_mb": 512})
+    assert status == 200 and data["settings"] == {"adapter": "Ethernet", "max_upload_mb": 512}
+    status, data = call_json(server, "GET", "/api/tftp/files")
+    assert status == 200 and data == {"files": [{"name": "boot/pxelinux.0", "size": 26828, "mtime": T0}]}
+    assert tftp.calls == [("status",), ("start", "Ethernet", True), ("stop",), ("start", None, False), ("set_uploads", True),
+                          ("update_settings", {"adapter": "Ethernet", "max_upload_mb": 512}), ("files",)]
+    for method, path, body, message in (("POST", "/api/tftp/start", {"uploads": None}, "uploads must be true or false"),
+                                        ("POST", "/api/tftp/uploads", {}, "on must be true or false"),
+                                        ("POST", "/api/tftp/uploads", {"on": "yes"}, "on must be true or false"),
+                                        ("PUT", "/api/tftp/settings", {"root": "C:/"}, "unknown TFTP setting 'root'"),
+                                        ("PUT", "/api/tftp/settings", [1], "JSON body must be an object")):
+        status, data = call_json(server, method, path, body)
+        assert status == 400 and data["error"] == {"code": "bad_request", "message": message}, (path, body)
+    owners = [{"pid": 4242, "name": "exampletftpd.exe"}, {"pid": 4243, "name": "PID 4243"}]
+    tftp.fail_with = tnt_tftp.TftpPortInUse("UDP port 69 is already used by exampletftpd.exe, PID 4243", owners=owners)
+    status, data = call_json(server, "POST", "/api/tftp/start", {"adapter": None, "uploads": False})
+    assert status == 409 and data == {"error": {"code": "tftp_port_in_use",
+                                                "message": "UDP port 69 is already used by exampletftpd.exe, PID 4243"},
+                                      "owners": owners}
+    tftp.fail_with = tnt_tftp.TftpPortInUse("UDP port 69 is already used by another program")
+    status, data = call_json(server, "POST", "/api/tftp/start", {"uploads": False})
+    assert status == 409 and data["error"]["code"] == "tftp_port_in_use" and data["owners"] == []
+    tftp.fail_with = RuntimeError("UDP port 69 could not be opened (access denied: WinError 10013)")
+    status, data = call_json(server, "POST", "/api/tftp/start", {"uploads": False})
+    assert status == 500 and data["error"]["code"] == "internal_error"
+
+
+@pytest.fixture
+def capture_folder(server, engine, tmp_path):
+    """A real tnt.capture.CaptureManager on a temporary captures folder (only its file methods run), for an administrator."""
+    folder = tmp_path / "captures"
+    folder.mkdir()
+    engine.capture = tnt_capture.CaptureManager(engine.bus, captures_dir_fn=lambda: folder)
+    server.wifi_reveal_check = lambda peer, local: "allowed"
+    return folder
+
+
+def test_capture_download_head_then_delete(server, capture_folder):
+    """FileResponse: the headers, the file in chunks, HEAD with no body; neither holds the file, so a delete right after
+    succeeds (Windows refuses to delete an open file)."""
+    data = b"\x0a\x0d\x0d\x0a" + bytes(range(256)) * 700              # a little under three 64 KiB chunks
+    (capture_folder / CAPTURE_NAME).write_bytes(data)
+    url = f"/api/tools/capture/files/{CAPTURE_NAME}"
+    status, headers, payload = call(server, "GET", url)
+    assert status == 200 and payload == data
+    assert headers["content-type"] == "application/octet-stream" and headers["content-length"] == str(len(data))
+    assert headers["content-disposition"] == f'attachment; filename="{CAPTURE_NAME}"'
+    assert headers["cache-control"] == "no-cache" and headers["x-content-type-options"] == "nosniff"
+    status, headers, payload = call(server, "HEAD", url)
+    assert status == 200 and payload == b"" and headers["content-length"] == str(len(data))
+    status, body = call_json(server, "DELETE", url)
+    assert status == 200 and body == {"files": []} and not (capture_folder / CAPTURE_NAME).exists()
+    for name in (CAPTURE_NAME, "CON", "TNT-capture-2026.pcapng", "..%5C" + CAPTURE_NAME):
+        for method in ("GET", "DELETE"):
+            status, body = call_json(server, method, f"/api/tools/capture/files/{name}")
+            assert status == 404 and body["error"] == {"code": "not_found", "message": tnt_capture.FILE_MISSING_TEXT}, (method, name)
+
+
+def test_capture_download_the_client_abandons_does_not_hold_the_file(server, capture_folder):
+    """While a download runs the file cannot be deleted (409); once the client resets the connection the server closes the
+    file, and the delete goes through."""
+    path = capture_folder / CAPTURE_NAME
+    with open(path, "wb") as fh:
+        fh.truncate(64 * 1024 * 1024)                                   # far more than the socket buffers take in
+    url = f"/api/tools/capture/files/{CAPTURE_NAME}"
+    sock = socket.create_connection(("127.0.0.1", server.port), timeout=10)
+    try:
+        sock.sendall(f"GET {url} HTTP/1.1\r\nHost: 127.0.0.1:{server.port}\r\n\r\n".encode("ascii"))
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = sock.recv(65536)
+            assert chunk, "the server closed the connection"
+            head += chunk
+        assert head.startswith(b"HTTP/1.1 200 ")
+        status, body = call_json(server, "DELETE", url)
+        assert status == 409 and body["error"] == {"code": "conflict", "message": tnt_capture.FILE_BUSY_TEXT}
+    finally:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("HH", 1, 0))    # a reset, not a clean close
+        sock.close()
+    assert _wait_for(lambda: call_json(server, "DELETE", url)[0] == 200, 10.0)
+    assert not path.exists()
+
+
 @pytest.fixture
 def fake_oui(monkeypatch):
     """``tnt.oui.vendor_for_oui`` backed by a synthetic registry; records every lookup."""
@@ -1780,6 +2601,37 @@ def test_sse_stream_delivers_hello_and_published_event(server, engine):
     assert server.clients_sse == 0
 
 
+def test_sse_capture_state_goes_to_administrators_only(server, engine):
+    """``capture.state`` carries the capture job (adapter, host / port filters, file name), which every /api/tools/capture route
+    refuses to anyone who is not a Windows administrator: the event stream leaves it out for them too (asked once per stream,
+    at the first such event, failing closed) and still forwards everything else."""
+    from tnt import capture as tnt_capture
+
+    assert api_routes.ADMIN_ONLY_EVENTS == frozenset({tnt_capture.EVENT})
+    job = {"capture": {"id": "c1", "state": "capturing", "adapter": {"name": "Ethernet", "index": 12, "mac": "02:00:5E:10:00:01"},
+                       "filters": {"host": "192.0.2.50", "port": 5060, "protocol": "udp"}, "file": None}}
+    for decision in ("denied", "unknown", "allowed"):
+        checks: List[Any] = []
+        server.wifi_reveal_check = lambda peer, local, d=decision: checks.append(peer) or d
+        frames: List[str] = []
+        ready = threading.Event()
+        t = threading.Thread(target=_read_sse_frames, args=(server.port, "event: ping.sample", frames, ready), daemon=True)
+        t.start()
+        assert ready.wait(10), frames
+        engine.bus.publish("capture.state", job, ts=T0)
+        engine.bus.publish("capture.state", job, ts=T0)
+        engine.bus.publish("ping.sample", {"target_id": 1, "ok": True, "rtt_ms": 12.5, "light": "green"}, ts=T0)
+        t.join(10)
+        assert not t.is_alive(), frames
+        captures = [json.loads(f.split("data: ", 1)[1].strip()) for f in frames if "event: capture.state" in f]
+        assert captures == ([dict(job, ts=T0)] * 2 if decision == "allowed" else []), decision
+        assert len(checks) == 1, decision                        # once per stream, at the first capture event
+        assert any("event: ping.sample" in f for f in frames), decision
+        deadline = time.time() + 5
+        while server.clients_sse and time.time() < deadline:
+            time.sleep(0.05)
+
+
 def test_sse_client_is_kicked_on_server_stop(engine, ui_dir):
     srv = ApiServer(engine, "127.0.0.1", 0, bus=engine.bus, ui_dir=ui_dir)
     srv.start()
@@ -2031,6 +2883,10 @@ def test_engine_on_net_changed_resets_caches_and_tells_every_component(data_dir)
 
     eng.ping, eng.linkmap, eng.lan, eng.dhcp = Component("ping", fail=True), Component("linkmap"), Component("lan"), Component("dhcp")
     eng.outages = Component("outages")
+    eng.networks, eng.reports = Component("networks"), Component("reports")
+    eng.natcheck, eng.tftp, eng.switchport = Component("natcheck"), Component("tftp", fail=True), Component("switchport")
+    # the port-forward test and packet capture keep nothing that describes the network: never told
+    eng.portcheck, eng.capture = Component("portcheck"), Component("capture")
     eng._netinfo_cache, eng._netinfo_cache_ts = {"internet_nic": {"name": "Wi-Fi"}, "adapter_count": 2}, time.time()
     eng._disc_defaults, eng._disc_defaults_ts = {"default_range": "192.168.10.0/24"}, time.time()
     release = threading.Event()
@@ -2038,8 +2894,8 @@ def test_engine_on_net_changed_resets_caches_and_tells_every_component(data_dir)
     eng._disc_thread.start()
     try:
         eng._on_net_changed({"generation": 4, "ts": T0, "summary": "Ethernet: 10.20.30.45/24 · gateway 10.20.30.1"})
-        assert calls == [("ping", 4), ("outages", 4), ("linkmap", 4), ("lan", 4), ("dhcp", 4)], \
-            "a failing component never stops the rest"
+        assert calls == [("networks", 4), ("ping", 4), ("outages", 4), ("linkmap", 4), ("natcheck", 4), ("lan", 4), ("dhcp", 4),
+                         ("tftp", 4), ("switchport", 4), ("reports", 4)], "a failing component never stops the rest"
         assert eng._netinfo_cache is None and eng._netinfo_cache_ts == 0.0
         assert eng._disc_defaults == {} and eng._disc_defaults_ts == 0.0 and eng._disc_net_changed is True
         assert _wait_for(lambda: any(e["category"] == "network" for e in eng.db.list_events(10)))
@@ -2092,6 +2948,83 @@ def test_engine_sleep_gap_wakes_the_network_watcher(data_dir):
     assert pokes == ["poke"]
     eng._monitoring_gap(T0, T0 + 60, "monitoring paused")
     assert pokes == ["poke"], "only a sleep can have carried the machine to another network"
+
+
+def test_engine_ip_release_renew_pauses_only_what_it_paused(data_dir, monkeypatch):
+    from tnt import netinfo, nettools
+    from tnt.engine import Engine
+
+    eng = Engine(console=True, port=0, data_dir=data_dir)
+    eng.ping = FakePing()
+    order: List[Any] = []
+    gaps: List[str] = []
+    eng.netwatch = SimpleNamespace(poll_soon=lambda: order.append("poll_soon"))
+    monkeypatch.setattr(netinfo, "_invalidate_cache", lambda: order.append("netinfo cache"))
+    monkeypatch.setattr(eng, "_monitoring_gap", lambda start, end, note: gaps.append(note))
+
+    def fake_release_renew(**kw: Any) -> Dict[str, Any]:
+        order.append(("release_renew", getattr(eng.ping, "paused", None)))
+        return dict(RENEW_RESULT)
+
+    monkeypatch.setattr(nettools, "release_renew", fake_release_renew)
+    eng._netinfo_cache, eng._netinfo_cache_ts = {"internet_nic": {"name": "Wi-Fi"}, "adapter_count": 1}, time.time()
+    res = eng.ip_release_renew()
+    assert res == dict(RENEW_RESULT, paused_monitoring=True) and list(res) == list(RENEW_RESULT)
+    assert order == [("release_renew", True), "netinfo cache", "poll_soon"]
+    assert eng.ping.paused is False and gaps == ["monitoring paused"], "the time without an address is a monitoring gap"
+    assert eng._netinfo_cache is None and eng._netinfo_cache_ts == 0.0
+
+    eng.ping.set_paused(True)                                                  # paused by the user: left paused
+    order.clear()
+    gaps.clear()
+    res = eng.ip_release_renew()
+    assert res["paused_monitoring"] is False and eng.ping.paused is True and gaps == []
+    assert order == [("release_renew", True), "netinfo cache", "poll_soon"]
+
+    eng.ping = None                                                            # no ping monitoring: just run
+    order.clear()
+    assert eng.ip_release_renew()["paused_monitoring"] is False and order[0] == ("release_renew", None)
+
+    eng.ping = FakePing()
+    monkeypatch.setattr(nettools, "release_renew", lambda **kw: (_ for _ in ()).throw(RuntimeError("boom")))
+    order.clear()
+    with pytest.raises(RuntimeError, match="boom"):
+        eng.ip_release_renew()
+    assert eng.ping.paused is False and order == ["netinfo cache", "poll_soon"], "resumed and refreshed even then"
+    monkeypatch.setattr(nettools, "release_renew", fake_release_renew)
+    assert eng.ip_release_renew()["ok"] is True, "the lock was released"
+
+
+def test_engine_ip_release_renew_runs_one_at_a_time(server, engine, data_dir, monkeypatch):
+    from tnt import nettools
+    from tnt.engine import Engine
+
+    eng = Engine(console=True, port=0, data_dir=data_dir)
+    started, finish = threading.Event(), threading.Event()
+
+    def slow(**kw: Any) -> Dict[str, Any]:
+        started.set()
+        finish.wait(5.0)
+        return dict(RENEW_RESULT)
+
+    monkeypatch.setattr(nettools, "release_renew", slow)
+    results: List[Dict[str, Any]] = []
+    worker = threading.Thread(target=lambda: results.append(eng.ip_release_renew()), daemon=True)
+    worker.start()
+    try:
+        assert started.wait(5.0)
+        with pytest.raises(RuntimeError, match="An IP release/renew is already running"):
+            eng.ip_release_renew()
+        engine.ip_release_renew = eng.ip_release_renew
+        server.wifi_reveal_check = lambda peer, local: "allowed"
+        status, data = call_body(server, "POST", "/api/tools/ip/renew")
+        assert status == 409 and data["error"] == {"code": "conflict", "message": "An IP release/renew is already running"}
+    finally:
+        finish.set()
+        worker.join(5.0)
+    assert results == [dict(RENEW_RESULT, paused_monitoring=False)]
+    status, data = call_body(server, "POST", "/api/tools/ip/renew")
+    assert status == 200 and data["ok"] is True
 
 
 def test_engine_start_and_stop_smoke(data_dir):
@@ -2156,6 +3089,8 @@ def test_engine_start_and_stop_smoke(data_dir):
         status, data = call_json(eng.api, "GET", "/api/status")
         assert data["geoip"]["state"] in ("starting", "error", "ready") and set(data["geoip"]) == set(geoip.STATUS_KEYS)
         assert "public_geo" in data["map"]
+        # the network tools are there from the start and idle (their wiring: test_engine_wires_the_network_tools)
+        assert data["tftp"]["running"] is False and not {"natcheck", "portcheck", "switchport", "capture", "tftp"} & set(eng.errors)
         assert eng.start() is None  # idempotent
     finally:
         t1 = time.monotonic()
@@ -2385,6 +3320,185 @@ def test_engine_stop_is_bounded_when_db_close_hangs(data_dir, monkeypatch):
     assert not eng.running and not eng.api.running
 
 
+def test_engine_wires_the_network_tools(data_dir, monkeypatch):
+    """Start order: NatChecker and PortChecker after the IP location manager, TftpServer right after the DHCP server (its
+    folder secured), SwitchPortFinder and CaptureManager right after the LAN peers (recover() on tnt-pktmon-recover, not
+    waited for), all before the network watcher.  Neither start nor stop runs pktmon or netsh."""
+    from tnt import firewall, paths, winacl
+    from tnt.engine import Engine
+
+    seed = tnt_db.Database(data_dir / "tnt.db")
+    seed.set_meta("defaults_loaded", "1")
+    seed.close()
+    ran: List[Any] = []
+
+    def no_pktmon(*args: Any, **kwargs: Any) -> Any:
+        ran.append(("pktmon", args))
+        raise OSError("pktmon is disabled in tests")
+
+    monkeypatch.setattr(tnt_pktmon, "_subprocess_run", no_pktmon)
+    monkeypatch.setattr(firewall, "run_netsh", lambda args, *a, **kw: ran.append(("netsh", list(args))) or (1, "disabled in tests"))
+    secured: List[Any] = []
+    monkeypatch.setattr(winacl, "_set_file_security", lambda path, sddl: secured.append((os.path.normcase(str(path)), sddl)))
+    release = threading.Event()
+    recovering: List[str] = []
+
+    def slow_recover(self: Any) -> None:
+        recovering.append(threading.current_thread().name)
+        release.wait(5.0)
+
+    monkeypatch.setattr(tnt_capture.CaptureManager, "recover", slow_recover)
+    order: List[str] = []
+    steps = ("_start_geoip", "_start_natcheck", "_start_portcheck", "_start_outages", "_start_dhcp", "_start_tftp", "_start_lan",
+             "_start_switchport", "_start_capture", "_start_netwatch")
+    for step in steps:
+        monkeypatch.setattr(Engine, step, lambda self, _real=getattr(Engine, step), _step=step: (order.append(_step), _real(self))[1])
+
+    eng = Engine(console=True, port=0, data_dir=data_dir)
+    t0 = time.monotonic()
+    eng.start()
+    try:
+        assert time.monotonic() - t0 < 10.0
+        assert order == list(steps)
+        assert isinstance(eng.natcheck, tnt_natcheck.NatChecker) and isinstance(eng.portcheck, tnt_portcheck.PortChecker)
+        assert isinstance(eng.switchport, tnt_switchport.SwitchPortFinder) and isinstance(eng.capture, tnt_capture.CaptureManager)
+        assert isinstance(eng.tftp, tnt_tftp.TftpServer) and eng.tftp.running is False
+        assert not {"natcheck", "portcheck", "switchport", "capture", "tftp"} & set(eng.errors)
+        # the TFTP folder is created and secured at start; the captures folder only when a capture or search starts
+        assert paths.tftp_dir().is_dir() and (os.path.normcase(str(paths.tftp_dir())), winacl.TFTP_SDDL) in secured
+        assert not paths.captures_dir().exists() and all(sddl != winacl.CAPTURES_SDDL for _path, sddl in secured)
+        assert recovering == ["tnt-pktmon-recover"], "recover() runs on its own thread"
+        assert any(t.name == "tnt-pktmon-recover" and t.daemon and t.is_alive() for t in threading.enumerate()), \
+            "start() did not wait for it"
+        assert eng.speed is not None and eng.speed._pinger is eng.pinger, "the latency-under-load probe gets the pinger"
+        assert eng.natcheck._refresh_fn == eng.linkmap.refresh_public_ip == eng.portcheck._refresh_fn
+        assert eng.natcheck._generation_fn() == eng.netwatch.generation == eng.switchport._generation()
+        status, data = call_json(eng.api, "GET", "/api/status")
+        assert status == 200 and list(data["tftp"]) == list(tnt_tftp.TFTP_SUMMARY_KEYS) and data["tftp"]["running"] is False
+        status, data = call_json(eng.api, "GET", "/api/netcheck/nat")
+        assert status == 200 and data == {"result": None, "running": False}
+        status, data = call_json(eng.api, "GET", "/api/tftp/files")
+        assert status == 200 and data == {"files": []}
+    finally:
+        release.set()
+        t1 = time.monotonic()
+        eng.stop()
+        assert time.monotonic() - t1 < 8.5
+    assert ran == [], "no pktmon or netsh at start or stop"
+    assert _wait_for(lambda: not any(t.name == "tnt-pktmon-recover" and t.is_alive() for t in threading.enumerate()))
+
+
+def test_engine_network_tool_accessors_look_when_they_are_called(data_dir):
+    """The public address, the network change time and generation and the NAT verdict are read from the engine when a
+    check asks (the network watcher starts after the checks); the refresh is the link map's, when there is one."""
+    from tnt.engine import Engine
+
+    eng = Engine(console=True, port=0, data_dir=data_dir)
+    view = {"public_ip": {"ip": "203.0.113.5", "ts": T0, "error": None, "checked_ts": T0}}
+    refreshed: List[int] = []
+    eng.linkmap = SimpleNamespace(view=lambda: view, refresh_public_ip=lambda: refreshed.append(1) or view["public_ip"])
+    eng._start_natcheck()
+    eng._start_portcheck()
+    eng._start_switchport()
+    nat, port, finder = eng.natcheck, eng.portcheck, eng.switchport
+    assert not {"natcheck", "portcheck", "switchport"} & set(eng.errors)
+    for checker in (nat, port):
+        assert checker._public_ip_fn() == view["public_ip"] and checker._public_ip_fn() is not view["public_ip"]
+        assert checker._changed_ts_fn() is None and checker._generation_fn() == 0
+        checker._refresh_fn()
+    assert refreshed == [1, 1] and port._nat_verdict_fn() is None and finder._generation() == 0
+    eng.netwatch = SimpleNamespace(state=lambda: {"generation": 7, "changed_ts": T0 + 5}, generation=7)   # a property there
+    view["public_ip"] = {"ip": "198.51.100.20", "ts": T0 + 9, "error": None, "checked_ts": T0 + 9}
+    for checker in (nat, port):
+        assert checker._changed_ts_fn() == T0 + 5 and checker._generation_fn() == 7
+        assert checker._public_ip_fn()["ip"] == "198.51.100.20"
+    assert finder._generation() == 7
+    eng.natcheck = SimpleNamespace(last=lambda: dict(NAT_RESULT, verdict="vpn"))
+    assert port._nat_verdict_fn() == "vpn"
+    eng.natcheck = eng.linkmap = eng.netwatch = None
+    assert port._nat_verdict_fn() is None and nat._public_ip_fn() == {} and nat._changed_ts_fn() is None
+    assert nat._generation_fn() == 0 and finder._generation() == 0
+    eng._start_natcheck()
+    assert eng.natcheck._refresh_fn is None, "no link map at start: nothing to refresh"
+
+
+def test_engine_network_tools_that_cannot_start_are_left_out(data_dir, monkeypatch):
+    """A module that does not import leaves its component None with ``errors[name]`` (the routes answer 503); a TFTP folder
+    that cannot be prepared never takes the server away."""
+    from tnt.engine import Engine
+
+    eng = Engine(console=True, port=0, data_dir=data_dir)
+    names = ("natcheck", "portcheck", "tftp", "switchport", "capture")
+    with monkeypatch.context() as mp:
+        for name in names:
+            mp.setitem(sys.modules, f"tnt.{name}", None)
+        for name in names:
+            getattr(eng, f"_start_{name}")()
+    assert [getattr(eng, name) for name in names] == [None] * len(names) and set(names) <= set(eng.errors)
+    eng.errors.clear()
+
+    def no_folder(self: Any) -> None:
+        raise RuntimeError("the folder exploded")
+
+    monkeypatch.setattr(tnt_tftp.TftpServer, "ensure_root", no_folder)
+    eng._start_tftp()
+    assert isinstance(eng.tftp, tnt_tftp.TftpServer) and "tftp" not in eng.errors
+
+
+def test_engine_stop_order_of_the_network_tools(data_dir):
+    """The TFTP server stops right after the DHCP server; the capture and then the switch port finder close right after the
+    LAN peers, each with a 1 s timeout, and a close that hangs is not waited for."""
+    from tnt.engine import Engine
+
+    eng = Engine(console=True, port=0, data_dir=data_dir)
+    order: List[Any] = []
+    hang = threading.Event()
+
+    class Part:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def stop(self) -> None:
+            order.append(self.name)
+
+        def close(self, timeout: float) -> None:
+            order.append((self.name, timeout))
+            if self.name == "switchport":
+                hang.wait(5.0)
+
+    eng.dhcp, eng.tftp, eng.lan, eng.capture, eng.switchport = (Part(n) for n in ("dhcp", "tftp", "lan", "capture", "switchport"))
+    eng._running = True
+    try:
+        t0 = time.monotonic()
+        eng.stop()
+        assert time.monotonic() - t0 < 3.0
+    finally:
+        hang.set()
+    assert order == ["dhcp", "tftp", "lan", ("capture", 1.0), ("switchport", 1.0)]
+
+
+def test_engine_retention_applies_the_capture_retention(data_dir):
+    import datetime
+
+    from tnt.engine import Engine
+
+    eng = Engine(console=True, port=0, data_dir=data_dir)
+    seen: List[float] = []
+    eng.capture = SimpleNamespace(enforce_retention=lambda now: seen.append(now) or 3)
+    eng._run_retention(T0, scheduled=False)
+    assert seen == [T0]
+    sunday = next(T0 + d * 86400 for d in range(7) if datetime.datetime.fromtimestamp(T0 + d * 86400).weekday() == 6)
+    vacuums: List[str] = []
+    eng.db = SimpleNamespace(retention=lambda days, now: {}, vacuum=lambda: vacuums.append("vacuum"), set_meta=lambda k, v: None)
+
+    def locked(now: float) -> int:
+        raise PermissionError(32, "The process cannot access the file because it is being used by another process")
+
+    eng.capture = SimpleNamespace(enforce_retention=locked)
+    eng._run_retention(sunday, scheduled=True)          # never raises, and the weekly vacuum still runs
+    assert vacuums == ["vacuum"]
+
+
 def test_clock_jump_guard():
     from tnt.engine import _clock_jumped
 
@@ -2434,6 +3548,21 @@ def test_selfcheck_modules_include_geoip():
         importlib.import_module(name)
     assert mods[mods.index("tnt.netwatch") + 1:mods.index("tnt.netwatch") + 5] == ["tnt.mmdb", "tnt.geohints",
                                                                                    "tnt.geohints_data", "tnt.geoip"]
+
+
+def test_selfcheck_modules_include_the_network_tools():
+    """The network tools follow tnt.geoip and import with no side effect (no socket, no Packet Monitor, no DLL call)."""
+    import importlib
+
+    from tnt import service
+
+    mods = list(service.SELFCHECK_MODULES)
+    new = ["tnt.winacl", "tnt.natcheck", "tnt.portcheck", "tnt.pcapng", "tnt.lldp", "tnt.pktmon", "tnt.switchport",
+           "tnt.capture", "tnt.tftp", "tnt.speedtest.quality"]
+    at = mods.index("tnt.geoip") + 1
+    assert mods[at:at + len(new)] == new and len(set(mods)) == len(mods)
+    for name in new:
+        importlib.import_module(name)
 
 
 def test_selfcheck_geoip_checks_are_offline(monkeypatch):

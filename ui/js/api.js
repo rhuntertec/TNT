@@ -91,6 +91,19 @@
     geoip: () => api.get('/geoip'),
     geoipLookup: (ip) => api.get('/geoip/lookup?ip=' + encodeURIComponent(ip)),
     geoipCheck: () => api.post('/geoip/check'),
+    updateStatus: () => api.get('/update'),
+    updateCheck: () => api.post('/update/check', {}, { timeout: 30000 }),
+    updateInstall: () => api.post('/update/install', {}, { timeout: 30000 }),
+    // Network info: the NAT check (POST answers once the check is done: a fresh public address first when the link map's is
+    // stale, up to 12 s, then at most 20 s for the router's answers), the switch port (LLDP / CDP heard through Packet Monitor:
+    // POST starts listening, DELETE stops) and a port-forward test from the internet (that public address first, up to 12 s,
+    // then at most 35 s for the port checkers)
+    natGet: () => api.get('/netcheck/nat'),
+    natRun: () => api.post('/netcheck/nat', {}, { timeout: 45000 }),
+    switchGet: () => api.get('/netcheck/switch'),
+    switchStart: (body) => api.post('/netcheck/switch', body || {}),
+    switchStop: () => api.del('/netcheck/switch'),
+    portForwardTest: (port) => api.post('/netcheck/portforward', { port }, { timeout: 60000 }),
     targets: () => api.get('/targets'),
     addTarget: (host, label) => api.post('/targets', label ? { host, label } : { host }),
     removeTarget: (id) => api.del('/targets/' + encodeURIComponent(id)),
@@ -125,6 +138,14 @@
     dhcpStop: () => api.post('/dhcp/stop', {}, { timeout: 20000 }),
     dhcpSettings: (patch) => api.put('/dhcp/settings', patch || {}),
     dhcpForget: (mac) => api.del('/dhcp/leases/' + encodeURIComponent(mac)),
+    // Tools: TFTP server. Start opens UDP 69 on the adapter (and adds its firewall rule on an installed service), so it gets a
+    // longer timeout; uploads switches "Allow uploads", settings saves the adapter and the max upload size.
+    tftpStatus: () => api.get('/tftp/status'),
+    tftpStart: (body) => api.post('/tftp/start', body || {}, { timeout: 20000 }),
+    tftpStop: () => api.post('/tftp/stop'),
+    tftpUploads: (on) => api.post('/tftp/uploads', { on: !!on }),
+    tftpSettings: (patch) => api.put('/tftp/settings', patch || {}),
+    tftpFiles: () => api.get('/tftp/files'),
     // Tools: traceroute is synchronous on the service (up to ~60 s for 30 silent hops) and the
     // LAN throughput test runs both directions before it answers (up to ~45 s).
     traceroute: (body) => api.post('/tools/traceroute', body || {}, { timeout: 120000 }),
@@ -138,6 +159,20 @@
     // ?reveal=1 asks for the plaintext keys, which the service only hands to a Windows
     // administrator (else 403 admin_required).
     wifiProfiles: (reveal) => api.get('/tools/wifi/profiles' + (reveal ? '?reveal=1' : '?reveal=0'), { timeout: 30000 }),
+    // Tools: a DNS lookup asks the DNS server itself, like nslookup (the server given, else this PC's; one record type when
+    // given, else A + AAAA), and the top bar's quick tools. A release/renew waits for DHCP on every adapter, so it gets the
+    // longest timeout of all.
+    dnsLookup: (name, server, type) => api.post('/tools/dns/lookup', Object.assign({ name }, server ? { server } : {}, type ? { type } : {}), { timeout: 30000 }),
+    flushDns: () => api.post('/tools/dns/flush', {}, { timeout: 45000 }),
+    ipRenew: () => api.post('/tools/ip/renew', {}, { timeout: 240000 }),
+    // Tools: packet capture, for a Windows administrator only (else 403 admin_required). Start waits for Packet Monitor to begin
+    // capturing; DELETE stops the capture and keeps what was captured. captureFileUrl is the address of a saved capture for a
+    // download link: it makes no request.
+    captureGet: () => api.get('/tools/capture'),
+    captureStart: (body) => api.post('/tools/capture', body || {}, { timeout: 20000 }),
+    captureStop: () => api.del('/tools/capture'),
+    captureDeleteFile: (name) => api.del('/tools/capture/files/' + encodeURIComponent(name)),
+    captureFileUrl: (name) => BASE + '/tools/capture/files/' + encodeURIComponent(name),
     // WiFi page: vendor names for 24-bit OUIs ("AA:BB:CC", 1-256 per call). Only OUIs go to the
     // service, never a full BSSID: the survey itself stays inside the TNT window.
     ouiVendors: (prefixes) => api.get('/oui?' + (prefixes || []).map((p) => 'prefix=' + encodeURIComponent(p)).join('&')),
@@ -345,6 +380,41 @@
     STALE_GRACE_MS: NET_STALE_GRACE_MS, TOAST_GAP_MS: NET_TOAST_GAP_MS,
   };
 
+  /* ---------------------------------------------------------- quick tools */
+  // Pure: what the top bar's IP Release/Renew and Flush DNS buttons say once the service answered (app.js drives them;
+  // node tests load this file on its own).
+  const QUICK_NAMES = { renew: 'IP Release/Renew', flush: 'Flush DNS' };
+
+  /** A quick tool's answer (RENEW_RESULT / FLUSH_RESULT) or the ApiError of its request -> { ok, kind, text }: `ok` picks
+   *  the button's green or red flash, `kind` and `text` the toast. Whatever the service says is shown as it is: a refusal
+   *  (403: not an administrator, or a page of another origin; 409: one is running already; 503: not available), a failed
+   *  renew's error with the first warning, and a warning that came with a renew that worked. */
+  function quickOutcome(tool, r, err) {
+    const renew = tool === 'renew';
+    const name = QUICK_NAMES[tool] || 'This tool';
+    if (err) {
+      const status = err.status || 0;
+      let text;
+      if (status === 403 || status === 409) text = err.message || name + ' was refused';
+      else if (status === 503) text = err.message || name + ' is not available on this service';
+      else if (status === 404) text = name + ' is not available on this service';     // an older service without the route
+      else text = (renew ? 'Could not release and renew the IP address: ' : 'Could not flush the DNS cache: ') + (err.message || 'unknown error');
+      const refused = status === 409 || (status === 403 && err.code === 'admin_required');
+      return { ok: false, kind: refused ? 'warn' : 'error', text };
+    }
+    r = r || {};
+    const warning = (Array.isArray(r.warnings) ? r.warnings.filter(Boolean).map(String) : [])[0];
+    const more = warning ? ' · ' + warning : '';
+    if (renew && r.ok) {
+      return { ok: true, kind: warning ? 'warn' : 'ok', text: 'IP address renewed' + (r.address ? ': ' + r.address : '') + (r.adapter ? ' on ' + r.adapter : '') + more };
+    }
+    if (renew) return { ok: false, kind: 'error', text: 'IP release/renew failed: ' + (r.error || 'no address came back') + more };
+    if (r.ok) return { ok: true, kind: 'ok', text: 'DNS cache flushed' };
+    return { ok: false, kind: 'error', text: 'Could not flush the DNS cache: ' + (r.error || 'unknown error') };
+  }
+
+  api.quick = { outcome: quickOutcome, NAMES: QUICK_NAMES };
+
   /* ------------------------------------------------------------------ SSE */
   const KNOWN_EVENTS = [
     'hello', 'ping.sample', 'ping.targets', 'outage.start', 'outage.end',
@@ -355,6 +425,9 @@
     'lan.peers', 'lan.state', 'lan.throughput.progress', 'lan.throughput.done',
     'net.changed',
     'report.progress', 'report.saved', 'report.deleted', 'report.updated',
+    'netcheck.switch',
+    'tftp.state', 'tftp.transfer',
+    'capture.state',
   ];
 
   /**

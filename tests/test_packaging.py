@@ -1,5 +1,6 @@
 """Release packaging inputs: no Markdown in a PyInstaller bundle, the licence files in the installer,
-the DB-IP credit for the IP location data the service downloads (CC BY 4.0) and its uninstall rule.
+the DB-IP credit for the IP location data the service downloads (CC BY 4.0) and its uninstall rule, and the
+uninstall rules for the TFTP server's firewall rule and the saved packet captures.
 
 The PyInstaller specs are not executed here (that is a full build). Instead the tests check the
 data filter both specs apply (``installer/pyi_common.without_markdown``) and run it over what
@@ -172,6 +173,42 @@ def test_installer_removes_the_geoip_cache_on_uninstall():
     assert re.search(r'^Type: filesandordirs; Name: "\{commonappdata\}\\TNT\\geoip"$', uninstall, re.M)
     installs = re.search(r"^\[InstallDelete\]\s*$(.*?)^\[", iss, re.M | re.S).group(1)
     assert "geoip" not in installs.lower()
+
+
+def _installer_header(iss: str) -> str:
+    """The comment block at the top of tnt.iss as one line of words (a name may wrap across comment lines)."""
+    return " ".join(iss.split("#ifndef", 1)[0].replace(";", " ").split())
+
+
+def test_installer_deletes_the_tftp_firewall_rule_on_uninstall():
+    """The TFTP server's inbound rule (added by the installed service the first time the server is switched on) goes with
+    the uninstall like the DHCP and LAN rules: the name is the one tnt.tftp uses."""
+    from tnt import tftp
+
+    iss = (INSTALLER / "tnt.iss").read_text(encoding="utf-8")
+    assert re.search(r'^#define MyTftpFirewallRule "([^"]*)"$', iss, re.M).group(1) == tftp.FIREWALL_RULE_NAME
+    uninstall = re.search(r"^\[UninstallRun\]\s*$(.*?)^\[", iss, re.M | re.S).group(1)
+    line = ('Filename: "{sys}\\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#MyTftpFirewallRule}"""; '
+            'RunOnceId: "TNTTftpFw"; Flags: runhidden waituntilterminated')
+    assert re.search("^" + re.escape(line) + "$", uninstall, re.M)
+    assert uninstall.count('RunOnceId: "TNTTftpFw"') == 1
+    assert tftp.FIREWALL_RULE_NAME in _installer_header(iss)
+
+
+def test_installer_removes_the_packet_captures_on_uninstall():
+    """Saved captures can hold passwords and private data: %ProgramData%\\TNT\\captures always goes with the uninstall and
+    survives an upgrade.  The TFTP server's folder is kept with the rest of the data (only /REMOVEDATA removes it)."""
+    from tnt import paths
+
+    assert paths.captures_dir().name == "captures" and paths.tftp_dir().name == "tftp"
+    iss = (INSTALLER / "tnt.iss").read_text(encoding="utf-8")
+    uninstall = re.search(r"^\[UninstallDelete\]\s*$(.*?)^\[", iss, re.M | re.S).group(1)
+    assert re.search(r'^Type: filesandordirs; Name: "\{commonappdata\}\\TNT\\captures"$', uninstall, re.M)
+    assert "tftp" not in uninstall.lower()
+    installs = re.search(r"^\[InstallDelete\]\s*$(.*?)^\[", iss, re.M | re.S).group(1)
+    assert "captures" not in installs.lower() and "tftp" not in installs.lower()
+    header = _installer_header(iss)
+    assert "(%ProgramData%\\TNT\\captures) are always removed" in header and "%ProgramData%\\TNT\\tftp" in header
 
 
 def test_gitignore_keeps_mmdb_files_out():

@@ -12,10 +12,12 @@ share so they are written once:
   code-page decoding of ``tnt.arp._decode_console`` (netsh writes cp437/cp850... like arp);
 * :func:`ensure_rule` is idempotent: ``show rule name=<name> verbose`` first; missing ->
   ``add rule``; present for another program path (dev python vs. the installed exe),
-  another port list (an older build) or another protocol -> ``delete rule`` + ``add rule``.
+  another port list (an older build), another protocol or, when a remote scope is asked
+  for (``remote_ip="localsubnet"``, the TFTP server), another remote scope ->
+  ``delete rule`` + ``add rule``.
   ``show rule`` output has *localised* labels, so the program path and the port list are
   recognised by their *shape* (a ``X:\\`` path, a bare comma-separated number list) rather
-  than by label.
+  than by label, and the remote scope by its value (``LocalSubnet`` is a keyword, not a label).
 * Nothing here raises: every function returns ``(ok, error)`` or ``(rc, output)``.
 
 Injectable seam: ``runner`` (a ``subprocess.run`` stand-in receiving the same keyword
@@ -140,6 +142,13 @@ def _rule_protocol(output: str) -> Optional[str]:
     return None
 
 
+def _rule_has_value(output: str, wanted: str) -> bool:
+    """True when some value in ``show rule ... verbose`` output is exactly *wanted*, case-insensitively
+    (``RemoteIP: LocalSubnet`` for ``remoteip=localsubnet``)."""
+    want = str(wanted or "").strip().casefold()
+    return bool(want) and any(v.casefold() == want for v in _values(output))
+
+
 def normalize_ports(ports: PortSpec) -> Tuple[List[int], str]:
     """``67`` / ``"67,68"`` / ``[67, 68]`` -> ``([67, 68], "67,68")`` (order kept, duplicates
     dropped).  ``ValueError`` for an empty list or a port outside 1..65535."""
@@ -166,13 +175,19 @@ def normalize_ports(ports: PortSpec) -> Tuple[List[int], str]:
 
 # --- rules ----------------------------------------------------------------------------------
 def ensure_rule(name: str, exe_path: Optional[str], protocol: str, ports: PortSpec,
-                runner: Optional[Callable[..., Any]] = None) -> Tuple[bool, Optional[str]]:
+                runner: Optional[Callable[..., Any]] = None, *,
+                remote_ip: Optional[str] = None) -> Tuple[bool, Optional[str]]:
     """Make sure the inbound-allow *program* rule *name* (``protocol`` ``tcp``/``udp``, local
     *ports*) exists for *exe_path* (the running interpreter when ``None``).
 
     ``show rule name=<name> verbose`` first; missing -> ``add rule``; present for another
     program, port list or protocol -> ``delete rule`` + ``add rule``.  Idempotent; returns
     ``(ok, error)`` and never raises.
+
+    *remote_ip* (a netsh ``remoteip`` value such as ``"localsubnet"``) scopes the rule to those
+    remote addresses: ``remoteip=<value>`` follows ``localport=`` in the ``add rule`` argv, and a
+    present rule counts only when ``show rule`` lists exactly that value (case-insensitive);
+    otherwise it is replaced.  ``None`` keeps the argv and the check exactly as they were.
     """
     exe = str(exe_path or sys.executable or "").strip()
     if not exe:
@@ -183,6 +198,9 @@ def ensure_rule(name: str, exe_path: Optional[str], protocol: str, ports: PortSp
     proto = str(protocol or "").strip().lower()
     if proto not in PROTOCOLS:
         return False, f"unsupported firewall protocol {protocol!r}"
+    remote = str(remote_ip).strip() if remote_ip is not None else ""
+    if remote and (any(ch.isspace() for ch in remote) or "=" in remote or '"' in remote):
+        return False, f"invalid remote address {remote_ip!r} for the firewall rule"
     try:
         wanted, ports_text = normalize_ports(ports)
     except ValueError as exc:
@@ -193,15 +211,19 @@ def ensure_rule(name: str, exe_path: Optional[str], protocol: str, ports: PortSp
             progs = _rule_programs(out)
             have_proto = _rule_protocol(out)
             if any(_same_path(p, exe) for p in progs) and set(wanted) <= _rule_ports(out) \
-                    and (have_proto is None or have_proto == proto):
+                    and (have_proto is None or have_proto == proto) and (not remote or _rule_has_value(out, remote)):
                 return True, None
             if progs or out:
-                # a rule with our name but another program / port list / protocol: replace it
+                # a rule with our name but another program / port list / protocol / remote scope: replace it
                 drc, dout = run_netsh(["advfirewall", "firewall", "delete", "rule", f"name={rule}"], runner)
                 if drc != 0:
                     log.warning("could not delete the stale firewall rule '%s': %s", rule, _short(dout))
-        arc, aout = run_netsh(["advfirewall", "firewall", "add", "rule", f"name={rule}", "dir=in", "action=allow",
-                               f"program={exe}", f"protocol={proto}", f"localport={ports_text}", "profile=any"], runner)
+        add = ["advfirewall", "firewall", "add", "rule", f"name={rule}", "dir=in", "action=allow",
+               f"program={exe}", f"protocol={proto}", f"localport={ports_text}"]
+        if remote:
+            add.append(f"remoteip={remote}")
+        add.append("profile=any")
+        arc, aout = run_netsh(add, runner)
         if arc != 0:
             return False, f"netsh exit {arc}: {_short(aout) or 'no output'}"
         log.info("firewall rule '%s' added for %s (%s %s)", rule, exe, proto, ports_text)

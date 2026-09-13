@@ -42,6 +42,23 @@ def geoip_dir() -> Path:
     return data_dir() / "geoip"
 
 
+def captures_dir() -> Path:
+    """Packet captures and switch-port lookups. Never created by :func:`ensure_dirs`: the capture code
+    creates it at each start and gives it a protected DACL (``tnt.winacl.CAPTURES_SDDL``)."""
+    return data_dir() / "captures"
+
+
+def tftp_dir() -> Path:
+    """The TFTP server's root folder. Never created by :func:`ensure_dirs`: the TFTP server creates it
+    and gives it a protected DACL (``tnt.winacl.TFTP_SDDL``)."""
+    return data_dir() / "tftp"
+
+
+def update_dir() -> Path:
+    """Where the auto-updater stages a downloaded installer before running it (tnt.updater)."""
+    return data_dir() / "update"
+
+
 def config_path() -> Path:
     return data_dir() / "config.json"
 
