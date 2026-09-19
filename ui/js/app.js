@@ -1042,17 +1042,14 @@
       else if (!s || s.available === false) html = line('<span class="strong">SIP</span>') + line(esc((s && s.reason) || 'Unavailable'), 'muted');
       else {
         const v = VERDICT[s.verdict] || VERDICT.unknown;
-        // the leg that decides the verdict is named, because "bad" without it sends nobody anywhere
-        const worst = ['lan', 'wan', 'sip'].filter((k) => s[k] && s[k] === s.verdict)[0];
-        const WHERE = { lan: 'the LAN leg', wan: 'the internet leg', sip: 'the trunk' };
-        // the three numbers a call is judged by, off the leg that limits it
+        // the grade and the three numbers a call is judged by, off the leg that limits it - and
+        // nothing else. Which leg that was is on the SIP page, where there is room to act on it;
+        // on a tile it only ever appeared for some verdicts, so the line moved as the grade changed.
         const nums = [];
         if (typeof s.mos === 'number') nums.push('<span class="num">' + s.mos.toFixed(2) + '</span><span class="muted">MOS</span>');
         if (typeof s.avg_ms === 'number') nums.push('<span class="num">' + fmtMs(s.avg_ms) + '</span><span class="muted">ms</span>');
         if (typeof s.jitter_ms === 'number') nums.push('<span class="num">' + fmtMs(s.jitter_ms) + '</span><span class="muted">jitter</span>');
-        html = line('<span class="badge ' + v[0] + '">' + v[1] + '</span>' +
-          (worst && s.verdict !== 'excellent' && s.verdict !== 'unknown'
-            ? ' <span class="muted">' + WHERE[worst] + '</span>' : ''));
+        html = line('<span class="badge ' + v[0] + '">' + v[1] + '</span>');
         html += nums.length ? line(nums.join(' ')) : '';
         if (!nums.length) {
           // no graded leg: the checks' verdicts, or the invitation, rather than an empty second line

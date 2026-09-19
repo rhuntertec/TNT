@@ -425,17 +425,56 @@ def test_the_page_answers_all_four_questions_in_a_browser(browser_page, mock, mo
     assert res["errorsAfter"] == "[]", res["errorsAfter"]
 
 
-def test_the_tile_names_the_leg_that_decides_the_verdict(browser_page):
-    """"Bad" on its own sends nobody anywhere: the tile says which leg it was."""
-    dom = browser_page("#sip")
-    assert 'data-mock-errors="[]"' in dom
+def _sip_tile_text(dom: str) -> str:
     body = re.search(r'<div class="tile-body" id="tile-sip"[^>]*>(.*?)</a>', dom, re.S)
     assert body, "the SIP tile has no body"
-    text = re.sub(r"<[^>]+>", " ", body.group(1))
+    return re.sub(r"<[^>]+>", " ", body.group(1))
+
+
+def test_the_tile_is_the_grade_and_the_three_numbers(browser_page):
+    """Nothing else. The grade and MOS / delay / jitter are what a glance is for; which leg was
+    weakest is on the SIP page, where there is room to act on it."""
+    dom = browser_page("#sip")
+    assert 'data-mock-errors="[]"' in dom
+    text = _sip_tile_text(dom)
     assert re.search(r"excellent|good|fair|poor|bad|not rated", text), text
     # the three numbers, not a call count
     assert "MOS" in text and " ms " in text and "jit" in text, text
     assert "call" not in text.replace("calls page", ""), text
+
+
+@pytest.mark.parametrize("verdict, weakest", [("fair", "lan"), ("poor", "wan"), ("bad", "sip")])
+def test_a_verdict_below_excellent_still_names_no_leg(browser_page, mock, monkeypatch, verdict, weakest):
+    """The regression this replaces: the tile used to append "the LAN leg" (or the internet leg, or
+    the trunk) beside any verdict that was not excellent.
+
+    The mock grades everything excellent, so that branch never ran in a test or on the dev server -
+    it only showed up on a real machine whose line was not perfect. Here the tile is driven through
+    each of the three legs instead.
+    """
+    real = mock.state.sip_tile
+
+    def graded() -> Dict[str, Any]:
+        tile = dict(real())
+        tile.update(verdict=verdict, lan=None, wan=None, sip=None)
+        tile[weakest] = verdict
+        return tile
+
+    monkeypatch.setattr(mock.state, "sip_tile", graded)
+    text = _sip_tile_text(browser_page("#sip"))
+    assert verdict in text, text
+    for leg in ("LAN leg", "internet leg", "trunk", "leg"):
+        assert leg not in text, f"{leg!r} is back on the tile: {text!r}"
+    # and the numbers are still there, which is the half of the tile that stayed
+    assert "MOS" in text and "jit" in text, text
+
+
+def test_the_tile_renderer_has_no_leg_wording_left():
+    """The source check that survives the mock grading everything excellent."""
+    app = _read("js/app.js")
+    tile = app[app.index("      const el = tileEls.sip;"):app.index("  function syncTools()")]
+    for phrase in ("the LAN leg", "the internet leg", "the trunk", "WHERE"):
+        assert phrase not in tile, phrase
 
 
 def test_the_mock_offers_the_one_capture_alg_tell_and_drops_it_with_two(mock):
