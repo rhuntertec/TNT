@@ -180,6 +180,8 @@ DEFAULTS: Dict[str, Any] = {
     "discovery": {"ports": list(DEFAULT_PORTS), "ping_timeout_ms": 500, "ping_attempts": 2,
                   "port_timeout_ms": 750, "concurrency": 128, "resolve_hostnames": True, "max_hosts": 4096},
     "retention": {"days": 365},
+    # Network info > Realtime throughput: adapters left off the card, by Windows connection name
+    "throughput": {"excluded": []},
     "ui": {"theme": "light", "show_ipv6": False},
     "lan": {"enabled": True},
     "geoip": {"enabled": True},
@@ -7292,10 +7294,16 @@ class MockState:
                 "rx_bytes": tot["rx_bytes"], "tx_bytes": tot["tx_bytes"],
                 "rx_packets": tot["rx_packets"], "tx_packets": tot["tx_packets"]}
 
+    def _tp_excluded(self) -> "set":
+        """tnt.throughput.ThroughputMonitor._excluded: the names throughput.excluded leaves out."""
+        names = (self.settings.get("throughput") or {}).get("excluded") or []
+        return {n.strip().casefold() for n in names if isinstance(n, str) and n.strip()}
+
     def throughput_tick(self, ts: float) -> Dict[str, Any]:
         """Advance every adapter's counters by a second and publish the throughput.sample event."""
         rows = []
         with self.lock:
+            excluded = self._tp_excluded()
             prof = net_profile(self.net_profile)
             primary = prof["internet_nic_index"]
             live = set()
@@ -7319,7 +7327,9 @@ class MockState:
                 buf.append([int(ts), rx_bps, tx_bps, rx_pps, tx_pps])
                 if len(buf) > TP_HISTORY_S:
                     del buf[: len(buf) - TP_HISTORY_S]
-                rows.append(self._tp_row(a, idx, primary, tot, buf))
+                # still sampled, just not reported: unticking the box brings the history back
+                if str(a.get("name") or "").strip().casefold() not in excluded:
+                    rows.append(self._tp_row(a, idx, primary, tot, buf))
             for idx in [i for i in self.tp_samples if i not in live]:
                 # the adapter went away with a network change: its history goes with it
                 self.tp_samples.pop(idx, None)
@@ -7344,11 +7354,14 @@ class MockState:
         with self.lock:
             prof = net_profile(self.net_profile)
             primary = prof["internet_nic_index"]
+            excluded = self._tp_excluded()
             for a in self._tp_adapters():
                 idx = int(a["index"])
                 tot = self.tp_totals.get(idx)
                 if tot is None:
                     continue                     # nothing sampled yet: the ticker has not reached it
+                if str(a.get("name") or "").strip().casefold() in excluded:
+                    continue                     # before anything else: the fallback must not bring it back
                 buf = self.tp_samples.get(idx) or []
                 window_rows = [s for s in buf if s[0] >= floor]
                 row = self._tp_row(a, idx, primary, tot, buf)

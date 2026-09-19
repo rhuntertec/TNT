@@ -15,6 +15,8 @@
   let renderedV6 = null;      // the show_ipv6 value the adapter cards were last drawn with
   let nc = null;              // the NAT, switch port & port forward card: made once per mount, every redraw re-appends its element
   let tp = null;              // the realtime throughput card: the same, and it holds its own half hour of samples
+  let tpBoxes = new Map();    // nicKey(name) -> the 'Hide from Realtime throughput' checkbox on that adapter's card
+  let boxSeq = 0;             // ids for the checkbox labels, one run per page
 
   /* ------------------------------------------------------------ IPv6 filter */
   // ui.show_ipv6 (Settings > Appearance, off by default): IPv6 subnet groups, addresses,
@@ -24,6 +26,36 @@
     const st = state || TNT.state;
     return !!(st && st.settings && st.settings.ui && st.settings.ui.show_ipv6);
   }
+  /* -------------------------------------------- hide a NIC from the throughput card */
+  /* throughput.excluded (settings) is a list of Windows connection names: the same string the
+     adapter card is headed with and the same one tnt/throughput.py matches on, so the box under
+     an adapter and the graph above always mean the same NIC. A name rather than an index, because
+     an index moves when a USB adapter is re-plugged and a name is what the person ticking the box
+     is reading. Comparison is case-insensitive and ignores surrounding space, like the service's. */
+  const nicKey = (name) => String(name == null ? '' : name).trim().toLowerCase();
+
+  /** The excluded names from a state snapshot, as they were stored. */
+  function excludedNics(state) {
+    const st = state || TNT.state;
+    const list = st && st.settings && st.settings.throughput && st.settings.throughput.excluded;
+    return Array.isArray(list) ? list.filter((n) => typeof n === 'string' && n.trim()) : [];
+  }
+
+  function nicExcluded(name, state) {
+    const key = nicKey(name);
+    return !!key && excludedNics(state).some((n) => nicKey(n) === key);
+  }
+
+  /** The list `throughput.excluded` should become when *name* is hidden (or shown again).
+   *  Pure, and it tolerates a list that already holds the name in another case: the result never
+   *  has it twice, and turning a box off removes every spelling of it. */
+  function nextExcluded(current, name, hide) {
+    const key = nicKey(name);
+    const out = (current || []).filter((n) => nicKey(n) !== key);
+    if (hide && key) out.push(String(name).trim());
+    return out;
+  }
+
   /** Pure: the subnet groups of one adapter as they should be drawn (family-6 groups dropped, IPv6 entries stripped). */
   function visibleGroups(a, v6) {
     const groups = a && Array.isArray(a.subnets) ? a.subnets : [];
@@ -307,6 +339,31 @@
       .sort((x, y) => WARNING_RANK[x.cls] - WARNING_RANK[y.cls]);
   }
 
+  /** The card's last row: keep this adapter off the Realtime throughput card.
+   *  The box is authoritative on screen the moment it is clicked and the setting is written behind
+   *  it; a write that fails puts the box back, because a tick that did not save is a lie. */
+  function throughputBox(a) {
+    const { h } = TNT.util;
+    const name = a.name || '';
+    const id = 'tp-hide-' + (++boxSeq);
+    const input = h('input', { type: 'checkbox', id, checked: nicExcluded(name) });
+    input.disabled = !name;              // an adapter with no name cannot be matched by name
+    input.addEventListener('change', async () => {
+      const hide = input.checked;
+      const before = excludedNics();
+      try {
+        const r = await TNT.api.updateSettings({ throughput: { excluded: nextExcluded(before, name, hide) } });
+        if (r && r.settings && TNT.app && TNT.app.state) TNT.app.state.settings = r.settings;
+      } catch (err) {
+        input.checked = !hide;
+        TNT.ui.toast('Could not save: ' + err.message, 'error');
+      }
+    });
+    if (name) tpBoxes.set(nicKey(name), input);
+    return h('label', { class: 'adapter-tp' + (name ? '' : ' off'), for: id }, input,
+      h('span', null, 'Hide from Realtime throughput'));
+  }
+
   function adapterCard(a, internetIndex, v6) {
     const { h, copyCode } = TNT.util;
     const isInternet = a.index === internetIndex;
@@ -356,7 +413,8 @@
       warnings.length ? h('div', { class: 'adapter-warnings' }, warnings.map((w) => h('div', { class: 'adapter-warn ' + w.cls, data: { code: w.code } },
         TNT.ui.icon(w.cls === 'grey' ? 'info' : 'warning'), h('span', null, w.message)))) : null,
       kv,
-      subnets);
+      subnets,
+      throughputBox(a));
   }
 
   /** Pure: what decides whether a fresh /api/netinfo needs the cards redrawn: all of it but the timestamp. */
@@ -389,6 +447,7 @@
       return;
     }
     renderedSig = netinfoSig(data);
+    tpBoxes = new Map();          // the cards are about to be rebuilt; the old inputs go with them
     const adapters = Array.isArray(data.adapters) ? data.adapters.slice() : [];
     const inet = data.internet_nic_index;
     adapters.sort((a, b) => {
@@ -470,6 +529,10 @@
       if (!root) return;
       // the IPv6 switch was flipped (saveSettings notifies the view): redraw the cached adapters, no refetch
       if (data && renderedV6 !== null && showIpv6(state) !== renderedV6) render();
+      // a box ticked in another window: follow it without rebuilding the cards, so a redraw does
+      // not throw away the scroll position every time the settings are re-read
+      const hidden = new Set(excludedNics(state).map(nicKey));
+      for (const [key, input] of tpBoxes) input.checked = hidden.has(key);
       // adapters are read on demand and on a network change; the link map follows every status snapshot
       if (state && state.status && state.status.map) updateMap(state.status.map);
       // the NAT card follows status.net.generation (a new network clears its results) and the link map's public address
@@ -498,5 +561,8 @@
     warningView,
     adapterWarnings,
     netinfoSig,
+    excludedNics,
+    nicExcluded,
+    nextExcluded,
   };
 })();

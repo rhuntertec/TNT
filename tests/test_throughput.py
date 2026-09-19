@@ -390,6 +390,163 @@ def test_a_primary_lookup_that_raises_keeps_the_last_answer_and_never_stops_a_sa
     assert mon.tick()["nics"][0]["primary"] is True
 
 
+
+# =========================================================================================
+# hiding an adapter (throughput.excluded, the checkbox on its Network info card)
+# =========================================================================================
+class FakeConfig:
+    """Just enough of ``tnt.config.Config`` for the monitor: one dotted get."""
+
+    def __init__(self, excluded: Any = ()) -> None:
+        self.excluded = excluded
+        self.asked = 0
+
+    def get(self, dotted: str, default: Any = None) -> Any:
+        assert dotted == "throughput.excluded", dotted
+        self.asked += 1
+        return self.excluded
+
+
+def excluding(names: Any, rows: List[List[throughput.Counters]], *, primary: Optional[int] = 1,
+              bus: Any = None) -> "tuple[throughput.ThroughputMonitor, FakeClock, FakeConfig]":
+    clock = FakeClock()
+    calls = [0]
+    cfg = FakeConfig(names)
+
+    def reader() -> List[throughput.Counters]:
+        i = min(calls[0], len(rows) - 1)
+        calls[0] += 1
+        return list(rows[i])
+
+    mon = throughput.ThroughputMonitor(bus, config=cfg, clock=clock, reader=reader, primary_fn=lambda: primary)
+    return mon, clock, cfg
+
+
+def three(rx: int) -> List[throughput.Counters]:
+    return [counters(1, index=12, name="Ethernet", rx_bytes=rx),
+            counters(2, index=18, name="Ethernet 2", rx_bytes=rx),
+            counters(3, index=32, name="Tailscale", if_type=53, rx_bytes=rx)]
+
+
+def names_of(mon: throughput.ThroughputMonitor, event: Any) -> "tuple[list, list]":
+    return ([n["name"] for n in (event or {}).get("nics", [])],
+            [n["name"] for n in mon.view(30)["nics"]])
+
+
+def test_an_adapter_on_the_excluded_list_is_left_off_the_card_and_out_of_the_event():
+    mon, clock, _ = excluding(["Ethernet 2"], [three(0), three(125_000)])
+    mon.tick()
+    clock.now += 1.0
+    event, view = names_of(mon, mon.tick())
+    assert event == ["Ethernet", "Tailscale"] and view == ["Ethernet", "Tailscale"]
+
+
+def test_the_name_is_matched_the_way_a_person_would_type_it():
+    """Case and stray spaces come from a hand-edited config; neither should silently stop working."""
+    for spelling in ("Ethernet 2", "  ethernet 2 ", "ETHERNET 2"):
+        mon, clock, _ = excluding([spelling], [three(0), three(125_000)])
+        mon.tick()
+        clock.now += 1.0
+        event, view = names_of(mon, mon.tick())
+        assert event == ["Ethernet", "Tailscale"], spelling
+        assert view == ["Ethernet", "Tailscale"], spelling
+
+
+def test_the_internet_facing_nic_can_be_hidden_too():
+    """view() keeps the primary NIC even when it is flat - but not when it was asked to hide it."""
+    mon, clock, _ = excluding(["Ethernet"], [three(0), three(125_000)], primary=1)
+    mon.tick()
+    clock.now += 1.0
+    event, view = names_of(mon, mon.tick())
+    assert "Ethernet" not in event and "Ethernet" not in view
+    assert view == ["Ethernet 2", "Tailscale"]
+
+
+def test_hiding_every_adapter_empties_the_card_rather_than_showing_them_all_again():
+    """view() lists everything when nothing moved, so the exclusion has to be applied first -
+    otherwise hiding the last adapter would bring all of them back."""
+    mon, clock, _ = excluding(["Ethernet", "Ethernet 2", "Tailscale"], [three(0), three(125_000)])
+    mon.tick()
+    clock.now += 1.0
+    event, view = names_of(mon, mon.tick())
+    assert event == [] and view == []
+    assert mon.view(30)["note"] is None, "an empty card is not an error"
+
+
+def test_a_hidden_adapter_is_still_sampled_so_unticking_the_box_brings_its_history_back():
+    rows = ramp(2, [125_000] * 6, index=18, name="Ethernet 2")
+    mon, clock, cfg = excluding(["Ethernet 2"], [[r] for r in rows])
+    for _ in rows:
+        mon.tick()
+        clock.now += 1.0
+    assert mon.view(30)["nics"] == []
+    cfg.excluded = []                                  # the box is unticked
+    nics = mon.view(30)["nics"]
+    assert [n["name"] for n in nics] == ["Ethernet 2"]
+    assert len(nics[0]["samples"]) == 5, "the history it kept while hidden is there"
+
+
+def test_nothing_is_hidden_without_a_config_or_when_reading_it_fails():
+    """A settings read that failed must not blank the card - the counters are the point of it."""
+    mon, clock, _ = monitor([three(0), three(125_000)], primary=1)      # no config at all
+    mon.tick()
+    clock.now += 1.0
+    assert len(mon.tick()["nics"]) == 3
+
+    class Boom:
+        def get(self, dotted: str, default: Any = None) -> Any:
+            raise OSError("settings unreadable")
+
+    clock2 = FakeClock()
+    calls = [0]
+    rows = [three(0), three(125_000)]
+
+    def reader() -> List[throughput.Counters]:
+        i = min(calls[0], len(rows) - 1)
+        calls[0] += 1
+        return list(rows[i])
+
+    mon2 = throughput.ThroughputMonitor(None, config=Boom(), clock=clock2, reader=reader, primary_fn=lambda: 1)
+    mon2.tick()
+    clock2.now += 1.0
+    assert len(mon2.tick()["nics"]) == 3
+    assert mon2._excluded() == frozenset()
+
+
+def test_a_list_that_is_not_a_list_of_names_hides_nothing():
+    for junk in (None, "Ethernet", 7, [None, 3, ""], {}):
+        mon, clock, _ = excluding(junk, [three(0), three(125_000)])
+        mon.tick()
+        clock.now += 1.0
+        assert len(mon.tick()["nics"]) == 3, junk
+
+
+def test_the_setting_is_read_fresh_so_a_box_takes_effect_on_the_next_tick():
+    """Not cached: a tick-old answer leaves a hidden NIC on the card for a second after the click."""
+    mon, clock, cfg = excluding([], [three(0), three(125_000), three(250_000)])
+    mon.tick()
+    clock.now += 1.0
+    assert len(mon.tick()["nics"]) == 3
+    cfg.excluded = ["Tailscale"]
+    clock.now += 1.0
+    assert [n["name"] for n in mon.tick()["nics"]] == ["Ethernet", "Ethernet 2"]
+
+
+def test_the_config_keeps_the_excluded_list_tidy():
+    from tnt import config
+
+    assert config.DEFAULTS["throughput"] == {"excluded": []}
+    assert config.clean_nic_names(["  Ethernet ", "ETHERNET", "Wi-Fi", "", 7, None]) == ["Ethernet", "Wi-Fi"]
+    for junk in (None, "Ethernet", 42, {"a": 1}):
+        assert config.clean_nic_names(junk) == []
+    assert len(config.clean_nic_names([str(i) for i in range(config.MAX_EXCLUDED_NICS + 50)])) \
+        == config.MAX_EXCLUDED_NICS
+    # it survives a round trip through validate, and a missing section is the default
+    assert config.validate({"throughput": {"excluded": ["Ethernet", "ethernet"]}})["throughput"]["excluded"] == ["Ethernet"]
+    assert config.validate({})["throughput"] == {"excluded": []}
+    assert config.validate({"throughput": {"excluded": "nonsense"}})["throughput"] == {"excluded": []}
+
+
 # =========================================================================================
 # the native layer (real iphlpapi)
 # =========================================================================================
@@ -604,6 +761,88 @@ def test_the_throughput_chart_scales_and_breaks_its_line_with_node(tmp_path):
     assert out["runs"] == [[990, 991, 992], [996, 997]]
     assert out["runsCoarse"] == [[990, 991, 992, 996, 997]]   # at 3 s a 4 s hole is within tolerance
     assert out["runsWindow"] == [[995]]                        # 900 is outside a 30 s window
+
+
+
+_HIDE_DRIVER = r"""
+const fs = require('fs'), vm = require('vm');
+// views/ipinfo.js only touches the DOM inside its functions; the three helpers under test are pure
+// apart from reading TNT.state, which the driver sets.
+const window = { TNT: { views: {}, util: {}, ui: {}, api: {}, charts: {}, netcheck: {}, throughput: {} } };
+const ctx = vm.createContext({ window, console, document: undefined, localStorage: undefined });
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx, { filename: 'ipinfo.js' });
+const v = window.TNT.views.ipinfo;
+const out = {};
+
+const state = (excluded) => ({ settings: { throughput: { excluded } } });
+out.read = {
+  plain: v.excludedNics(state(['Ethernet 2'])),
+  junkEntries: v.excludedNics(state(['Ethernet', 3, null, '  ', 'Wi-Fi'])),
+  notAList: v.excludedNics(state('Ethernet')),
+  missing: v.excludedNics({ settings: {} }),
+  noState: v.excludedNics({}),
+};
+out.is = {
+  exact: v.nicExcluded('Ethernet 2', state(['Ethernet 2'])),
+  otherCase: v.nicExcluded('ethernet 2', state(['ETHERNET 2'])),
+  spaced: v.nicExcluded(' Ethernet 2 ', state(['Ethernet 2'])),
+  no: v.nicExcluded('Ethernet', state(['Ethernet 2'])),
+  blank: v.nicExcluded('', state([''])),
+  nullName: v.nicExcluded(null, state(['Ethernet'])),
+};
+out.next = {
+  add: v.nextExcluded([], 'Ethernet 2', true),
+  addToExisting: v.nextExcluded(['Wi-Fi'], 'Ethernet 2', true),
+  noDuplicate: v.nextExcluded(['Ethernet 2'], 'Ethernet 2', true),
+  replacesOtherCase: v.nextExcluded(['ETHERNET 2'], 'Ethernet 2', true),
+  remove: v.nextExcluded(['Wi-Fi', 'Ethernet 2'], 'Ethernet 2', false),
+  removesEveryCase: v.nextExcluded(['ethernet 2', 'Ethernet 2', 'Wi-Fi'], 'ETHERNET 2', false),
+  removeMissing: v.nextExcluded(['Wi-Fi'], 'Ethernet 2', false),
+  trims: v.nextExcluded([], '  Ethernet 2  ', true),
+  blankName: v.nextExcluded(['Wi-Fi'], '', true),
+};
+process.stdout.write(JSON.stringify(out));
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+def test_the_hide_checkboxs_arithmetic_with_node(tmp_path):
+    out = _node(_HIDE_DRIVER, tmp_path, str(UI / "js/views/ipinfo.js"))
+
+    assert out["read"] == {"plain": ["Ethernet 2"], "junkEntries": ["Ethernet", "Wi-Fi"],
+                           "notAList": [], "missing": [], "noState": []}
+    assert out["is"] == {"exact": True, "otherCase": True, "spaced": True,
+                         "no": False, "blank": False, "nullName": False}
+    # ticking adds the name once however the list already spells it; unticking removes every spelling
+    assert out["next"] == {
+        "add": ["Ethernet 2"], "addToExisting": ["Wi-Fi", "Ethernet 2"],
+        "noDuplicate": ["Ethernet 2"], "replacesOtherCase": ["Ethernet 2"],
+        "remove": ["Wi-Fi"], "removesEveryCase": ["Wi-Fi"], "removeMissing": ["Wi-Fi"],
+        "trims": ["Ethernet 2"], "blankName": ["Wi-Fi"],
+    }
+
+
+def test_every_adapter_card_ends_with_the_hide_checkbox():
+    """The checkbox is the card's last row and writes the same setting the service reads."""
+    src = (UI / "js/views/ipinfo.js").read_text(encoding="utf-8")
+    start = src.index("    return h('div', { class: 'card adapter'")
+    built = src[start:src.index("\n  }", start)]
+    assert built.rstrip().endswith("throughputBox(a));"), "the checkbox is not the card's last row"
+    assert "TNT.api.updateSettings({ throughput: { excluded:" in src
+    assert "'Hide from Realtime throughput'" in src
+    # a name is the key on both sides: a card with no name cannot be matched, so its box is dead
+    assert "input.disabled = !name;" in src
+    css = (UI / "css/tnt.css").read_text(encoding="utf-8")
+    assert ".adapter-tp {" in css and ".adapter-tp input {" in css
+
+
+def test_the_throughput_card_drops_a_nic_the_service_stops_sending():
+    """Hiding one has to take it off the chart now, not when its last samples age out - which for
+    the 30 minute window would be half an hour later."""
+    src = (UI / "js/throughput.js").read_text(encoding="utf-8")
+    assert "for (const key of Array.from(nics.keys())) if (!live.has(key)) nics.delete(key);" in src
+    assert "if (seenIds.has(n.id)) seed();" in src, "a NIC that comes back asks for its backlog"
+    assert "Every adapter is hidden." in src
 
 
 def test_the_card_and_the_chart_are_loaded_by_the_page():

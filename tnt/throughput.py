@@ -24,6 +24,13 @@ dropped too: it is this PC talking to itself.
 A tunnel's traffic is counted twice on purpose - once on the tunnel and once on the NIC that
 carries it - because that is what is really on each interface, and it is what Task Manager shows.
 
+An adapter the site never wants to look at is left out by name: ``throughput.excluded`` in the
+settings holds Windows connection names ("Ethernet 2", "vEthernet (Default Switch)"), set from a
+checkbox at the foot of that adapter's card on Network info.  Names, not indexes, because an index
+moves when a USB NIC is re-plugged and a name is what the person ticking the box is reading.  An
+excluded adapter is still *sampled* - the table read costs the same either way - so unticking the
+box brings its history back rather than starting it from nothing.
+
 Rates and gaps
 --------------
 A rate needs two readings, so the first tick after start records nothing.  A counter that goes
@@ -347,10 +354,12 @@ class ThroughputMonitor:
     the real interface table and asks :mod:`tnt.netinfo` which NIC carries the default route.
     """
 
-    def __init__(self, bus: Any = None, *, clock: Optional[Callable[[], float]] = None,
+    def __init__(self, bus: Any = None, *, config: Any = None,
+                 clock: Optional[Callable[[], float]] = None,
                  reader: Optional[Callable[[], List[Counters]]] = None,
                  primary_fn: Optional[Callable[[], Optional[int]]] = None) -> None:
         self._bus = bus
+        self._config = config
         self._clock = clock or time.time
         self._reader = reader or read_counters
         self._primary_fn = primary_fn
@@ -463,8 +472,10 @@ class ThroughputMonitor:
         """
         now = float(self._clock() if now is None else now)
         primary = self._primary_luid(now)
+        excluded = self._excluded()
         with self._lock:
-            nics = [self._row(nic, primary) for nic in self._nics.values() if nic.samples]
+            nics = [self._row(nic, primary) for nic in self._nics.values()
+                    if nic.samples and nic.name.strip().casefold() not in excluded]
         nics.sort(key=_order)
         return {"ts": now, "nics": nics}
 
@@ -481,10 +492,13 @@ class ThroughputMonitor:
         now = float(self._clock())
         floor_ts = now - window_s
         primary = self._primary_luid(now)
+        excluded = self._excluded()
         with self._lock:
             note = self._note
             rows = []
             for nic in self._nics.values():
+                if nic.name.strip().casefold() in excluded:
+                    continue        # before anything else, so the "nothing moved" fallback cannot bring it back
                 window = [s for s in nic.samples if s[0] >= floor_ts]
                 rows.append((nic, window, self._row(nic, primary)))
         every: List[Dict[str, Any]] = []
@@ -524,6 +538,26 @@ class ThroughputMonitor:
             "rx_packets": int(nic.last.rx_packets),
             "tx_packets": int(nic.last.tx_packets),
         }
+
+    def _excluded(self) -> "frozenset[str]":
+        """The adapter names ``throughput.excluded`` says to leave out, case-folded for comparison.
+
+        Read every time rather than cached: it is a short list behind one lock, and a tick-old
+        answer would leave a NIC on the card for a second after its box was unticked.  Anything
+        unreadable means **exclude nothing** - a settings read that failed must not blank the card.
+        """
+        if self._config is None:
+            return frozenset()
+        try:
+            names = self._config.get("throughput.excluded")
+        except Exception:  # noqa: BLE001
+            log.debug("reading throughput.excluded failed", exc_info=True)
+            return frozenset()
+        if not isinstance(names, (list, tuple)):
+            # a hand-edited config can hold anything here; iterating a bare string would hide every
+            # adapter whose name is one letter long, and a number would raise
+            return frozenset()
+        return frozenset(n.strip().casefold() for n in names if isinstance(n, str) and n.strip())
 
     def _primary_luid(self, now: float) -> Optional[int]:
         """The LUID of the NIC carrying the default route, remembered for PRIMARY_TTL_S."""

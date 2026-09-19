@@ -640,6 +640,15 @@ code.copy.stale { color: var(--ink-soft); border-style: dashed; }
 .adapter-warn.grey { border-color: var(--outline-25); background: var(--paper-2); color: var(--ink-soft); }
 .adapter-warn svg.icon { flex: none; width: 18px; height: 18px; margin-top: 1px; }
 .subnet { display: flex; flex-direction: column; gap: 8px; }
+/* the adapter card's last row: keep this NIC off the realtime throughput card. A dashed rule
+   above it, because it is a setting rather than another fact about the adapter */
+.adapter-tp { display: flex; align-items: center; gap: 8px; margin-top: auto; padding-top: 10px;
+  border-top: 2px dashed var(--outline-25); font-size: 13px; font-weight: 700; color: var(--ink-soft); cursor: pointer; }
+.adapter-tp input { flex: none; width: 16px; height: 16px; accent-color: var(--blue); cursor: pointer; margin: 0; }
+/* an adapter Windows gave no connection name cannot be matched by name, so its box does nothing:
+   js/views/ipinfo.js puts .off on the label instead, since this stylesheet uses no parent selector */
+.adapter-tp.off { cursor: default; opacity: 0.55; }
+.adapter-tp:hover { color: var(--ink); }
 .subnet-title { display: flex; align-items: center; gap: 8px; font-weight: 800; font-size: 14px; }
 
 /* ---------- network info: realtime throughput ---------- */

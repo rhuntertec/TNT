@@ -117,6 +117,10 @@ DEFAULTS: Dict[str, Any] = {
     "retention": {"days": 365},
     "network": {"poll_s": 5},       # tnt.netwatch: read the adapters' IP configuration this often
     "map": {"internet_host": "totalelectronics.com"},   # second hop of the live link map (Network info)
+    # Network info > Realtime throughput: adapters to leave off the card, by their Windows
+    # connection name ("Ethernet", "Wi-Fi"). The name, not the index: an index moves when a USB
+    # NIC is re-plugged, and the name is what the checkbox that sets this sits under.
+    "throughput": {"excluded": []},
     "ui": {"theme": "light", "show_ipv6": False},   # Network info hides IPv6 addresses unless asked
     "lan": {"enabled": True},       # Tools > LAN throughput: beacon on UDP 7132, throughput server on TCP 7133
     "geoip": {"enabled": True},     # IP location + ISP (Network info, Traceroute) from DB-IP Lite: the service downloads ~65 MB a month
@@ -293,6 +297,38 @@ def _ipv4_text(value: Any) -> str:
         return ""
 
 
+#: Most adapter names one machine can have on the excluded list.  A list is only ever added to by
+#: ticking a checkbox next to an adapter that exists, so this is a backstop against a hand-edited
+#: config growing without bound, not a limit anyone should meet.
+MAX_EXCLUDED_NICS = 64
+
+
+def clean_nic_names(value: Any) -> List[str]:
+    """A settings list of adapter names, tidied: strings only, trimmed, no blanks, no duplicates.
+
+    Names are compared case-insensitively for the duplicate test but kept as they were written, so a
+    config a tech edited by hand reads the way they left it.  Anything that is not a list at all
+    (None from an older config, a string someone put there) means "exclude nothing" rather than an
+    error: a broken setting here must not cost the whole settings file.
+    """
+    out: List[str] = []
+    seen = set()
+    if not isinstance(value, (list, tuple)):
+        return out
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        name = item.strip()
+        key = name.casefold()
+        if not name or key in seen:
+            continue
+        seen.add(key)
+        out.append(name)
+        if len(out) >= MAX_EXCLUDED_NICS:
+            break
+    return out
+
+
 def validate(cfg: Dict[str, Any]) -> Dict[str, Any]:
     """Return a cleaned copy of *cfg*: defaults filled in, numbers clamped, enums checked,
     retired settings dropped."""
@@ -344,6 +380,8 @@ def validate(cfg: Dict[str, Any]) -> Dict[str, Any]:
             if 1 <= pi <= 65535 and pi not in clean_ports:
                 clean_ports.append(pi)
     _set_path(out, "discovery.ports", clean_ports or list(DEFAULT_PORTS))
+    # excluded adapter names (Network info > Realtime throughput)
+    _set_path(out, "throughput.excluded", clean_nic_names(_get_path(out, "throughput.excluded")))
     # strings
     for dotted in ("api.host", "map.internet_host", "dhcp.adapter", "dhcp.pool_start", "dhcp.pool_end",
                    "dhcp.static_ip", "tftp.adapter"):

@@ -3422,6 +3422,45 @@ def test_the_mock_serves_a_throughput_window(mock):
     assert data["step_s"] == 3 and len(data["nics"][0]["samples"]) <= mock.mod.TP_MAX_POINTS
 
 
+
+def test_the_mock_hides_an_adapter_the_settings_exclude(mock):
+    """Ticking the box on an adapter card is a PUT /api/settings, and the card follows because the
+    service stops reporting that NIC - in the view and in the event alike."""
+    from tnt import config as tnt_config
+
+    assert mock.mod.DEFAULTS["throughput"] == tnt_config.DEFAULTS["throughput"]
+    now = time.time()
+    for i in range(35):
+        mock.state.throughput_tick(now - 34 + i)
+    try:
+        shown = [n["name"] for n in _req(mock.port, "GET", "/api/throughput?window_s=30")[2]["nics"]]
+        assert "Ethernet 2" in shown and "Ethernet" in shown
+
+        st, _, body = _req(mock.port, "PUT", "/api/settings", {"throughput": {"excluded": ["Ethernet 2"]}})
+        assert st == 200 and body["changed"] == ["throughput.excluded"]
+        assert body["settings"]["throughput"]["excluded"] == ["Ethernet 2"]
+
+        after = [n["name"] for n in _req(mock.port, "GET", "/api/throughput?window_s=30")[2]["nics"]]
+        assert "Ethernet 2" not in after and "Ethernet" in after
+        event = mock.state.throughput_tick(now + 1)
+        assert "Ethernet 2" not in [n["name"] for n in event["nics"]]
+
+        # it was still sampled while hidden, so unticking gives its history back rather than a
+        # line that starts from now
+        _req(mock.port, "PUT", "/api/settings", {"throughput": {"excluded": []}})
+        back = next(n for n in _req(mock.port, "GET", "/api/throughput?window_s=30")[2]["nics"]
+                    if n["name"] == "Ethernet 2")
+        assert len(back["samples"]) > 30
+
+        # hiding everything empties the card rather than falling back to showing them all
+        every = [a["name"] for a in mock.state._tp_adapters()]
+        _req(mock.port, "PUT", "/api/settings", {"throughput": {"excluded": every}})
+        assert _req(mock.port, "GET", "/api/throughput?window_s=30")[2]["nics"] == []
+        assert mock.state.throughput_tick(now + 2)["nics"] == []
+    finally:
+        _req(mock.port, "PUT", "/api/settings", {"throughput": {"excluded": []}})
+
+
 def test_the_throughput_sample_event_reaches_the_stream(mock):
     """The card's only live feed: its rows are the view's rows without the series."""
     conn = http.client.HTTPConnection("127.0.0.1", mock.port, timeout=5)

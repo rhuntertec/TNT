@@ -659,7 +659,7 @@ class Engine:
         try:
             from .throughput import ThroughputMonitor
 
-            tm = ThroughputMonitor(self.bus)
+            tm = ThroughputMonitor(self.bus, config=self.config)
             tm.start()
             self.throughput = tm
         except Exception as exc:  # noqa: BLE001

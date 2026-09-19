@@ -132,6 +132,7 @@
     let seedAgain = false;
     let lastEventTs = 0;
     let note = null;              // the service could not read the counters, and says why
+    let seenIds = new Set();      // every NIC this card has ever held, so a returning one is known
     let dead = false;
 
     const seg = TNT.ui.segmented(WINDOWS.map((w) => ({ value: w[0], label: w[1] })), winS, (v) => setWindow(Number(v)));
@@ -191,12 +192,26 @@
       const ts = Number(data.ts) || 0;
       if (lastEventTs && ts - lastEventTs > GAP_S) seed();      // samples were missed: refill
       lastEventTs = ts || lastEventTs;
+      const live = new Set();
       for (const n of data.nics) {
+        live.add(n.id);
         let rec = nics.get(n.id);
-        if (!rec) { rec = { meta: n, samples: [] }; nics.set(n.id, rec); }
+        if (!rec) {
+          rec = { meta: n, samples: [] };
+          nics.set(n.id, rec);
+          // a NIC we held before and dropped is back (its box was unticked, or it was replugged).
+          // The service never stopped sampling it, so ask for the backlog rather than drawing its
+          // line from this second on.
+          if (seenIds.has(n.id)) seed();
+        }
+        seenIds.add(n.id);
         rec.meta = n;
         push(rec.samples, [Math.round(ts), n.rx_bps || 0, n.tx_bps || 0, n.rx_pps || 0, n.tx_pps || 0]);
       }
+      // the event lists every adapter the service is willing to report, idle ones included, so one
+      // that is missing from it is gone: hidden by its checkbox, or unplugged. Either way it goes
+      // now rather than lingering on screen until its last samples age out of the window.
+      for (const key of Array.from(nics.keys())) if (!live.has(key)) nics.delete(key);
       render();
     }
 
@@ -231,6 +246,14 @@
       return { el: el2, chart, nameEl, descEl, linkEl, cells };
     }
 
+    /** How many adapters the settings are keeping off this card, so an empty card can say so
+     *  instead of reading as "nothing is moving" when in fact nothing is allowed to show. */
+    function hiddenCount() {
+      const st = TNT.app && TNT.app.state;
+      const list = st && st.settings && st.settings.throughput && st.settings.throughput.excluded;
+      return Array.isArray(list) ? list.length : 0;
+    }
+
     function render() {
       if (dead || !bodyEl) return;
       const now = lastEventTs || TNT.util.nowS();
@@ -239,8 +262,9 @@
       if (!list.length) {
         // the note comes first: "waiting" for something that is never coming would be a lie
         const why = note ? 'The adapter counters could not be read: ' + note
-          : nics.size ? 'No adapter is moving anything right now.'
-            : 'Waiting for the first sample…';
+          : hiddenCount() ? 'Every adapter is hidden. The checkboxes are under the adapter cards below.'
+            : nics.size ? 'No adapter is moving anything right now.'
+              : 'Waiting for the first sample…';
         if (order.length || bodyEl.firstChild === null || bodyEl.dataset.why !== why) {
           order = []; blocks = new Map();
           bodyEl.innerHTML = '';

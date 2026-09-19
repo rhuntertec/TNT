@@ -415,6 +415,14 @@ def _ipconfig_text() -> str:
 
 
 def test_internet_nic_gateway_and_subnets_real_machine():
+    """What is true of whichever adapter holds the default route on this machine right now.
+
+    A VPN client (Mullvad, Tailscale, WireGuard) *is* the internet-facing adapter while it is
+    connected, and a tunnel is addressed as a host route - a /32 whose gateway is deliberately
+    outside it, because the tunnel has no subnet to be inside of.  The LAN-shaped checks below
+    therefore run only when the route source really does sit on a subnet; asserting them
+    unconditionally failed the suite for no better reason than the VPN being switched on.
+    """
     adapters = netinfo.get_adapters()
     nic = netinfo.get_internet_nic(adapters)
     if nic is None:
@@ -422,19 +430,27 @@ def test_internet_nic_gateway_and_subnets_real_machine():
     assert nic.is_up and nic.ipv4 and nic.gateways
     assert nic.primary_ipv4 is not None
     primary = next(x for x in nic.ipv4 if x.address == nic.primary_ipv4)
-    assert 8 <= primary.prefix <= 30, "an internet-facing NIC should sit on a real subnet"
     gw = netinfo.get_default_gateway()
     assert gw is not None and gw in nic.gateways
-    assert ipaddress.ip_address(gw) in ipaddress.ip_network(primary.network)
-    # the gateway is grouped with the subnet that contains it
+    assert 8 <= primary.prefix <= 32
     groups = netinfo.subnet_groups(nic)
     group = next(g for g in groups if g["network"] == primary.network)
     assert group["family"] == 4 and group["mask"] == primary.netmask
-    assert nic.primary_ipv4 in group["addresses"] and gw in group["gateways"]
+    assert nic.primary_ipv4 in group["addresses"]
+    tunnel = primary.prefix == 32
+    if tunnel:
+        # the gateway belongs to the adapter but not to its /32; it is still grouped with it,
+        # because that is the only group the adapter has
+        assert nic.if_type == 53, "only a tunnel should be addressed as a host route"
+        assert ipaddress.ip_address(gw) not in ipaddress.ip_network(primary.network)
+    else:
+        assert primary.prefix <= 30, "an adapter on a subnet needs room for a gateway and a host"
+        assert ipaddress.ip_address(gw) in ipaddress.ip_network(primary.network)
+        assert gw in group["gateways"]
     # cross-check with ipconfig (independent oracle)
     text = _ipconfig_text()
     assert nic.primary_ipv4 in text and gw in text
-    # the internet NIC must be a physical Ethernet/Wi-Fi adapter on a normal desktop
+    # Ethernet, Wi-Fi, a tunnel or a WWAN modem - never something odd
     assert nic.if_type in (6, 71, 53, 131)
 
 
