@@ -64,7 +64,13 @@ INSTALLER_ARGS = ("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART")
 SETUP_ASSET_RE = re.compile(r"^TNT-Setup-.*\.exe$", re.IGNORECASE)
 CHECKSUM_NAMES = ("sha256sums", "sha256sums.txt")   # a shared checksum list (fallback to "<setup>.sha256")
 _HEX64_RE = re.compile(r"\b([0-9a-fA-F]{64})\b")
-_VER_RE = re.compile(r"^[vV]?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.\-]+))?(?:\+[0-9A-Za-z.\-]+)?$")
+#: A release tag.  The optional ``TNT`` prefix is this project's own convention - its releases are
+#: tagged ``TNT1.20.1``, not ``v1.20.1`` - and leaving it out here meant every release from 1.16.0
+#: onward parsed as None, so no client ever found an update.  Both forms are accepted now.
+_VER_RE = re.compile(r"^(?:[Tt][Nn][Tt])?[vV]?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.\-]+))?"
+                     r"(?:\+[0-9A-Za-z.\-]+)?$")
+#: What :func:`display_version` strips off the front, longest first.
+_VER_PREFIXES = ("tntv", "tnt", "v")
 
 MAX_SETUP_BYTES = 300 * MiB
 MAX_JSON_BYTES = 4 * MiB
@@ -138,9 +144,16 @@ def is_newer(candidate: object, current: object) -> bool:
 
 
 def display_version(tag: object) -> str:
-    """The tag without a leading ``v`` for display (``"v1.16.0"`` -> ``"1.16.0"``); "" for non-str."""
+    """A tag as a version for display: ``"v1.16.0"`` and ``"TNT1.20.1"`` -> ``"1.16.0"`` / ``"1.20.1"``.
+
+    "" for a non-string, and a tag that is not one of ours comes back untouched rather than chopped.
+    """
     text = tag.strip() if isinstance(tag, str) else ""
-    return text[1:] if text[:1] in ("v", "V") and len(text) > 1 and text[1].isdigit() else text
+    lowered = text.lower()
+    for prefix in _VER_PREFIXES:
+        if lowered.startswith(prefix) and len(text) > len(prefix) and text[len(prefix)].isdigit():
+            return text[len(prefix):]
+    return text
 
 
 def _release_ok(rel: Any, channel: str) -> bool:

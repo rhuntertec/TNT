@@ -24,6 +24,17 @@ REL_DRAFT = {"tag_name": "v2.0.0", "draft": True, "prerelease": False, "assets":
 
 
 # --------------------------------------------------------------------------- pure helpers
+#: Every tag form TNT has actually published on GitHub, and the version each one means.  The
+#: releases from 1.16.0 on are tagged "TNT<ver>"; 1.7.0 and 1.12.0 used "v<ver>".
+PUBLISHED_TAGS = {
+    "v1.7.0": "1.7.0",
+    "v1.12.0": "1.12.0",
+    "TNT1.16.0": "1.16.0",
+    "TNT1.20.0": "1.20.0",
+    "TNT1.20.1": "1.20.1",
+}
+
+
 class TestVersion:
     def test_parse_and_display(self):
         assert parse_version("v1.16.0") == (1, 16, 0, 1, ())
@@ -31,6 +42,23 @@ class TestVersion:
         assert parse_version("1.16.0-rc.1")[3] == 0        # a pre-release ranks below the release
         assert parse_version("bogus") is None and parse_version(None) is None
         assert display_version("v1.16.0") == "1.16.0" and display_version("1.16.0") == "1.16.0"
+
+    @pytest.mark.parametrize("tag, version", sorted(PUBLISHED_TAGS.items()))
+    def test_every_tag_this_project_has_published_parses(self, tag, version):
+        """The bug this guards: the pattern took an optional "v" but not the "TNT" prefix TNT's own
+        releases use, so everything from 1.16.0 - the release that *introduced* auto-update - parsed
+        as None and no client could ever see an update.  It went unnoticed because the tests here
+        only ever used "v1.16.0", a form the project had stopped tagging with.
+        """
+        assert parse_version(tag) is not None, f"{tag} does not parse: no client can see this release"
+        assert display_version(tag) == version
+
+    def test_a_tag_that_is_not_ours_is_left_alone(self):
+        for tag in ("bogus", "TNT-Setup-1.20.1.exe", "release", "TNTv", ""):
+            assert parse_version(tag) is None, tag
+        assert display_version("bogus") == "bogus"
+        assert display_version("TNT-Setup") == "TNT-Setup"
+        assert display_version(None) == ""
 
     @pytest.mark.parametrize("a,b,newer", [
         ("1.16.0", "1.15.0", True),
@@ -48,6 +76,33 @@ class TestVersion:
     def test_is_newer_needs_both_to_parse(self):
         assert is_newer("bogus", "1.0.0") is False and is_newer("1.0.0", "bogus") is False
 
+
+
+class TestPublishedTagsAreDiscoverable:
+    """End to end over the shapes GitHub really returns, because the parser is only half of it."""
+
+    @staticmethod
+    def _rel(tag: str) -> "dict":
+        return {"tag_name": tag, "draft": False, "prerelease": False, "html_url": "https://x/" + tag,
+                "published_at": "2026-09-19T21:00:00Z",
+                "assets": [{"name": f"TNT-Setup-{display_version(tag)}.exe", "size": 32_000_000,
+                            "browser_download_url": "https://x/setup.exe"},
+                           {"name": f"TNT-Setup-{display_version(tag)}.exe.sha256", "size": 86,
+                            "browser_download_url": "https://x/setup.exe.sha256"}]}
+
+    @pytest.mark.parametrize("tag, version", sorted(PUBLISHED_TAGS.items()))
+    def test_a_client_one_version_back_finds_it(self, tag, version):
+        older = version.rsplit(".", 1)[0] + ".0" if not version.endswith(".0") else "1.0.0"
+        rel = self._rel(tag)
+        assert select_release([rel], "stable", older) is rel, f"a {older} client cannot see {tag}"
+        asset = pick_setup_asset(rel["assets"])
+        assert asset is not None and pick_checksum_asset(rel["assets"], asset["name"]) is not None
+
+    def test_the_newest_wins_across_both_tag_styles(self):
+        """1.12.0 was tagged v1.12.0 and 1.20.1 TNT1.20.1: a mixed list has to order correctly."""
+        rels = [self._rel("v1.12.0"), self._rel("TNT1.16.0"), self._rel("TNT1.20.1")]
+        assert select_release(rels, "stable", "1.12.0")["tag_name"] == "TNT1.20.1"
+        assert select_release(rels, "stable", "1.20.1") is None       # already on the newest
 
 class TestSelectRelease:
     def test_stable_picks_newest_release(self):
