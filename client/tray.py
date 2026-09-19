@@ -27,8 +27,9 @@ What it does
   polled every 10 s; the icon's status dot and the tooltip
   (``TNT — 3 targets · all green``) follow ``overall_light``.
 * JS bridge (``window.pywebview.api``): ``save_file(suggested_name, b64)``,
-  ``open_path(path)``, ``client_info()``, ``set_theme(theme)`` and the small extra
-  ``retry()`` used by the error page. The public :class:`JsBridge` methods are registered one by
+  ``pick_capture_file()`` (the Packet capture page's "Browse…": an open dialog that answers a path
+  and reads nothing - the service opens the file), ``open_path(path)``, ``client_info()``,
+  ``set_theme(theme)`` and the small extra ``retry()`` used by the error page. The public :class:`JsBridge` methods are registered one by
   one with ``window.expose`` (:func:`bridge_functions`), never as ``js_api``: pywebview resolves a
   ``js_api`` call name as a dotted attribute path, so a page could have reached
   ``_app.wifi.survey`` or ``_app.quit`` past every method's own check. The window is also a
@@ -39,7 +40,7 @@ What it does
   because Windows 11 24H2 gives BSSID lists only to a user who granted location access, and
   reaches the UI only through the bridge: ``wifi_survey(options)``, ``wifi_scan_now()``,
   ``wifi_clear()``, ``wifi_set_enabled(on)`` (``wifi_survey_enabled`` in client.json, default
-  on) and ``open_location_settings()``. They answer only while the window shows the TNT service
+  off) and ``open_location_settings()``. They answer only while the window shows the TNT service
   origin (:meth:`ClientApp.showing_service_page`). The session starts the first time the window
   is actually shown (not while TNT.exe waits minimised in the tray), or on a ``wifi_survey``
   call while the window is visible or the WiFi page is active; the scanner thread stops on quit.
@@ -138,7 +139,7 @@ THEME_BG = {"light": "#FFF7E8", "dark": "#1E1B2E"}
 TRAY_ICON_PX = 64
 #: Windows truncates balloon text at 255 characters (NOTIFYICONDATAW.szInfo).
 NOTIFY_MAX = 255
-#: client.json key of the Wi-Fi survey switch (default on).
+#: client.json key of the Wi-Fi survey switch (default off).
 WIFI_ENABLED_KEY = "wifi_survey_enabled"
 #: The Settings page where location access (which the Wi-Fi survey needs) is granted.
 LOCATION_SETTINGS_URI = "ms-settings:privacy-location"
@@ -287,9 +288,10 @@ def navigation_allowed(uri: Any, base: Any) -> bool:
 
 
 def wifi_enabled_setting(state: Dict[str, Any]) -> bool:
-    """The Wi-Fi survey switch from client.json: a JSON boolean, anything else means on (the default)."""
-    value = state.get(WIFI_ENABLED_KEY, True) if isinstance(state, dict) else True
-    return value if isinstance(value, bool) else True
+    """The Wi-Fi survey switch from client.json: a JSON boolean, anything else means off. The default is off —
+    Wi-Fi scanning stays off until the user turns it on (remembered in client.json)."""
+    value = state.get(WIFI_ENABLED_KEY, False) if isinstance(state, dict) else False
+    return value if isinstance(value, bool) else False
 
 
 # --------------------------------------------------------------------------- HTTP client
@@ -1293,6 +1295,33 @@ class JsBridge:
             return path
         except Exception:  # noqa: BLE001
             log.exception("save_file failed")
+            return None
+
+    def pick_capture_file(self) -> Optional[str]:
+        """Open dialog for a capture file -> its path, or None when it is cancelled (or there is no window).
+
+        The Packet capture page's "Browse…" uses this so a capture taken anywhere on this PC can be opened, not only
+        the ones TNT saved; the SIP page's call flows use the same one for each of their two slots.  Nothing is read
+        here: the path goes to the service, which is what opens the file."""
+        try:
+            import webview  # local import: keep the module importable without a GUI
+            window = self._app.window
+            if window is None:
+                return None
+            # pywebview >= 5 exposes FileDialog.OPEN; OPEN_DIALOG is the deprecated alias.
+            dialog = getattr(getattr(webview, "FileDialog", None), "OPEN", None)
+            if dialog is None:
+                dialog = webview.OPEN_DIALOG
+            result = window.create_file_dialog(
+                dialog, allow_multiple=False,
+                file_types=("Packet captures (*.pcapng;*.pcap;*.cap)", "All files (*.*)"))
+            if not result:
+                return None
+            path = result[0] if isinstance(result, (list, tuple)) else result
+            log.info("a capture file was picked for the packet capture page")
+            return str(path)
+        except Exception:  # noqa: BLE001
+            log.exception("pick_capture_file failed")
             return None
 
     def open_path(self, path: str) -> bool:

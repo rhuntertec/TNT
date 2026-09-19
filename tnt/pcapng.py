@@ -42,6 +42,17 @@ Readers
   lookup's small LLDP/CDP capture).
 * :func:`count_packets` counts EPB + SPB + PB in a file of any size: it reads block headers (and the 20 fixed bytes of
   each EPB/PB) and seeks past the bodies, so memory stays constant (the packet capture file list).
+* :func:`iter_packets_with_offsets` yields ``(block offset, PACKET)``, which is how the live capture indexes a file it
+  opened, and :func:`read_packet_at` reads one packet back from such an offset (None for anything that is not a packet
+  block there, never an error).
+
+Writing
+-------
+:class:`Writer` writes a one-interface file: a little-endian SHB (``shb_userappl``) and IDB (``if_name`` and
+``if_tsresol`` 10^-6 s), then an EPB per :meth:`Writer.write_packet`, which returns the block's offset for the index
+above. The live capture writes every frame it receives through it, so the file on disk is the capture and only a
+summary per packet stays in memory. A packet over ``Writer.MAX_PACKET`` raises :class:`PcapngError` before anything is
+written.
 
 Wi-Fi rewrite
 -------------
@@ -84,7 +95,7 @@ from typing import Any, BinaryIO, Dict, Iterator, List, Optional, Tuple, Union
 
 __all__ = ["PcapngError", "MAX_BLOCK", "MAX_IN_MEMORY", "PACKET_KEYS", "REWRITE_KEYS", "KNOWN_ETHERTYPES",
            "iter_blocks", "iter_packets", "read_packets", "count_packets", "dot11_to_ethernet",
-           "rewrite_dot11_to_ethernet"]
+           "rewrite_dot11_to_ethernet", "Writer", "iter_packets_with_offsets", "read_packet_at"]
 
 MAX_BLOCK = 16 * 1024 * 1024              # one block of any type
 MAX_IN_MEMORY = 64 * 1024 * 1024          # read_packets() refuses a larger buffer
@@ -349,6 +360,129 @@ def count_packets(path: PathLike) -> int:
             fileobj.seek(offset + length - 4)
             _check_trailer(endian, _read_exact(fileobj, 4), length, offset)
             offset += length
+
+
+_OPT_END = struct.pack("<HH", OPT_END, 0)
+
+
+def _option(code: int, value: Union[bytes, str]) -> bytes:
+    """One little-endian option (code, length, value, padding) for a block :class:`Writer` writes."""
+    raw = value.encode("utf-8", "replace") if isinstance(value, str) else bytes(value)
+    raw = raw[:0xFFFF]
+    return struct.pack("<HH", code, len(raw)) + raw + bytes(_pad4(len(raw)) - len(raw))
+
+
+def iter_packets_with_offsets(fileobj: BinaryIO, *, max_packets: Optional[int] = None) -> Iterator[Tuple[int, Dict[str, Any]]]:
+    """``(block offset, PACKET)`` for every EPB, SPB and PB, so a caller can index a file and come back to one packet.
+
+    The offset is the packet block's own start in the file, which :func:`read_packet_at` takes."""
+    limit = _limit(max_packets)
+    if limit == 0:
+        return
+    section: Optional[_Section] = None
+    offset = count = 0
+    for endian, block_type, body in iter_blocks(fileobj):
+        if block_type == BLOCK_SHB:
+            section = _Section(endian)
+        elif block_type == BLOCK_IDB:
+            section.add_interface(body)                     # iter_blocks guarantees an SHB came first
+        elif block_type in PACKET_BLOCKS:
+            yield offset, section.packet(block_type, body, offset)
+            count += 1
+            if limit is not None and count >= limit:
+                return
+        offset += len(body) + 12
+
+
+def read_packet_at(path: PathLike, offset: int, *, endian: str = "<", linktype: int = LINKTYPE_ETHERNET,
+                   ts_divisor: int = DEFAULT_TS_DIVISOR) -> Optional[Dict[str, Any]]:
+    """The PACKET at *offset* of a pcapng file, or None when there is no packet block there.
+
+    The section's byte order, link type and timestamp resolution are the caller's (it indexed the file with
+    :func:`iter_packets_with_offsets`), so one packet is read without walking the file again.  A block that is not an
+    EPB, SPB or PB, or one that does not read back, gives None rather than an error."""
+    if offset < 0:
+        return None
+    try:
+        with open(path, "rb") as fileobj:
+            fileobj.seek(offset)
+            head = _read_exact(fileobj, 8)
+            if len(head) < 8:
+                return None
+            block_type, length = struct.unpack(endian + "II", head)
+            if block_type not in PACKET_BLOCKS or length < _MIN_LENGTH.get(block_type, 12) or length > MAX_BLOCK:
+                return None
+            body = _read_exact(fileobj, length - 12)
+            if len(body) < length - 12:
+                return None
+    except OSError:
+        return None
+    section = _Section(endian)
+    section.interfaces.append((linktype, 0, ts_divisor))
+    try:
+        return section.packet(block_type, body, offset)
+    except (PcapngError, struct.error):
+        return None
+
+
+class Writer:
+    """Writes a pcapng file of one interface: the SHB and IDB up front, then an EPB per packet.
+
+    Used by the live packet capture, which writes every frame it receives straight to disk and keeps only a summary in
+    memory.  :meth:`write_packet` returns the block's offset, which is what the packet list stores so a detail view can
+    read that one packet back with :func:`read_packet_at`.  The byte order is always little-endian and the timestamp
+    resolution microseconds, so a reader needs no options to follow it.  Nothing here closes *fileobj*: the caller owns
+    it.  Timestamps before 1970 or past the 64-bit range are clamped, and a packet larger than :data:`MAX_BLOCK` minus
+    its header is refused with :class:`PcapngError` (never a partial block)."""
+
+    __slots__ = ("_out", "_linktype", "_snaplen", "offset", "packets")
+
+    #: what a caller may not exceed with one packet (the block header, the fixed fields and the trailing length)
+    MAX_PACKET = MAX_BLOCK - 32
+
+    def __init__(self, fileobj: BinaryIO, *, linktype: int = LINKTYPE_ETHERNET, snaplen: int = 0,
+                 app_name: str = "TNT", if_name: Optional[str] = None) -> None:
+        self._out = fileobj
+        self._linktype = int(linktype)
+        self._snaplen = max(0, int(snaplen))
+        self.offset = 0                                  # bytes written so far: the next block's offset
+        self.packets = 0
+        self._write(_block("<", BLOCK_SHB, struct.pack("<IHHq", 0x1A2B3C4D, 1, 0, -1) + _option(4, app_name) + _OPT_END))
+        options = _option(9, bytes((6,)))                # if_tsresol: 10^-6 s
+        if if_name:
+            options = _option(2, if_name) + options
+        self._write(_block("<", BLOCK_IDB, struct.pack("<HHI", self._linktype, 0, self._snaplen) + options + _OPT_END))
+
+    def _write(self, data: bytes) -> None:
+        self._out.write(data)
+        self.offset += len(data)
+
+    def write_packet(self, ts: Optional[float], data: bytes, origlen: Optional[int] = None) -> int:
+        """Append one packet; the offset of the block that was written.
+
+        *ts* is float seconds since 1970 (None means 0) and *origlen* the frame's length on the wire (None means the
+        length of *data*)."""
+        frame = bytes(data)
+        if len(frame) > self.MAX_PACKET:
+            raise PcapngError(f"a {len(frame)} byte packet is over the {self.MAX_PACKET} byte block limit")
+        micros = 0 if ts is None else int(max(0.0, float(ts)) * DEFAULT_TS_DIVISOR)
+        micros = min(micros, 0xFFFFFFFFFFFFFFFF)
+        wire = len(frame) if origlen is None else max(len(frame), int(origlen))
+        padded = _pad4(len(frame))
+        at = self.offset
+        length = 32 + padded
+        self._write(b"".join((struct.pack("<IIIIIII", BLOCK_EPB, length, 0, micros >> 32, micros & 0xFFFFFFFF,
+                                          len(frame), wire),
+                              frame, bytes(padded - len(frame)), struct.pack("<I", length))))
+        self.packets += 1
+        return at
+
+    def flush(self) -> None:
+        """Push what is buffered to the file; never raises for a file object without ``flush``."""
+        try:
+            self._out.flush()
+        except (AttributeError, OSError, ValueError):
+            pass
 
 
 def dot11_to_ethernet(frame: bytes, origlen: int) -> Optional[Tuple[bytes, int]]:

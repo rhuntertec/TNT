@@ -271,6 +271,8 @@ NETWORK_TIME_NOTE = "On their networks: "
 LEAVE_MERGE_S = 120.0
 
 PHASES: Tuple[str, ...] = ("speed", "discovery", "wifi", "history", "save")
+#: What a phase says when its tool is switched off in Settings (tnt.config.TOOLS).
+_TOOL_OFF = "The {tool} tool is switched off in Settings"
 #: ``job["phase"]`` while each phase runs
 JOB_PHASE = {"speed": "speed", "discovery": "discovery", "wifi": "wifi", "history": "finalize", "save": "finalize"}
 #: the part of the job's 0..100 each phase covers
@@ -2591,7 +2593,17 @@ class ReportManager:
             except Exception:  # noqa: BLE001
                 log.exception("full scan: cancelling its speed test failed")
 
+    def _tool_on(self, name: str) -> bool:
+        """Whether a main tool is switched on.  A Full Scan runs the tools a site actually uses; a section for
+        one that was switched off would be an empty section nobody asked for."""
+        from .config import tool_on
+
+        return tool_on(self._config, name)
+
     def _speed_phase(self, scan: _Scan, ctx: Dict[str, Any]) -> None:
+        if not self._tool_on("speed"):
+            self._phase_update(scan, "speed", status="skipped", message=_TOOL_OFF.format(tool="Speed"))
+            return
         self._phase_update(scan, "speed", status="running", message="Starting the speed test")
         sched = getattr(self._engine, "speed", None)
         if sched is None or not callable(getattr(sched, "run_now", None)):
@@ -2701,6 +2713,9 @@ class ReportManager:
             return False
 
     def _discovery_phase(self, scan: _Scan, ctx: Dict[str, Any]) -> None:
+        if not self._tool_on("discovery"):
+            self._phase_update(scan, "discovery", status="skipped", message=_TOOL_OFF.format(tool="Discovery"))
+            return
         self._phase_update(scan, "discovery", status="running", message="Starting the Discovery scan")
         engine = self._engine
         if engine is None or getattr(engine, "discovery", None) is None or not callable(getattr(engine, "discovery_start", None)):
@@ -2813,6 +2828,10 @@ class ReportManager:
 
     # wifi --------------------------------------------------------------------
     def _wifi_phase(self, scan: _Scan, ctx: Dict[str, Any]) -> None:
+        if not self._tool_on("wifi"):
+            # no intake is opened either: a page that posted a survey would have nowhere for it to go
+            self._phase_update(scan, "wifi", status="skipped", message=_TOOL_OFF.format(tool="WiFi"))
+            return
         # the intake opens in the step that announces the phase: a page without the bridge posts the moment it hears of
         # it, and no post is taken before the job says it waits for one
         self._phase_update(scan, "wifi", status="running", message="Waiting for the TNT window to scan Wi-Fi", open_wifi=True)

@@ -1,11 +1,14 @@
-"""Node-driver tests for what three 1.15.0 cards do, on a small fake DOM (their pure helpers are pinned in
-test_ui_115_views.py): the Network info card's NAT section after a check that failed (ui/js/netcheck.js), and the packet
-capture Port and TFTP Max upload number fields holding text that is not a number (tools/capture.js, tools/tftp.js).
+"""Node-driver tests for what two 1.15.0 cards do, on a small fake DOM (their pure helpers are pinned in
+test_ui_115_views.py): the Network info card's NAT section after a check that failed (ui/js/netcheck.js), and the TFTP
+Max upload number field holding text that is not a number (tools/tftp.js).
 
 A number field whose text cannot be read as a number reports ``value === ''`` with ``validity.badInput`` (the HTML value
 sanitization WebView2 and Chromium follow); the fake inputs here are set up that way.  Each driver loads one module into a
 node vm with a fake document, fake timers only the driver moves, and a scripted TNT.api: nothing reaches a service.
 Offline: node and files only.
+
+(The packet capture card that used to be driven here is gone: it is a page of its own now, ui/js/views/capture.js, whose
+helpers are pinned in test_ui_115_views.py and whose markup is mounted in a browser in test_ui.py.)
 """
 from __future__ import annotations
 
@@ -225,61 +228,6 @@ def test_netcheck_nat_checks_again_once_the_service_answers_after_a_failed_check
         # it answers again: exactly one more automatic check, and its verdict
         assert (s["back"]["natRun"], s["back"]["badge"], s["back"]["cls"]) == (runs + 1, "Single NAT", "badge green"), name
         assert s["idleChecking"] is False, name
-
-
-# ------------------------------------------------------------------------------------------ tools/capture.js
-_CAPTURE_DRIVER = r"""
-(async () => {
-  const status = { available: true, reason: null, capture: null, files: [],
-    adapters: [{ name: 'Ethernet', index: 12, mac: '02:00:5E:10:00:01', type_name: 'Ethernet', wifi: false }] };
-  for (const name of ['captureGet', 'captureStart', 'captureStop', 'captureDeleteFile']) T.api[name] = scripted(name);
-  T.api.captureFileUrl = (name) => '/api/tools/capture/files/' + name;
-  queues.captureGet = [ok(status)];
-  queues.captureStart = [ok({ capture: null })];
-  const card = T.tools.capture.create();
-  card.mount();
-  await settle();
-  const field = (label) => find(card.body, (e) => e.attrs['aria-label'] === label);
-  const port = field('Port (optional)'), host = field('Host (optional)'), protocol = field('Protocol');
-  const startBtn = find(card.body, (e) => e.tagName === 'button' && e.textContent === 'Start');
-  const invalid = find(card.body, (e) => e.className.split(' ').includes('capture-invalid'));
-  const snap = () => ({ starts: (calls.captureStart || []).map((args) => [args[0].host, args[0].port, args[0].protocol]),
-    invalidHidden: invalid.hidden, invalidText: invalid.textContent, portInvalid: port.getAttribute('aria-invalid') });
-  const out = {};
-  host.value = '192.0.2.50';
-  port.value = ''; port.validity = { badInput: true, valid: false };        // '5060-' typed: the field reads ''
-  startBtn.fire('click'); await settle();
-  out.click = snap();
-  port.fire('keydown', { key: 'Enter' }); await settle();
-  out.enter = snap();
-  port.validity = { badInput: false, valid: true }; port.value = '5060';
-  startBtn.fire('click'); await settle();
-  out.number = snap();
-  port.value = '';
-  startBtn.fire('click'); await settle();
-  out.empty = snap();
-  protocol.value = 'icmp'; protocol.fire('change');                          // ICMP takes no port: the field is disabled
-  port.validity = { badInput: true, valid: false };
-  startBtn.fire('click'); await settle();
-  out.icmp = snap();
-  card.unmount();
-  done(out);
-})().catch(crash);
-"""
-
-
-@NODE
-def test_capture_refuses_a_port_that_is_not_a_number_instead_of_capturing_every_port(tmp_path):
-    """'5060-' in Port reads as '' in a number field: the capture must not start without a port filter. Start and Enter both
-    give the service's message under the form with Port marked; an empty Port still means every port, and with ICMP (Port
-    disabled) the field is not read."""
-    out = _drive(tmp_path, _CAPTURE_DRIVER, "js/tools/capture.js")
-    message = "port must be a whole number from 1 to 65535"
-    for step in ("click", "enter"):
-        assert out[step] == {"starts": [], "invalidHidden": False, "invalidText": message, "portInvalid": "true"}, step
-    assert (out["number"]["starts"], out["number"]["invalidHidden"], out["number"]["portInvalid"]) == ([["192.0.2.50", 5060, None]], True, None)
-    assert out["empty"]["starts"] == [["192.0.2.50", 5060, None], ["192.0.2.50", None, None]]
-    assert out["icmp"]["starts"] == [["192.0.2.50", 5060, None], ["192.0.2.50", None, None], ["192.0.2.50", None, "icmp"]]
 
 
 # --------------------------------------------------------------------------------------------- tools/tftp.js

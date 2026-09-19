@@ -524,3 +524,82 @@ def test_module_opens_no_socket_and_runs_no_program():
                 for alias in node.names}
     imported |= {(node.module or "").split(".")[0] for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
     assert not imported & {"socket", "subprocess", "ctypes", "http", "urllib", "ssl", "asyncio", "multiprocessing"}
+
+
+# --------------------------------------------------------------------------- Writer and the offset readers
+def test_writer_writes_a_file_every_reader_here_takes(tmp_path):
+    out = io.BytesIO()
+    writer = pcapng.Writer(out, linktype=1, if_name="Ethernet")
+    header_bytes = writer.offset
+    first = writer.write_packet(1_700_000_000.123456, ETH_FRAME, 74)
+    second = writer.write_packet(1_700_000_001.5, ETH_FRAME[:20])
+    data = out.getvalue()
+    assert (first, second) == (header_bytes, header_bytes + 32 + len(ETH_FRAME) + (-len(ETH_FRAME) % 4))
+    assert writer.packets == 2 and writer.offset == len(data)
+    packets = read_packets(data)
+    assert [p["caplen"] for p in packets] == [len(ETH_FRAME), 20]
+    assert [p["origlen"] for p in packets] == [74, 20]
+    assert packets[0]["ts"] == pytest.approx(1_700_000_000.123456)
+    assert packets[0]["linktype"] == 1 and packets[0]["data"] == ETH_FRAME
+    path = tmp_path / "written.pcapng"
+    path.write_bytes(data)
+    assert count_packets(path) == 2
+
+
+def test_writer_offsets_come_back_through_read_packet_at(tmp_path):
+    out = io.BytesIO()
+    writer = pcapng.Writer(out)
+    offsets = [writer.write_packet(1_700_000_000.0 + i, ETH_FRAME + bytes([i])) for i in range(4)]
+    path = tmp_path / "x.pcapng"
+    path.write_bytes(out.getvalue())
+    for i, offset in enumerate(offsets):
+        packet = pcapng.read_packet_at(path, offset)
+        assert packet is not None and packet["data"][-1] == i
+        assert tuple(packet) == PACKET_KEYS
+    assert [o for o, _p in pcapng.iter_packets_with_offsets(io.BytesIO(out.getvalue()))] == offsets
+
+
+@pytest.mark.parametrize("offset", [0, 12, -1, 10 ** 9])
+def test_read_packet_at_is_none_anywhere_that_is_not_a_packet(tmp_path, offset):
+    out = io.BytesIO()
+    pcapng.Writer(out).write_packet(1.0, ETH_FRAME)
+    path = tmp_path / "x.pcapng"
+    path.write_bytes(out.getvalue())
+    assert pcapng.read_packet_at(path, offset) is None
+
+
+def test_read_packet_at_is_none_for_a_file_that_is_not_there(tmp_path):
+    assert pcapng.read_packet_at(tmp_path / "nope.pcapng", 0) is None
+
+
+def test_writer_clamps_a_timestamp_it_cannot_write():
+    out = io.BytesIO()
+    writer = pcapng.Writer(out)
+    writer.write_packet(None, ETH_FRAME)
+    writer.write_packet(-5.0, ETH_FRAME)
+    assert [p["ts"] for p in read_packets(out.getvalue())] == [0.0, 0.0]
+
+
+def test_writer_refuses_a_packet_over_the_block_limit():
+    out = io.BytesIO()
+    writer = pcapng.Writer(out)
+    with pytest.raises(PcapngError, match="over the"):
+        writer.write_packet(1.0, bytes(pcapng.Writer.MAX_PACKET + 1))
+    assert writer.packets == 0
+
+
+def test_writer_pads_an_odd_length_packet_and_stays_readable():
+    out = io.BytesIO()
+    writer = pcapng.Writer(out)
+    for size in (1, 2, 3, 5, 15):
+        writer.write_packet(1.0, bytes(range(size)))
+    assert [p["caplen"] for p in read_packets(out.getvalue())] == [1, 2, 3, 5, 15]
+    assert len(out.getvalue()) % 4 == 0
+
+
+def test_iter_packets_with_offsets_stops_at_max_packets():
+    out = io.BytesIO()
+    writer = pcapng.Writer(out)
+    for i in range(5):
+        writer.write_packet(float(i), ETH_FRAME)
+    assert len(list(pcapng.iter_packets_with_offsets(io.BytesIO(out.getvalue()), max_packets=2))) == 2

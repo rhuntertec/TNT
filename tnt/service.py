@@ -535,14 +535,22 @@ SELFCHECK_MODULES = (
     # stdlib C extensions whose DLLs a conda-based build can silently miss
     "ctypes", "sqlite3", "ssl", "hashlib", "zlib", "bz2", "lzma", "gzip", "xml.etree.ElementTree",
     "socket", "select", "json", "http.server", "mmap",
-    # every TNT component the engine loads lazily
-    "tnt.paths", "tnt.config", "tnt.db", "tnt.events", "tnt.logging_setup", "tnt.icmp", "tnt.netinfo",
-    "tnt.arp", "tnt.oui", "tnt.pinger", "tnt.outages", "tnt.speedtest", "tnt.speedtest.cloudflare",
-    "tnt.speedtest.fastcom", "tnt.speedtest.scheduler", "tnt.speedtest.patterns",
-    "tnt.discovery", "tnt.export_pdf", "tnt.diagnostics", "tnt.api.server", "tnt.api.routes",
-    "tnt.api.sse", "tnt.engine", "tnt.netwatch", "tnt.mmdb", "tnt.geohints", "tnt.geohints_data", "tnt.geoip",
-    "tnt.winacl", "tnt.natcheck", "tnt.portcheck", "tnt.pcapng", "tnt.lldp", "tnt.pktmon", "tnt.switchport",
-    "tnt.capture", "tnt.tftp", "tnt.speedtest.quality",
+    # every module of the tnt package. A frozen build that cannot import one of these is broken in exactly the
+    # way this check exists to catch, and the list is every module rather than a chosen few because the chosen few
+    # drifted: tests/test_packaging.py fails when a new module is not here.
+    "tnt.api", "tnt.api.routes", "tnt.api.server", "tnt.api.sse",
+    "tnt.arp", "tnt.capture", "tnt.config", "tnt.db", "tnt.dhcp", "tnt.diagnostics", "tnt.discovery",
+    "tnt.dissect", "tnt.etw", "tnt.events", "tnt.export_pdf", "tnt.firewall", "tnt.geohints",
+    "tnt.geohints_data", "tnt.geoip", "tnt.icmp", "tnt.lanpeers", "tnt.linkmap", "tnt.lldp",
+    "tnt.logging_setup", "tnt.mdns", "tnt.mmdb", "tnt.natcheck", "tnt.netinfo", "tnt.nettools",
+    "tnt.networks", "tnt.netwatch", "tnt.outages",
+    "tnt.oui", "tnt.paths", "tnt.pcapng", "tnt.peer", "tnt.pinger", "tnt.pktmon", "tnt.portcheck",
+    "tnt.proav", "tnt.ptp", "tnt.report_pdf", "tnt.reports", "tnt.service", "tnt.sipalg", "tnt.sipcalls",
+    "tnt.sipflow", "tnt.sipnat", "tnt.sipqual", "tnt.speedtest", "tnt.speedtest.base",
+    "tnt.speedtest.cloudflare", "tnt.speedtest.fastcom", "tnt.speedtest.patterns", "tnt.speedtest.quality",
+    "tnt.speedtest.scheduler", "tnt.switchport", "tnt.throughput", "tnt.tftp", "tnt.traceroute",
+    "tnt.updater", "tnt.wifi",
+    "tnt.winacl", "tnt.engine",
     # third-party packages the service depends on
     "netaddr", "reportlab", "psutil",
 )

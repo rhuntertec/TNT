@@ -1,5 +1,5 @@
 /* TNT — app.js
-   Owns application state, hash routing, the top tiles, the header status pill,
+   Owns application state, hash routing, the top tiles and their shortcut strip, the header status pill,
    the Settings modal, the Diagnostics panel, toasts, the confirm modal and the SSE wiring,
    including following this PC onto another network (net.changed / status.net.generation).
    Also provides the shared helpers views use at runtime: TNT.util, TNT.ui, TNT.icons. */
@@ -36,6 +36,8 @@
     grip: '<svg ' + S + ' style="fill:currentColor;stroke:none"><circle cx="9" cy="6" r="2"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="15" cy="12" r="2"/><circle cx="9" cy="18" r="2"/><circle cx="15" cy="18" r="2"/></svg>',
     search: '<svg ' + S + '><circle cx="10.5" cy="10.5" r="6.6"/><path d="M15.6 15.6 21 21"/></svg>',
     info: '<svg ' + S + '><circle cx="12" cy="12" r="9"/><path d="M12 11v5.4M12 7.6v.4"/></svg>',
+    edit: '<svg ' + S + '><path d="M4 20l1-4L15.5 5.5l3 3L8 19l-4 1z"/><path d="M13.5 7.5l3 3"/></svg>',
+    expand: '<svg ' + S + '><path d="M9 4H4v5"/><path d="M15 20h5v-5"/><path d="M4.4 4.4l6 6"/><path d="M19.6 19.6l-6-6"/></svg>',
     // a chunky open-end wrench, head top-right, handle to the bottom-left
     tools: '<svg ' + S + '><path d="M14.2 3.6a5.2 5.2 0 0 1 6.2 6.2l-1.9-1.9-2.5.7-.7 2.5 1.9 1.9a5.2 5.2 0 0 1-6.2-6.2L4.4 13.4a2.4 2.4 0 0 0 3.4 3.4l6.4-6.6" stroke-linejoin="round"/><path d="M6 17.6h.01"/></svg>',
     // a router-ish box handing out addresses: the DHCP badge in the Tools view
@@ -47,6 +49,7 @@
     // three broadcast arcs over a dot: the WiFi tile and the saved Wi-Fi networks card
     wifi: '<svg ' + S + '><path d="M2.4 8.4a14 14 0 0 1 19.2 0"/><path d="M5.6 11.9a9.4 9.4 0 0 1 12.8 0"/><path d="M8.8 15.4a4.8 4.8 0 0 1 6.4 0"/><circle cx="12" cy="19.1" r="1.3" fill="currentColor" stroke="none"/></svg>',
     // two overlapping channel shapes standing on a baseline: the WiFi page's spectrum charts
+    activity: '<svg ' + S + '><path d="M2.6 13.4h4L9 7.2l3.4 10 2.6-5.2h6.4"/></svg>',
     spectrum: '<svg ' + S + '><path d="M2.6 20.2h18.8"/><path d="M4 20.2 6.6 7.4h4.6l2.6 12.8"/><path d="M11.2 20.2 13.6 12.6h4.2l2.4 7.6"/></svg>',
     // crosshair target: the last hop of a traceroute
     target: '<svg ' + S + '><circle cx="12" cy="12" r="8.4"/><circle cx="12" cy="12" r="3.8"/><circle cx="12" cy="12" r="1.1" fill="currentColor" stroke="none"/><path d="M12 2.4v2.6M12 19v2.6M2.4 12H5M19 12h2.6"/></svg>',
@@ -68,7 +71,13 @@
     chevron: '<svg ' + S + '><path d="M9.2 5.4 15.8 12l-6.6 6.6"/></svg>',
     // a file with a folded corner and an arrow up and an arrow down on it: the TFTP server card (files to and from devices)
     tftp: '<svg ' + S + '><path d="M7 3.4h6.8l5 5V19a1.6 1.6 0 0 1-1.6 1.6H7A1.6 1.6 0 0 1 5.4 19V5A1.6 1.6 0 0 1 7 3.4z" stroke-linejoin="round"/><path d="M13.6 3.6v5h5"/><path d="M9.8 17.8v-6.4M7.9 13.3l1.9-1.9 1.9 1.9"/><path d="M14.4 11.4v6.4M12.5 15.9l1.9 1.9 1.9-1.9"/></svg>',
-    // a magnifier over a waveform: the Packet capture card
+    // a handset: the SIP calls found in a packet capture
+    phone: '<svg ' + S + '><path d="M7.5 3.5 10 6.4l-2 2.4a12 12 0 0 0 5.2 5.2l2.4-2 2.9 2.5-1.3 2.2a2.4 2.4 0 0 1-2.6 1.1C9.7 16.9 7.1 14.3 5.3 9.4A2.4 2.4 0 0 1 6.4 6.8z"/></svg>',
+    // a magnifier over a waveform: the Packet capture tile and page (the space after <svg matters: without it the
+    // markup names an element "svgclass" and nothing draws)
+    proav: '<svg ' + S + '><path d="M3.6 9.2h3.4L11.6 5.2v13.6L7 14.8H3.6z" stroke-linejoin="round"/><path d="M15.2 9.3a4 4 0 0 1 0 5.4"/><path d="M18 6.6a8 8 0 0 1 0 10.8"/></svg>',
+    // a handset lifted off a phone, with a call arc: the SIP tile and page
+    sip: '<svg ' + S + '><path d="M5.6 4.2h3.1l1.5 3.6-2 1.4a10.6 10.6 0 0 0 4.6 4.6l1.4-2 3.6 1.5v3.1a1.8 1.8 0 0 1-2 1.8C9.5 17.6 6.4 14.5 3.8 6.2a1.8 1.8 0 0 1 1.8-2z" stroke-linejoin="round"/><path d="M15.4 3.6a6.6 6.6 0 0 1 5 5"/></svg>',
     capture: '<svg ' + S + '><circle cx="10.5" cy="10.5" r="6.6"/><path d="M15.6 15.6 21 21"/><path d="M6.2 10.8h1.6l1.2-2.6 1.8 5.2 1.4-3.8.9 1.2h1.5" stroke-width="2"/></svg>',
     // the same cylinder stick the easter egg throws: curved far end, elliptical cap with the
     // wick hole, curved seams and label band, fuse out of the cap, spark at the tip
@@ -198,8 +207,11 @@
     void el.offsetWidth;
     el.classList.add('pop');
   }
-  function targetName(t) { return t ? (t.label || t.host) : ''; }
-  TNT.util = { h, esc, nowS, fmtMs, fmtNum, fmtPct, fmtMbps, fmtClock, fmtTime, fmtDate, fmtDateTime, fmtDateTimeSec, fmtStamp, fmtDuration, relTime, untilText, fmtBytes, ipKey, copyCode, pop, targetName, pad2 };
+  // the display name: a custom name the user set wins, then the built-in label (e.g. "Gateway"), then the host
+  function targetName(t) { return t ? (t.name || t.label || t.host) : ''; }
+  // what the name reverts to when the custom name is cleared (the built-in label, else the host)
+  function originalTargetName(t) { return t ? (t.label || t.host) : ''; }
+  TNT.util = { h, esc, nowS, fmtMs, fmtNum, fmtPct, fmtMbps, fmtClock, fmtTime, fmtDate, fmtDateTime, fmtDateTimeSec, fmtStamp, fmtDuration, relTime, untilText, fmtBytes, ipKey, copyCode, pop, targetName, originalTargetName, pad2 };
 
   /* ================================================================== ui */
   const $ = (sel, root) => (root || document).querySelector(sel);
@@ -226,7 +238,7 @@
     else if (opts.body instanceof Node) body.appendChild(opts.body);
     else if (typeof opts.body === 'function') opts.body(body);
     const foot = opts.foot ? h('div', { class: 'modal-foot' }, opts.foot) : null;
-    const card = h('div', { class: 'modal' + (opts.narrow ? ' narrow' : ''), role: 'dialog', 'aria-modal': 'true', 'aria-label': opts.title || 'Dialog' }, head, body, foot);
+    const card = h('div', { class: 'modal' + (opts.narrow ? ' narrow' : '') + (opts.wide ? ' wide' : ''), role: 'dialog', 'aria-modal': 'true', 'aria-label': opts.title || 'Dialog' }, head, body, foot);
     const backdrop = h('div', { class: 'modal-backdrop' }, card);
     // Escape closes the modal on top only (a confirm over another modal closes alone: the one under it registered its
     // listener first and sees it is not on top). opts.onEscape() returning true leaves it open and lets the key through
@@ -411,8 +423,40 @@
     live: 'connecting', apiOk: true, now: nowS(), view: null,
   };
   TNT.state = state;
-  const ACCENT = { ipinfo: 'var(--blue)', ping: 'var(--green)', outages: 'var(--yellow)', speed: 'var(--purple)', discovery: 'var(--orange)', tools: 'var(--red)', wifi: 'var(--teal)', reports: 'var(--grey)' };
-  const VIEW_NAMES = ['ipinfo', 'ping', 'outages', 'speed', 'discovery', 'wifi', 'tools', 'reports'];   // the tile order of index.html
+  const ACCENT = { ipinfo: 'var(--blue)', ping: 'var(--green)', outages: 'var(--yellow)', speed: 'var(--purple)', discovery: 'var(--orange)', tools: 'var(--red)', wifi: 'var(--teal)', reports: 'var(--grey)', capture: 'var(--pink)', proav: 'var(--lime)', sip: 'var(--sand)' };
+  const VIEW_NAMES = ['ipinfo', 'ping', 'outages', 'speed', 'discovery', 'wifi', 'tools', 'reports', 'capture', 'proav', 'sip'];   // the tile order of index.html
+  //: the tiles under the four full-height ones, half height with a two-line body (.tile.half in css/tnt.css)
+  //: the main tools Settings can switch off, in tile order (tnt.config.TOOLS). A tool that is off has no tile
+  //: and no page, and its service side takes no automated action either — the switch is one setting, not two.
+  //: this project's page, for the link in Settings. A constant, never a setting.
+  const TNT_REPO_URL = 'https://github.com/rhuntertec/TNT';
+  //: the icon each tile's settings section wears, so a section is recognisably that page's
+  const TILE_ICONS = { ipinfo: 'network', ping: 'ping', outages: 'outage', speed: 'speed',
+                       discovery: 'discovery', wifi: 'wifi', tools: 'tools', reports: 'report',
+                       capture: 'capture', proav: 'proav', sip: 'sip' };
+  const TOOLS = ['speed', 'discovery', 'wifi', 'capture', 'proav', 'sip'];
+  const TOOL_NAMES = { speed: 'Speed', discovery: 'Discovery', wifi: 'WiFi', capture: 'Packet capture',
+                       proav: 'Pro AV', sip: 'SIP' };
+  const TOOL_WHAT = {
+    speed: 'Scheduled internet speed tests, the history charts and the patterns. Off, no test runs by itself.',
+    discovery: 'The on-demand LAN scan that finds what is on the network.',
+    wifi: 'The Wi-Fi survey: access points, channels, signal over time and the spectrum chart.',
+    capture: 'The packet analyser on its own page. Off, no capture can be started.',
+    proav: 'Dante, AES67, Ravenna, ST 2110 and Q-LAN: what is streaming and what clock it follows.',
+    sip: 'The SIP qualifier, the ALG check, the STUN test and the call flows.',
+  };
+  /** Pure: whether a tool is switched on, from status.tools. Anything unknown is on — a tile that vanished
+   *  because a status read failed would be worse than one that stayed. */
+  function toolOn(name) {
+    if (!TOOLS.includes(name)) return true;
+    const t = state.status && state.status.tools;
+    return !t || t[name] !== false;
+  }
+  /** The tiles that exist right now, in markup order. */
+  function liveViews() { return VIEW_NAMES.filter(toolOn); }
+
+  //: every tile is half height now — the four that used to be tall said more than a glance needs
+  const HALF_TILES = ['ipinfo', 'ping', 'outages', 'speed', 'discovery', 'wifi', 'tools', 'reports', 'capture', 'proav', 'sip'];
 
   /* ================================================================ theme */
   function setTheme(theme, opts) {
@@ -464,6 +508,7 @@
     }
     lastNet = net.next;
     state.status = st;
+    syncTools();   // a tool switched off elsewhere takes its tile with it
     state.targets = Array.isArray(st.targets) ? st.targets : [];
     state.apiOk = true;
     adoptStatusJob(st.reports && st.reports.job);
@@ -734,10 +779,10 @@
   }
 
   const tileEls = {};
-  const PING_TILE_MAX = 6;   // lights shown on the Ping tile (3 columns x 2 rows)
+  const PING_TILE_MAX = 3;   // lights shown on the Ping tile: one row, and nothing else on it
   const SLUGGISH_MS = 100;   // header says "looking sluggish" only from this 1-minute average up
   // the Tools tile names the tools under the DHCP server, in the order of their cards on the Tools page
-  const TOOLS_TILE_ITEMS = ['LAN throughput', 'Port forward', 'Traceroute', 'TFTP server', 'Subnet calc', 'DNS', 'Packet capture', 'WiFi passwords'];
+  const TOOLS_TILE_ITEMS = ['LAN throughput', 'Port forward check', 'Traceroute', 'TFTP server', 'Subnet calc', 'DNS', 'WiFi passwords'];
   function line(html, cls, title) { return '<div class="tile-line ' + (cls || '') + '"' + (title ? ' title="' + esc(title) + '"' : '') + '>' + html + '</div>'; }
   /** The most serious problem of a status.netinfo adapter (its `warnings` codes, labelled like the Network info
    *  page) as a badge for the Network info tile; '' without one. The informational grey ones stay on the page. */
@@ -760,15 +805,14 @@
       let html;
       if (!st) html = line('Loading…', 'muted');
       else if (nic) {
-        // adapter, its IPv4 and the gateway; the live gateway/internet state is on the link map
+        // the adapter and its IPv4. The gateway is one line down on the page itself, with the live link map
+        // beside it; on a two-line tile it was the least useful of the three.
         html = line('<span class="strong">' + esc(nic.name) + '</span><span class="badge blue" style="--accent:var(--blue)">internet</span>' + warningBadge(nic)) +
-          line('<span class="muted">IPv4</span> <code>' + esc(api.net.nicCidr(nic) || nic.ipv4 || '—') + '</code>') +
-          line('<span class="muted">Gateway</span> <code>' + esc(nic.gateway || '—') + '</code>');
+          line('<span class="muted">IPv4</span> <code>' + esc(api.net.nicCidr(nic) || nic.ipv4 || '—') + '</code>');
       } else if (local) {
         // no adapter faces the internet: the one that is connected anyway (a bench cable, the DHCP server tool, no DHCP server)
         html = line('<span class="strong">' + esc(local.name) + '</span><span class="badge grey">no internet</span>' + warningBadge(local)) +
-          line('<span class="muted">IPv4</span> <code>' + esc(api.net.nicCidr(local) || local.ipv4 || '—') + '</code>') +
-          line('<span class="muted">Gateway</span> <code>' + esc(local.gateway || '—') + '</code>');
+          line('<span class="muted">IPv4</span> <code>' + esc(api.net.nicCidr(local) || local.ipv4 || '—') + '</code>');
       } else {
         html = line('<span class="strong">No internet adapter</span>') + line((st.netinfo && st.netinfo.adapter_count || 0) + ' adapters found', 'muted');
       }
@@ -778,8 +822,8 @@
     {
       const el = tileEls.ping;
       const t = state.targets;
-      // the tile shows the first six targets as a 3 x 2 grid of lights; the summary line
-      // below still counts every target
+      // the first three targets as a row of lights, and nothing else. The counts, the average and the rest of
+      // the targets are the page's job; the tile is the glance.
       const shown = t.slice(0, PING_TILE_MAX);
       const key = shown.map((x) => x.id).join(',');
       if (el.dataset.key !== key) {
@@ -790,7 +834,6 @@
           const row = h('div', { class: 'tile-lights' });
           for (const x of shown) row.appendChild(h('div', { class: 'tl', title: x.host }, lightEl(x.light), h('span', null, targetName(x))));
           el.appendChild(row);
-          el.appendChild(h('div', { class: 'tile-line muted', data: { role: 'summary' } }, ''));
         }
       }
       if (t.length) {
@@ -798,14 +841,6 @@
         shown.forEach((x, i) => { const l = lights[i]; if (l && l.className !== 'light ' + x.light) l.className = 'light ' + x.light; });
         const names = el.querySelectorAll('.tl span:last-child');
         shown.forEach((x, i) => { if (names[i] && names[i].textContent !== targetName(x)) names[i].textContent = targetName(x); });
-        const reds = t.filter((x) => x.light === 'red').length, yel = t.filter((x) => x.light === 'yellow').length;
-        const ok = t.filter((x) => x.last && x.last.ok && x.last.rtt_ms != null);
-        const avg = ok.length ? ok.reduce((a, x) => a + x.last.rtt_ms, 0) / ok.length : null;
-        let text = st && st.paused ? 'Paused' : reds ? reds + ' down' : yel ? yel + ' sluggish' : 'All green';
-        text += ' · ' + t.length + (t.length === 1 ? ' target' : ' targets');
-        if (avg != null && !reds) text += ' · ~' + fmtMs(avg) + ' ms';
-        const s = el.querySelector('[data-role=summary]');
-        if (s && s.textContent !== text) s.textContent = text;
       }
     }
     // Outages
@@ -821,10 +856,12 @@
         const ongoingCls = o.total_active ? 'red' : 'yellow';
         html = line('<span class="num">' + n + '</span><span class="muted">in the last 24 h</span>' + (ongoing ? ' <span class="badge ' + ongoingCls + ' pulse">ongoing</span>' : ''));
         if (o.last) {
+          // when and how long, on one line. Which target it was is on the page, and on a two-line tile the name
+          // crowded out the two numbers somebody actually glances for.
           const l = o.last;
-          const who = l.kind === 'total_internet' ? 'Internet' : l.kind === 'total_local' ? 'Local network' : (l.host || 'target');
-          html += line('<span class="muted">Last:</span> ' + esc(who) + ' · ' + esc(relTime(l.start_ts, now)));
-          html += line('<span class="muted">Lasted</span> ' + (l.open ? '<span class="ongoing strong">still going</span>' : esc(fmtDuration(l.duration_s))));
+          html += line('<span class="muted">Last:</span> ' + esc(relTime(l.start_ts, now)) + '. '
+            + (l.open ? '<span class="ongoing strong">Still going</span>'
+              : '<span class="muted">Lasted</span> ' + esc(fmtDuration(l.duration_s))));
         } else html += line(n ? '' : 'Nice and quiet', 'muted');
       }
       if (el.dataset.html !== html) { el.innerHTML = html; el.dataset.html = html; }
@@ -839,19 +876,22 @@
         const last = sp.last;
         if (last && last.ok) {
           html = line('<span class="strong">↓ <span class="num">' + fmtMbps(last.download_mbps) + '</span></span><span class="strong">↑ <span class="num">' + fmtMbps(last.upload_mbps) + '</span></span><span class="muted">Mbps</span>');
-          html += line('<span class="muted">' + fmtMs(last.latency_ms) + ' ms · ' + esc(relTime(last.ts, now)) + '</span>');
         } else if (last) {
-          html = line('<span class="strong">Last test failed</span>') + line(esc(relTime(last.ts, now)), 'muted');
-        } else html = line('No results yet', 'muted') + line('');
+          html = line('<span class="strong">Last test failed</span>');
+        } else html = line('No results yet', 'muted');
+        // the second line is what the last test measured, or the run that is happening instead. When the next one
+        // is due is on the page: on a two-line tile it was taking the room the result needed.
         if (sp.running) {
           const p = sp.progress || {};
           html += line('<span class="spark-icon">' + ICONS.spark + '</span> Testing… ' + esc(p.phase || '') + ' ' + Math.round((p.pct || 0) * 100) + '%');
-        } else if (sp.enabled === false) html += line('Automatic tests off', 'muted');
-        else html += line('<span class="muted">Next ' + esc(untilText(sp.next_run_ts, now)) + '</span>');
+        } else if (last) {
+          html += line('<span class="muted">' + (last.ok ? fmtMs(last.latency_ms) + ' ms · ' : '') + esc(relTime(last.ts, now))
+            + (sp.enabled === false ? ' · auto off' : '') + '</span>');
+        } else html += line(sp.enabled === false ? 'Automatic tests off' : 'Runs every ' + (sp.interval_min || 15) + ' min', 'muted');
       }
       if (el.dataset.html !== html) { el.innerHTML = html; el.dataset.html = html; }
     }
-    // Discovery
+    // Discovery (half height: two lines)
     {
       const el = tileEls.discovery;
       const d = st && st.discovery;
@@ -866,41 +906,36 @@
         const r = d.last_run;
         // the last scan is history: one of a network this PC is not on any more says so
         const other = api.net.runElsewhere(r.cidr, st.netinfo && st.netinfo.internet_nic, st.net && st.net.networks);
-        html = line('<span class="num">' + (r.found || 0) + '</span><span class="muted">devices found</span>') +
-          line('<code>' + esc(r.cidr) + '</code>' + (other ? '<span class="badge grey" title="This PC is on another network now">other network</span>' : '')) +
+        html = line('<span class="num">' + (r.found || 0) + '</span><span class="muted">devices ·</span><code>' + esc(r.cidr) + '</code>' +
+          (other ? '<span class="badge grey" title="This PC is on another network now">other network</span>' : '')) +
           line(esc(relTime(r.ts, now)) + ' · ' + esc(fmtDuration(r.duration_s)), 'muted');
       } else html = line('Nothing found yet — hit Scan', 'muted');
       if (el.dataset.html !== html) { el.innerHTML = html; el.dataset.html = html; }
     }
-    // Tools: the DHCP server's state, the TFTP server's while it runs or has an error, then the other tools by name
+    // Tools (half height): the DHCP server's state with the TFTP server's badge beside it, then the tool names on one line
     {
       const el = tileEls.tools;
       const d = st && st.dhcp;
       let html;
       if (!st) html = line('Loading…', 'muted');
       else {
-        if (!d || d.available === false) html = line('<span class="strong">DHCP server</span> <span class="muted">unavailable</span>');
-        else if (d.error) html = line('<span class="strong">DHCP server</span> <span class="badge red">error</span>') + line(esc(d.error), 'muted');
+        // the TFTP server (status.tftp, its summary) only earns room while it runs or has an error: green "on", yellow
+        // "uploads on", red "error" with the error as the hover title, until the server starts again
+        const t = st.tftp;
+        const tftp = t && (t.running || t.error)
+          ? ' <span class="badge ' + (t.error ? 'red">TFTP error' : t.uploads ? 'yellow">TFTP uploads' : 'green">TFTP on') + '</span>'
+          : '';
+        if (!d || d.available === false) html = line('<span class="strong">DHCP server</span> <span class="muted">unavailable</span>' + tftp);
+        else if (d.error) html = line('<span class="strong">DHCP server</span> <span class="badge red">error</span>' + tftp, '', String(d.error));
         else if (d.running) {
           const p = d.pool || {};
           const n = d.bound || 0;
-          // two lines while it runs (the pool is the hover title), then the tool names below
-          html = line('<span class="num">' + n + '</span><span class="muted">DHCP client' + (n === 1 ? '' : 's') + '</span>' + (d.offered ? ' <span class="badge yellow">' + d.offered + ' offered</span>' : ''),
-            '', 'Pool ' + (p.start || '?') + '–' + (p.end || '?')) +
-            line('on ' + esc(d.adapter || 'adapter') + ' · since ' + esc(relTime(d.since_ts, now)), 'muted');
-        } else html = line('<span class="strong">DHCP server</span> <span class="muted">off</span>');
-        // the TFTP server (status.tftp, its summary) gets a line of its own while it runs: green "on", yellow "uploads on". Its
-        // error (a start that failed, or a network change that stopped it) is only set while it is off, so the red "error" line
-        // shows then, with the error as the hover title, until the server starts again
-        const t = st.tftp;
-        if (t && (t.running || t.error)) {
-          const badge = t.error ? '<span class="badge red">error</span>' : t.uploads ? '<span class="badge yellow">uploads on</span>' : '<span class="badge green">on</span>';
-          html += line('<span class="strong">TFTP server</span> ' + badge, '', t.error ? String(t.error) : '');
-        }
-        // two columns where the tile is wide enough (rows of four or fewer), one where it is not: the seven names take four
-        // lines instead of seven (the tile's row is 192 px at 1366 px, 219 px with the TFTP line, next to the first row's
-        // 155 px; one per line is taller)
-        html += '<div class="tile-tools">' + TOOLS_TILE_ITEMS.map((name) => line(esc(name), 'tile-tool')).join('') + '</div>';
+          html = line('<span class="num">' + n + '</span><span class="muted">DHCP client' + (n === 1 ? '' : 's') + '</span>' +
+            (d.offered ? ' <span class="badge yellow">' + d.offered + ' offered</span>' : '') + tftp,
+            '', 'Pool ' + (p.start || '?') + '–' + (p.end || '?'));
+        } else html = line('<span class="strong">DHCP server</span> <span class="muted">off</span>' + tftp);
+        // the tools by name on one ellipsized line: the half-height tile has no room for the old grid of names
+        html += line('<span class="tile-ellipsis muted" title="' + esc(TOOLS_TILE_ITEMS.join(', ')) + '">' + esc(TOOLS_TILE_ITEMS.join(' · ')) + '</span>');
       }
       if (el.dataset.html !== html) { el.innerHTML = html; el.dataset.html = html; }
     }
@@ -919,10 +954,9 @@
           let bars = '<span class="survey-bars ' + t.cls + '" aria-hidden="true">';
           for (let i = 1; i <= 4; i++) bars += '<span' + (i <= t.bars ? ' class="on"' : '') + '></span>';
           bars += '</span>';
-          html += line('<span class="strong tile-ellipsis" title="' + esc(t.name) + '">' + esc(t.name) + '</span>');
-          // the link speed of the connection sits between the signal and "connected"
-          html += line(bars + '<span class="strong">' + esc(wc.dbmText(t.rssi)) + '</span>' + (t.rate ? '<span class="strong">' + esc(wc.mbpsText(t.rate)) + '</span>' : '') +
-            '<span class="muted">' + (t.connected ? 'connected' : 'strongest') + '</span>');
+          // half height: the strongest (or connected) network, its bars and its signal share one line
+          html += line(bars + '<span class="strong tile-ellipsis" title="' + esc(t.name) + (t.connected ? ' (connected)' : '') + '">' + esc(t.name) + '</span>' +
+            '<span class="strong">' + esc(wc.dbmText(t.rssi)) + '</span>');
         } else html += line('Nothing in range right now', 'muted');
       } else if (sum.kind === 'waiting' || sum.kind === 'starting') {
         html = line(esc(sum.headline), 'muted');
@@ -944,12 +978,181 @@
       else {
         html = line('<span class="num">' + info.total + '</span><span class="muted">' + (info.total === 1 ? 'report' : 'reports') + ' ·</span><span class="muted">' +
           info.sites + (info.sites === 1 ? ' site' : ' sites') + '</span>');
-        if (info.last) html += line('<span class="strong tile-ellipsis" title="' + esc(info.last.site) + '">' + esc(info.last.site) + '</span>');
       }
+      // half height: the second line is the running scan, else the newest report's site and age
       if (job && job.status === 'running') {
         html += line('<span class="spark-icon">' + ICONS.spark + '</span> <span class="strong">Full scan</span> ' + esc(RU.jobButton(job).label));
-      } else if (info.loaded && info.last) html += line(esc(relTime(info.last.created_ts, now)), 'muted');
+      } else if (info.loaded && info.last) {
+        html += line('<span class="strong tile-ellipsis" title="' + esc(info.last.site) + '">' + esc(info.last.site) + '</span><span class="muted">' +
+          esc(relTime(info.last.created_ts, now)) + '</span>');
+      }
       if (el.dataset.html !== html) { el.innerHTML = html; el.dataset.html = html; }
+    }
+    // Packet capture (half height): the live capture's state and count, else the saved files
+    {
+      const el = tileEls.capture;
+      const c = st && st.capture;
+      let html;
+      if (!st) html = line('Loading…', 'muted');
+      else if (!c || c.available === false) html = line('<span class="strong">Packet capture</span>') + line(esc((c && c.reason) || 'Unavailable'), 'muted');
+      else if (c.running) {
+        html = line('<span class="spark-icon">' + ICONS.spark + '</span> <span class="strong">Capturing</span> <span class="muted">on</span> ' +
+          '<span class="tile-ellipsis">' + esc(c.adapter || '') + '</span>') +
+          line('<span class="num">' + (c.packets || 0) + '</span><span class="muted">packets</span>' +
+            (c.calls ? ' <span class="badge yellow">' + c.calls + ' SIP call' + (c.calls === 1 ? '' : 's') + '</span>' : ''));
+      } else {
+        const n = c.files || 0;
+        html = line('<span class="strong">Not capturing</span>') +
+          line(n ? '<span class="num">' + n + '</span><span class="muted">saved capture' + (n === 1 ? '' : 's') + '</span>' : 'Pick an adapter and start', 'muted');
+      }
+      if (el.dataset.html !== html) { el.innerHTML = html; el.dataset.html = html; }
+    }
+    // Pro AV (half height): the worst finding of the last scan, or what it found
+    {
+      const el = tileEls.proav;
+      const p = st && st.proav;
+      const WORST = { bad: ['red', 'to fix'], warn: ['yellow', 'to check'], info: ['blue', 'noted'], good: ['green', 'all good'] };
+      let html;
+      if (!st) html = line('Loading…', 'muted');
+      else if (!p || p.available === false) html = line('<span class="strong">Pro AV</span>') + line(esc((p && p.reason) || 'Unavailable'), 'muted');
+      else if (p.running) {
+        html = line('<span class="spark-icon">' + ICONS.spark + '</span> <span class="strong">Listening…</span> ' +
+          Math.round((p.pct || 0) * 100) + '%') + line('Dante, AES67 and the clock', 'muted');
+      } else if (!p.last_run_ts) {
+        html = line('<span class="strong">Not scanned</span>') + line('Find Dante, AES67 and the clock', 'muted');
+      } else {
+        const worst = WORST[p.worst] || ['grey', 'no findings'];
+        html = line('<span class="num">' + (p.devices || 0) + '</span><span class="muted">device' + ((p.devices === 1) ? '' : 's') + '</span>' +
+          (p.streams ? ' <span class="num">' + p.streams + '</span><span class="muted">stream' + (p.streams === 1 ? '' : 's') + '</span>' : '')) +
+          line('<span class="badge ' + worst[0] + '">' + worst[1] + '</span>' +
+            (p.clock ? ' <span class="tile-ellipsis muted">clock: ' + esc(p.clock) + '</span>' : ' <span class="muted">no clock heard</span>'));
+      }
+      if (el.dataset.html !== html) { el.innerHTML = html; el.dataset.html = html; }
+    }
+    // SIP (half height): the qualifier's verdict, the leg that decides it and how many calls the line carries
+    {
+      const el = tileEls.sip;
+      const s = st && st.sip;
+      const VERDICT = {
+        excellent: ['green', 'excellent'], good: ['green', 'good'], fair: ['yellow', 'fair'],
+        poor: ['red', 'poor'], bad: ['red', 'bad'], unknown: ['grey', 'not rated'],
+      };
+      let html;
+      if (!st) html = line('Loading…', 'muted');
+      else if (!s || s.available === false) html = line('<span class="strong">SIP</span>') + line(esc((s && s.reason) || 'Unavailable'), 'muted');
+      else {
+        const v = VERDICT[s.verdict] || VERDICT.unknown;
+        // the leg that decides the verdict is named, because "bad" without it sends nobody anywhere
+        const worst = ['lan', 'wan', 'sip'].filter((k) => s[k] && s[k] === s.verdict)[0];
+        const WHERE = { lan: 'the LAN leg', wan: 'the internet leg', sip: 'the trunk' };
+        // the three numbers a call is judged by, off the leg that limits it
+        const nums = [];
+        if (typeof s.mos === 'number') nums.push('<span class="num">' + s.mos.toFixed(2) + '</span><span class="muted">MOS</span>');
+        if (typeof s.avg_ms === 'number') nums.push('<span class="num">' + fmtMs(s.avg_ms) + '</span><span class="muted">ms</span>');
+        if (typeof s.jitter_ms === 'number') nums.push('<span class="num">' + fmtMs(s.jitter_ms) + '</span><span class="muted">jitter</span>');
+        html = line('<span class="badge ' + v[0] + '">' + v[1] + '</span>' +
+          (worst && s.verdict !== 'excellent' && s.verdict !== 'unknown'
+            ? ' <span class="muted">' + WHERE[worst] + '</span>' : ''));
+        html += nums.length ? line(nums.join(' ')) : '';
+        if (!nums.length) {
+          // no graded leg: the checks' verdicts, or the invitation, rather than an empty second line
+          const bits = [];
+          if (s.alg === 'alg') bits.push('<span class="badge red">SIP ALG</span>');
+          else if (s.alg === 'clean') bits.push('<span class="badge green">no ALG</span>');
+          if (s.nat === 'address-dependent') bits.push('<span class="badge red">symmetric NAT</span>');
+          html += line(bits.length ? bits.join(' ')
+            : (s.sip_host ? '<span class="tile-ellipsis muted">' + esc(s.sip_host) + '</span>' : 'Qualify the line for calls'),
+            bits.length ? '' : 'muted');
+        }
+      }
+      if (el.dataset.html !== html) { el.innerHTML = html; el.dataset.html = html; }
+    }
+  }
+
+  /** Hide the tiles of tools that are switched off, and leave the page if the open one just went. Called on
+   *  every status read: the switch can be flipped in another window, or by another TNT on the same service. */
+  function syncTools() {
+    const tiles = $('#tiles');
+    if (!tiles) return;
+    let changed = false;
+    for (const name of TOOLS) {
+      const tile = tiles.querySelector('a.tile[data-view="' + name + '"]');
+      if (!tile) continue;
+      const on = toolOn(name);
+      if (tile.hidden !== !on) { tile.hidden = !on; changed = true; }
+    }
+    if (changed) {
+      // the squares are hidden, not rebuilt: buildJumps() appends its row and registers the scroll listeners,
+      // so calling it again would leave two rows and two listeners behind
+      for (const [view, a] of Object.entries(jumps.items || {})) a.hidden = !toolOn(view);
+      syncJumps();
+    }
+    if (current.name && !toolOn(current.name)) {
+      toast(TOOL_NAMES[current.name] + ' is switched off in Settings', 'warn');
+      location.hash = '#ipinfo';
+    }
+  }
+
+  /* ===================================================== tile shortcuts */
+  /* One small square per tile, in the tile's own colour, in the header's own row between the wordmark
+     and the status pill. They ride up into view as the last tile scrolls up behind the header and sink
+     back down when the page returns to the tiles or one of them is clicked, so there is always a way
+     back to another section without scrolling up first. Built from the tiles themselves: a new tile in
+     index.html gets a shortcut for free. */
+  //: the one word under the icon where the tile's own title is two (everything else uses its first word)
+  const JUMP_NAMES = { ipinfo: 'Network', capture: 'Capture', proav: 'ProAV' };
+  const JUMP_HIDE_PX = 12;   //: they go back down once this much of the tiles is under the header again
+  const jumps = { root: null, items: {}, on: false };
+
+  function buildJumps() {
+    const root = $('#tile-jumps'), tiles = $('#tiles');
+    if (!root || !tiles) return;
+    const row = h('div', { class: 'tile-jumps-row' });
+    for (const tile of tiles.querySelectorAll('a.tile:not([hidden])')) {
+      const name = tile.dataset.view;
+      const titleEl = tile.querySelector('.tile-title'), iconHost = tile.querySelector('.tile-icon');
+      const title = titleEl ? titleEl.textContent.trim() : name;
+      const a = h('a', {
+        class: 'tile-jump', href: tile.getAttribute('href') || '#' + name, title: title,
+        data: { view: name }, style: { '--accent': ACCENT[name] || 'var(--blue)' },
+      }, iconEl(iconHost && iconHost.dataset.icon ? iconHost.dataset.icon : 'info'),
+         h('span', { class: 'tile-jump-label' }, JUMP_NAMES[name] || title.split(/\s+/)[0]));
+      jumps.items[name] = a;
+      row.appendChild(a);
+    }
+    root.appendChild(row);
+    jumps.root = root;
+    // a shortcut takes the page back to the top, where the tiles themselves are in view again
+    root.addEventListener('click', (e) => {
+      if (!e.target.closest('a.tile-jump')) return;
+      setJumps(false);
+      window.scrollTo({ top: 0 });
+    });
+    // a scroll event already arrives at most once a frame, so this reads the two edges and nothing more
+    window.addEventListener('scroll', syncJumps, { passive: true });
+    window.addEventListener('resize', syncJumps, { passive: true });
+  }
+  /** Show the squares exactly while the tiles are out of sight — their bottom edge up behind the
+   *  sticky header. A few pixels of hysteresis so a scroll that stops on the line cannot flicker. */
+  function syncJumps() {
+    if (!jumps.root) return;
+    const tiles = $('#tiles'), bar = $('#topbar');
+    if (!tiles || tiles.hidden) { setJumps(false); return; }
+    const gone = tiles.getBoundingClientRect().bottom - (bar ? bar.getBoundingClientRect().bottom : 0);
+    if (gone <= 0) setJumps(true);
+    else if (gone >= JUMP_HIDE_PX) setJumps(false);
+  }
+  function setJumps(on) {
+    if (!jumps.root || jumps.on === on) return;
+    jumps.on = on;
+    jumps.root.classList.toggle('on', on);
+  }
+  //: the shortcut of the section being shown wears the tile's own active tint
+  function markJumps(name) {
+    for (const [view, a] of Object.entries(jumps.items)) {
+      const on = view === name;
+      a.classList.toggle('active', on);
+      if (on) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
     }
   }
 
@@ -986,6 +1189,8 @@
       t.classList.toggle('active', on);
       if (on) t.setAttribute('aria-current', 'page'); else t.removeAttribute('aria-current');
     }
+    markJumps(name);
+    syncJumps();
     if (current.name === name) return;
     if (current.view && current.view.unmount) { try { current.view.unmount(); } catch (e) { console.error('unmount failed', e); } }
     view.innerHTML = '';
@@ -1003,7 +1208,8 @@
     tileNav = false;
     const hash = (location.hash || '').replace(/^#/, '').split('?')[0];
     if (hash === 'diagnostics') { showDiagnostics(); return; }
-    const name = VIEW_NAMES.includes(hash) ? hash : 'ipinfo';   // Network info is the landing page
+    // Network info is the landing page, and it is also where a tool that has been switched off sends you
+    const name = VIEW_NAMES.includes(hash) && toolOn(hash) ? hash : 'ipinfo';
     if (hash !== name) { history.replaceState(null, '', '#' + name); }
     showView(name, fromTile);
   }
@@ -1013,6 +1219,8 @@
   function showDiagnostics() {
     $('#tiles').hidden = true; $('#view').hidden = true; $('#diagnostics').hidden = false;
     for (const t of $('#tiles').querySelectorAll('.tile')) t.classList.remove('active');
+    markJumps(null);
+    setJumps(false);   // no tiles on this page, so nothing to jump back to
     if (current.view && current.view.unmount) { try { current.view.unmount(); } catch (e) { console.error(e); } }
     current = { name: 'diagnostics', view: null };
     state.view = 'diagnostics';
@@ -1100,10 +1308,20 @@
 
   /* ============================================================ settings */
   function settingRow(title, sub, control) {
-    return h('div', { class: 'setting' }, h('div', { class: 'desc' }, h('span', { class: 't' }, title), sub ? h('span', { class: 's' }, sub) : null), control);
+    return h('div', { class: 'setting' }, h('div', { class: 'desc' }, h('span', { class: 't' }, title), sub ? h('span', { class: 's' }, sub) : null),
+      h('div', { class: 'setting-control' }, control));
   }
   function group(title, children) {
     return h('div', { class: 'setting-group' }, h('h3', null, title), children);
+  }
+  /** A section of settings that belong to one main tile: the tile's own accent, icon and name, so there is
+   *  never a question which page a setting is about. The accent is set on the section, so every toggle and
+   *  button inside it picks the tile's colour up from --accent rather than naming a colour of its own. */
+  function tileGroup(view, title, children) {
+    const box = h('div', { class: 'setting-group tile-group', style: { '--accent': ACCENT[view] || 'var(--blue)' } },
+      h('h3', null, h('span', { class: 'tg-icon' }, iconEl(TILE_ICONS[view] || 'info')), title), children);
+    box.dataset.view = view;
+    return box;
   }
   async function saveSettings(patch, okText) {
     try {
@@ -1121,57 +1339,54 @@
     const st = state.status || {};
     const body = h('div', { class: 'modal-body' });
 
-    // Monitoring
-    const loadedT = toggle({ checked: !!(s.ping && s.ping.loaded), on: 'Loaded', off: 'Unloaded', accent: 'var(--green)',
-      onChange: (v, input) => saveSettings({ ping: { loaded: v } }, v ? 'Pings are now loaded (' + (s.ping.loaded_bytes || 1200) + ' B)' : 'Pings are now unloaded (' + (s.ping.unloaded_bytes || 32) + ' B)').then((ok) => { if (!ok) input.checked = !v; }) });
-    const pausedT = toggle({ checked: !st.paused, on: 'Running', off: 'Paused', accent: 'var(--green)',
+    /* ---- Tools: what this site actually uses. First, because everything under it is a setting for something
+       that may not be switched on at all. A tool that is off has no tile, no page and no automated action. */
+    const toolRows = TOOLS.map((name) => {
+      const on = toolOn(name);
+      const t = toggle({ checked: on, on: 'On', off: 'Off', accent: ACCENT[name] || 'var(--blue)',
+        onChange: (v, input) => saveSettings({ tools: { [name]: v } },
+          TOOL_NAMES[name] + (v ? ' is on' : ' is off')).then((ok) => {
+            if (!ok) { input.checked = !v; return; }
+            if (state.status) state.status.tools = Object.assign({}, state.status.tools || {}, { [name]: v });
+            syncTools();
+            refreshStatus();
+          }) });
+      t.input.setAttribute('aria-label', TOOL_NAMES[name]);
+      return h('div', { class: 'setting tool-row', style: { '--accent': ACCENT[name] || 'var(--blue)' } },
+        h('div', { class: 'desc' },
+          h('span', { class: 't' }, h('span', { class: 'tg-icon' }, iconEl(TILE_ICONS[name] || 'info')), TOOL_NAMES[name]),
+          h('span', { class: 's' }, TOOL_WHAT[name])),
+        h('div', { class: 'setting-control' }, t));
+    });
+    body.appendChild(group('Tools', [
+      h('p', { class: 'muted small set-intro' },
+        'Switch off what this site never uses. A tool that is off has no tile and no page, and its background '
+        + 'work stops too — no scheduled speed tests, no section for it in a Full Scan.'),
+      ...toolRows,
+    ]));
+
+    /* ---- App-wide, above the per-tile sections. */
+    const themeT = toggle({ checked: state.theme === 'dark', on: 'Dark', off: 'Light', onChange: (v) => setTheme(v ? 'dark' : 'light') });
+    themeT.id = 'settings-theme-toggle';
+    const pausedT = toggle({ checked: !st.paused, on: 'Running', off: 'Paused',
       onChange: async (v, input) => {
         try { await (v ? api.resume() : api.pause()); toast(v ? 'Monitoring resumed' : 'Monitoring paused', v ? 'ok' : 'warn'); refreshStatus(); }
         catch (err) { toast(err.message, 'error'); input.checked = !v; }
       } });
-    body.appendChild(group('Monitoring', [
-      settingRow('Ping payload', 'Loaded sends ' + (s.ping && s.ping.loaded_bytes || 1200) + '-byte pings (stresses the link a little); unloaded sends ' + (s.ping && s.ping.unloaded_bytes || 32) + ' bytes.', loadedT),
-      settingRow('Monitoring', 'Pause all pinging. Outages are not detected while paused.', pausedT),
-    ]));
-
-    // Appearance
-    const themeT = toggle({ checked: state.theme === 'dark', on: 'Dark', off: 'Light', accent: 'var(--purple)', onChange: (v) => setTheme(v ? 'dark' : 'light') });
-    themeT.id = 'settings-theme-toggle';
-    // IPv6 is hidden by default: the Network info page only shows it when this is on
-    const ipv6T = toggle({ checked: !!(s.ui && s.ui.show_ipv6), on: 'Shown', off: 'Hidden', accent: 'var(--purple)',
-      onChange: (v, input) => saveSettings({ ui: { show_ipv6: v } }, v ? 'IPv6 addresses are shown' : 'IPv6 addresses are hidden').then((ok) => { if (!ok) input.checked = !v; }) });
-    ipv6T.input.setAttribute('aria-label', 'Show IPv6 addresses');
-    body.appendChild(group('Appearance', [
+    body.appendChild(group('General', [
       settingRow('Theme', 'Remembered on this PC and in the service settings.', themeT),
-      settingRow('IPv6 addresses', 'Show IPv6 addresses and subnets on the Network info page, and IPv6 addresses in DNS lookups on the Tools page.', ipv6T),
-    ]));
-
-    // IP location (DB-IP Lite): on by default; the service downloads the data
-    const geoOn = !(s.geoip && s.geoip.enabled === false);
-    const geoT = toggle({ checked: geoOn, on: 'On', off: 'Off', accent: 'var(--blue)',
-      onChange: (v, input) => saveSettings({ geoip: { enabled: v } }, v ? 'IP location on' : 'IP location off').then((ok) => { if (!ok) input.checked = !v; }) });
-    geoT.input.setAttribute('aria-label', 'Show IP location and ISP');
-    const geoRetry = h('button', { class: 'btn', id: 'settings-geoip-retry', type: 'button', hidden: !geoipRetryVisible() }, 'Retry now');
-    geoRetry.addEventListener('click', () => {
-      geoRetry.disabled = true;
-      api.geoipCheck().then(() => renderSettingsGeoip(), () => toast('Could not start the IP location check', 'error'))
-        .then(() => { geoRetry.disabled = false; });
-    });
-    body.appendChild(group('IP location', [
-      settingRow('Location and ISP', 'Shows the internet provider and city of the public address on Network info and a Location column in Traceroute. The service downloads DB-IP’s free IP location data (CC BY 4.0): about 65 MB a month, about 140 MB on disk. Addresses are looked up on this PC only.', geoT),
-      h('div', { class: 'geo-status' }, h('span', { id: 'settings-geoip', role: 'status' }, geoipStatusText()), geoRetry, geoAttribution(), geoLicence()),
+      settingRow('Monitoring', 'Pause all pinging. Outages are not detected while paused.', pausedT),
     ]));
 
     // Updates (GitHub releases): check, notify and self-install; the download is verified (SHA-256) before it runs
     const up = s.update || {};
-    const upOn = up.enabled !== false;
-    const upT = toggle({ checked: upOn, on: 'On', off: 'Off', accent: 'var(--green)',
+    const upT = toggle({ checked: up.enabled !== false, on: 'On', off: 'Off',
       onChange: (v, input) => saveSettings({ update: { enabled: v } }, v ? 'Update checks on' : 'Update checks off').then((ok) => { if (!ok) input.checked = !v; }) });
     upT.input.setAttribute('aria-label', 'Check for updates');
-    const upAutoT = toggle({ checked: up.auto_install === true, on: 'Auto', off: 'Ask', accent: 'var(--green)',
+    const upAutoT = toggle({ checked: up.auto_install === true, on: 'Auto', off: 'Ask',
       onChange: (v, input) => saveSettings({ update: { auto_install: v } }, v ? 'Updates install automatically' : 'Updates ask before installing').then((ok) => { if (!ok) input.checked = !v; }) });
     upAutoT.input.setAttribute('aria-label', 'Install updates automatically');
-    const upEvery = h('input', { class: 'input', type: 'number', min: '1', max: '168', step: '1', value: String(up.check_interval_h || 24), style: { width: '120px' }, 'aria-label': 'Check interval in hours' });
+    const upEvery = h('input', { class: 'input', type: 'number', min: '1', max: '168', step: '1', value: String(up.check_interval_h || 24), 'aria-label': 'Check interval in hours' });
     upEvery.addEventListener('change', () => {
       const v = Math.max(1, Math.min(168, parseInt(upEvery.value, 10) || 24));
       upEvery.value = String(v);
@@ -1189,78 +1404,97 @@
     body.appendChild(group('Updates', [
       settingRow('Check for updates', 'Watches this project’s GitHub releases page. When a newer release is out, a banner offers to install it. The installer is verified against the release’s SHA-256 checksum before it runs.', upT),
       settingRow('When an update is found', 'Ask (show the banner and wait for you) or install automatically at the next check.', upAutoT),
-      settingRow('Check every', 'Hours between checks (1–168).', h('div', { class: 'row' }, upEvery, h('span', { class: 'muted small' }, 'h'))),
+      settingRow('Check every', 'Hours between checks (1–168).', h('div', { class: 'row inline-unit' }, upEvery, h('span', { class: 'muted small' }, 'h'))),
       settingRow('Channel', 'Stable releases only, or include pre-releases for early builds.', upChannel),
       h('div', { class: 'geo-status' }, h('span', { id: 'settings-update', role: 'status' }, updateSettingsText(updateState(), state.now)), upCheck),
     ]));
 
-    // Speed tests
-    const sp = s.speedtest || {};
-    const enabledT = toggle({ checked: sp.enabled !== false, on: 'On', off: 'Off', accent: 'var(--purple)',
-      onChange: (v, input) => saveSettings({ speedtest: { enabled: v } }, v ? 'Automatic speed tests on' : 'Automatic speed tests off').then((ok) => { if (!ok) input.checked = !v; }) });
-    const interval = h('input', { class: 'input', type: 'number', min: '1', max: '1440', step: '1', value: String(sp.interval_min || 15), style: { width: '120px' }, 'aria-label': 'Speed test interval in minutes' });
-    interval.addEventListener('change', () => {
-      const v = Math.max(1, Math.min(1440, parseInt(interval.value, 10) || 15));
-      interval.value = String(v);
-      saveSettings({ speedtest: { interval_min: v } }, 'Speed tests every ' + v + ' min');
+    /* ---- One section per tile, in the tile's own colour, for the settings that belong to that page. */
+
+    // Network info (blue): what its page shows, and the IP location data behind its WAN chip and Traceroute
+    const ipv6T = toggle({ checked: !!(s.ui && s.ui.show_ipv6), on: 'Shown', off: 'Hidden',
+      onChange: (v, input) => saveSettings({ ui: { show_ipv6: v } }, v ? 'IPv6 addresses are shown' : 'IPv6 addresses are hidden').then((ok) => { if (!ok) input.checked = !v; }) });
+    ipv6T.input.setAttribute('aria-label', 'Show IPv6 addresses');
+    const geoT = toggle({ checked: !(s.geoip && s.geoip.enabled === false), on: 'On', off: 'Off',
+      onChange: (v, input) => saveSettings({ geoip: { enabled: v } }, v ? 'IP location on' : 'IP location off').then((ok) => { if (!ok) input.checked = !v; }) });
+    geoT.input.setAttribute('aria-label', 'Show IP location and ISP');
+    const geoRetry = h('button', { class: 'btn', id: 'settings-geoip-retry', type: 'button', hidden: !geoipRetryVisible() }, 'Retry now');
+    geoRetry.addEventListener('click', () => {
+      geoRetry.disabled = true;
+      api.geoipCheck().then(() => renderSettingsGeoip(), () => toast('Could not start the IP location check', 'error'))
+        .then(() => { geoRetry.disabled = false; });
     });
-    const backend = h('select', { class: 'input', 'aria-label': 'Speed test backend' },
-      [['auto', 'Auto (Cloudflare, else fast.com)'], ['cloudflare', 'Cloudflare'], ['fastcom', 'fast.com']].map(([v, l]) => h('option', { value: v, selected: (sp.backend || 'auto') === v }, l)));
-    backend.addEventListener('change', () => saveSettings({ speedtest: { backend: backend.value } }, 'Backend: ' + backend.options[backend.selectedIndex].text));
-    body.appendChild(group('Speed tests', [
-      settingRow('Automatic tests', 'Runs in the background even when this window is closed.', enabledT),
-      settingRow('Interval', 'Minutes between tests (1–1440).', h('div', { class: 'row' }, interval, h('span', { class: 'muted small' }, 'min'))),
-      settingRow('Backend', 'Both are built in. If one refuses a test (rate limit), the other runs instead.', backend),
+    body.appendChild(tileGroup('ipinfo', 'Network info', [
+      settingRow('IPv6 addresses', 'Show IPv6 addresses and subnets on the Network info page, and IPv6 addresses in DNS lookups on the Tools page.', ipv6T),
+      settingRow('Location and ISP', 'Shows the internet provider and city of the public address on Network info and a Location column in Traceroute. The service downloads DB-IP’s free IP location data (CC BY 4.0): about 65 MB a month, about 140 MB on disk. Addresses are looked up on this PC only.', geoT),
+      h('div', { class: 'geo-status' }, h('span', { id: 'settings-geoip', role: 'status' }, geoipStatusText()), geoRetry, geoAttribution(), geoLicence()),
     ]));
 
-    // Default targets
+    // Ping (green): how it pings, and what Load Default Tiles resets to
+    const loadedT = toggle({ checked: !!(s.ping && s.ping.loaded), on: 'Loaded', off: 'Unloaded',
+      onChange: (v, input) => saveSettings({ ping: { loaded: v } }, v ? 'Pings are now loaded (' + (s.ping.loaded_bytes || 1200) + ' B)' : 'Pings are now unloaded (' + (s.ping.unloaded_bytes || 32) + ' B)').then((ok) => { if (!ok) input.checked = !v; }) });
     // the gateway chip names the address the gateway tile pings right now (renderSettingsGateway keeps it current)
     const chips = h('div', { class: 'chips' }, h('span', { class: 'badge blue', id: 'settings-gateway', style: { '--accent': 'var(--blue)' } }, gatewayChipText()),
       copyCode('1.1.1.1'), copyCode('totalelectronics.com'));
-    body.appendChild(group('Default targets', [
-      settingRow('Load Default Tiles resets the tiles to these', 'Other tiles are removed (after a confirmation); their history stays in the database.', null),
+    body.appendChild(tileGroup('ping', 'Ping', [
+      settingRow('Ping payload', 'Loaded sends ' + (s.ping && s.ping.loaded_bytes || 1200) + '-byte pings (stresses the link a little); unloaded sends ' + (s.ping && s.ping.unloaded_bytes || 32) + ' bytes.', loadedT),
+      settingRow('Default targets', 'Load Default Tiles on the Ping page resets the tiles to these. Other tiles are removed (after a confirmation); their history stays in the database.', null),
       chips,
     ]));
 
-    // Export
-    const range = h('select', { class: 'input', 'aria-label': 'Report range' },
-      [['daily', 'Daily (last 24 h)'], ['weekly', 'Weekly (7 days)'], ['monthly', 'Monthly (30 days)'], ['yearly', 'Yearly (365 days)'], ['custom', 'Custom…']].map(([v, l]) => h('option', { value: v }, l)));
-    const toLocalInput = (ts) => { const d = new Date(ts * 1000); return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) + 'T' + pad2(d.getHours()) + ':' + pad2(d.getMinutes()); };
-    const from = h('input', { class: 'input', type: 'datetime-local', value: toLocalInput(nowS() - 7 * 86400), 'aria-label': 'From' });
-    const to = h('input', { class: 'input', type: 'datetime-local', value: toLocalInput(nowS()), 'aria-label': 'To' });
-    const customRow = h('div', { class: 'form-row', hidden: true }, h('div', { class: 'field' }, h('label', null, 'From'), from), h('div', { class: 'field' }, h('label', null, 'To'), to));
-    range.addEventListener('change', () => { customRow.hidden = range.value !== 'custom'; });
-    const exportBtn = h('button', { class: 'btn btn-primary', type: 'button', style: { '--accent': 'var(--red)' } }, iconEl('download'), 'Export PDF');
-    exportBtn.addEventListener('click', async () => {
-      let f = null, t = null;
-      if (range.value === 'custom') {
-        f = new Date(from.value).getTime() / 1000; t = new Date(to.value).getTime() / 1000;
-        if (!isFinite(f) || !isFinite(t) || t <= f) { toast('Pick a valid custom range (To must be after From)', 'warn'); return; }
-      }
-      busy(exportBtn, true, 'Building report…');
-      try {
-        const r = await api.exportPdf(range.value, f, t);
-        await saveBlob(r.blob, r.filename || 'TNT-report.pdf');
-      } catch (err) { toast('Export failed: ' + err.message, 'error'); }
-      finally { busy(exportBtn, false); }
-    });
-    body.appendChild(group('Export PDF report', [
-      h('div', { class: 'form-row' }, h('div', { class: 'field' }, h('label', null, 'Range'), range), exportBtn),
-      customRow,
-    ]));
+    // Speed (purple): only while the tool is on — its settings are meaningless when nothing runs
+    if (toolOn('speed')) {
+      const sp = s.speedtest || {};
+      const enabledT = toggle({ checked: sp.enabled !== false, on: 'On', off: 'Off',
+        onChange: (v, input) => saveSettings({ speedtest: { enabled: v } }, v ? 'Automatic speed tests on' : 'Automatic speed tests off').then((ok) => { if (!ok) input.checked = !v; }) });
+      enabledT.input.setAttribute('aria-label', 'Automatic speed tests');
+      const interval = h('input', { class: 'input', type: 'number', min: '1', max: '1440', step: '1', value: String(sp.interval_min || 15), 'aria-label': 'Speed test interval in minutes' });
+      interval.addEventListener('change', () => {
+        const v = Math.max(1, Math.min(1440, parseInt(interval.value, 10) || 15));
+        interval.value = String(v);
+        saveSettings({ speedtest: { interval_min: v } }, 'Speed tests every ' + v + ' min');
+      });
+      const backend = h('select', { class: 'input', 'aria-label': 'Speed test backend' },
+        [['auto', 'Auto (Cloudflare, else fast.com)'], ['cloudflare', 'Cloudflare'], ['fastcom', 'fast.com']].map(([v, l]) => h('option', { value: v, selected: (sp.backend || 'auto') === v }, l)));
+      backend.addEventListener('change', () => saveSettings({ speedtest: { backend: backend.value } }, 'Backend: ' + backend.options[backend.selectedIndex].text));
+      body.appendChild(tileGroup('speed', 'Speed', [
+        settingRow('Automatic tests', 'Runs in the background even when this window is closed.', enabledT),
+        settingRow('Interval', 'Minutes between tests (1–1440).', h('div', { class: 'row inline-unit' }, interval, h('span', { class: 'muted small' }, 'min'))),
+        settingRow('Backend', 'Both are built in. If one refuses a test (rate limit), the other runs instead.', backend),
+      ]));
+    }
 
-    // Service
+    // SIP (sand): the host every part of that page defaults to
+    if (toolOn('sip')) {
+      const sip = s.sip || {};
+      const sipHost = h('input', { class: 'input', type: 'text', value: String(sip.host || ''), placeholder: 'pbx.example.net', 'aria-label': 'SIP host' });
+      sipHost.addEventListener('change', () => saveSettings({ sip: { host: sipHost.value.trim() } },
+        sipHost.value.trim() ? 'SIP host: ' + sipHost.value.trim() : 'SIP host cleared'));
+      const sipPort = h('input', { class: 'input', type: 'number', min: '1', max: '65535', step: '1', value: String(sip.port || 5060), 'aria-label': 'SIP port' });
+      sipPort.addEventListener('change', () => {
+        const v = Math.max(1, Math.min(65535, parseInt(sipPort.value, 10) || 5060));
+        sipPort.value = String(v);
+        saveSettings({ sip: { port: v } }, 'SIP port ' + v);
+      });
+      body.appendChild(tileGroup('sip', 'SIP', [
+        settingRow('Your SIP host', 'The PBX, SBC or registrar this site registers to. Named, it is graded as its own leg in the qualifier and is what the ALG check probes.', sipHost),
+        settingRow('SIP port', 'The port that host answers SIP on (5060 unless somebody moved it).', sipPort),
+      ]));
+    }
+
+    /* ---- Service, last. */
     const diagBtn = h('button', { class: 'btn', type: 'button' }, iconEl('info'), 'Diagnostics');
+    const repoLink = h('a', { class: 'btn', href: TNT_REPO_URL, rel: 'noreferrer' }, iconEl('spark'), 'TNT on GitHub');
+    repoLink.addEventListener('click', (e) => openExternal(e, TNT_REPO_URL));
     const svcInfo = h('div', { class: 'kv' },
       h('span', { class: 'k' }, 'Version'), h('span', { class: 'v' }, copyCode(st.version || '—')),
       h('span', { class: 'k' }, 'Uptime'), h('span', { class: 'v' }, st.uptime_s != null ? fmtDuration(st.uptime_s) + ' (' + (st.mode || '') + ')' : '—'),
       h('span', { class: 'k' }, 'API'), h('span', { class: 'v' }, copyCode(location.origin)));
-    body.appendChild(group('Service', [svcInfo, h('div', { class: 'row' }, diagBtn)]));
+    body.appendChild(group('Service', [svcInfo, h('div', { class: 'row' }, repoLink), h('div', { class: 'row' }, diagBtn)]));
 
     const m = modal({ title: 'Settings', body });
     diagBtn.addEventListener('click', () => { m.close(); location.hash = '#diagnostics'; });
   }
-
   function blobToBase64(blob) {
     return new Promise((resolve, reject) => {
       const fr = new FileReader();
@@ -1316,20 +1550,6 @@
     reportsInfoTimer = setTimeout(() => { reportsInfoTimer = null; loadReportsInfo(); }, 300);
   }
 
-  function renderFullScanButton() {
-    const btn = $('#btn-full-scan');
-    if (!btn) return;
-    const b = RU.jobButton(fullScan.job);
-    const label = $('#full-scan-label');
-    if (label.textContent !== b.label) label.textContent = b.label;
-    btn.classList.toggle('running', b.running);
-    btn.style.setProperty('--pct', b.pct + '%');
-    if (btn.title !== b.title) btn.title = b.title;
-    const aria = b.running ? 'Full scan running: ' + b.phase + '. Open Reports' : null;
-    if (!aria) btn.removeAttribute('aria-label');
-    else if (btn.getAttribute('aria-label') !== aria) btn.setAttribute('aria-label', aria);
-  }
-
   /** The job a status snapshot carries (status.reports.job): without the event stream it is how this page hears of a scan started
    *  from another window, in time to run its Wi-Fi part. Only a job the controller does not follow yet, or the end of the one it
    *  follows, is taken: a snapshot can be older than the progress events already applied. */
@@ -1340,7 +1560,6 @@
   }
 
   function onFullScanJob(job, prev) {
-    renderFullScanButton();
     renderTiles();
     // the name modal's pre-filled site follows a suggestion that arrives late or changes, until the user types
     if (siteModal && job) siteModal.sync(job);
@@ -1493,7 +1712,8 @@
   }
 
   /* ========================================================= quick tools */
-  // The top bar's IP Release/Renew and Flush DNS run their tool on the service with one click. While it runs the button is
+  // The Quick Tools row at the top of the Tools page (views/tools.js builds the buttons with these ids and calls
+  // TNT.app.quickRun) holds IP Release/Renew and Flush DNS. They run their tool on the service with one click. While it runs the button is
   // disabled and says so ("Renewing…"); then its background flashes green (done) or red (failed or refused, with a toast:
   // api.quick.outcome). A release/renew changes this PC's addresses: the status and the open view's netChanged hook run as
   // soon as it answers, not after the settle delay of a net.changed event (the one the service publishes still comes).
@@ -1537,20 +1757,32 @@
     st.timer = setTimeout(() => { st.timer = null; btn.classList.remove('flash-ok', 'flash-bad'); }, QUICK_FLASH_MS);
   }
 
+  /** The Quick Tools row was just mounted (or re-mounted): show a tool that is still running as busy again. The row only
+   *  exists while the Tools page is open, so a run started before leaving it finds a fresh button when it comes back. */
+  function quickSync() {
+    for (const tool of Object.keys(QUICK_TOOLS)) {
+      const btn = $('#' + QUICK_TOOLS[tool].id);
+      if (btn && quickState[tool].busy) quickBusy(btn, tool, true);
+    }
+  }
+
   /** Runs a quick tool ('renew' | 'flush'); a click while it runs is ignored. */
   async function quickRun(tool) {
     const q = QUICK_TOOLS[tool], st = quickState[tool];
-    const btn = q ? $('#' + q.id) : null;
-    if (!btn || st.busy) return;
+    const started = q ? $('#' + q.id) : null;
+    if (!started || st.busy) return;
     st.busy = true;
-    if (btn.dataset.idleTitle === undefined) btn.dataset.idleTitle = btn.title;
-    const hadFocus = document.activeElement === btn;
-    quickBusy(btn, tool, true);
+    if (started.dataset.idleTitle === undefined) started.dataset.idleTitle = started.title;
+    const hadFocus = document.activeElement === started;
+    quickBusy(started, tool, true);
     if (tool === 'renew') quietPauseUntil = Infinity;
     let result = null, error = null;
     try { result = await q.run(); } catch (err) { error = err; }
     st.busy = false;
     if (tool === 'renew') quietPauseUntil = Date.now() + RENEW_QUIET_MS;
+    // the Tools page may have been left and opened again while the tool ran: finish on the button that is on the page now
+    const btn = $('#' + q.id) || started;
+    if (btn.dataset.idleTitle === undefined) btn.dataset.idleTitle = btn.title;
     quickBusy(btn, tool, false);
     if (hadFocus && document.activeElement === document.body) { try { btn.focus(); } catch (e) { /* ignore */ } }
     const o = api.quick.outcome(tool, result, error);
@@ -1630,6 +1862,25 @@
     ev.on('dhcp.state', (d) => { if (state.status && d) { state.status.dhcp = Object.assign({}, state.status.dhcp || {}, d); renderTiles(); } });
     // TFTP server (Tools tile): tftp.state carries its summary (running, uploads, error), merged the same way
     ev.on('tftp.state', (d) => { if (state.status && d) { state.status.tftp = Object.assign({}, state.status.tftp || {}, d); renderTiles(); } });
+    // the Pro AV scan: the tile follows the job, and the open page is handed the same event
+    // a speed test finishing changes the SIP page's capacity figure and its call-quality lines
+    ev.on('speedtest.done', () => {
+      const view = TNT.views.sip;
+      if (current.name === 'sip' && view && view.onEvent) { try { view.onEvent('speedtest.done'); } catch (e) { console.error(e); } }
+    });
+    for (const name of ['proav.state', 'proav.progress']) {
+      ev.on(name, (d) => {
+        const job = d && d.job;
+        if (state.status && job) {
+          state.status.proav = Object.assign({}, state.status.proav || {}, {
+            running: job.state === 'scanning', pct: job.pct,
+          });
+          renderTiles();
+        }
+        const view = TNT.views.proav;
+        if (current.name === 'proav' && view && view.onEvent) { try { view.onEvent(name, d); } catch (e) { console.error(e); } }
+      });
+    }
     // IP location: geoip.state is STATUS (the service adds its bus ts to every SSE payload; the development server does not)
     ev.on('geoip.state', (d) => { if (state.status && d) { const { ts, ...st } = d; state.status.geoip = Object.assign({}, state.status.geoip || {}, st); renderSettingsGeoip(); notifyView(); } });
     // auto-update: update.state is STATUS (the service adds its bus ts; the development server does not)
@@ -1659,13 +1910,13 @@
     $('#btn-settings').appendChild(iconEl('gear'));
     for (const el of document.querySelectorAll('[data-icon]')) { el.appendChild(iconEl(el.dataset.icon)); }
     for (const name of VIEW_NAMES) tileEls[name] = $('#tile-' + name);
+    // index.html already carries `half` (so there is no flash of full-height tiles before this runs); setting it
+    // again from HALF_TILES keeps the markup and the list that renderTiles reasons about from drifting apart
+    for (const name of HALF_TILES) { const tile = $('a.tile[data-view="' + name + '"]'); if (tile) tile.classList.add('half'); }
+    buildJumps();   // after the tiles carry their final classes: the strip is built from them
 
     $('#btn-settings').addEventListener('click', openSettings);
-    $('#btn-full-scan').addEventListener('click', fullScanClick);
-    $('#btn-ip-renew').addEventListener('click', () => quickRun('renew'));
-    $('#btn-flush-dns').addEventListener('click', () => quickRun('flush'));
     fullScan.subscribe(onFullScanJob);
-    renderFullScanButton();
     $('#diag-refresh').addEventListener('click', loadDiagnostics);
     $('#diag-copy').addEventListener('click', () => copyText(diagText || 'No diagnostics loaded'));
     $('#diag-back').addEventListener('click', () => { location.hash = '#ipinfo'; });
@@ -1705,6 +1956,7 @@
   }
 
   TNT.app = { state, refreshStatus, loadSettings, showView, openSettings, showDiagnostics, setTheme, saveBlob, overallText, setTargets, quickRun,
+    quickSync, QUICK_TOOL_IDS: { renew: QUICK_TOOLS.renew.id, flush: QUICK_TOOLS.flush.id },
     fullScan, fullScanClick, openSiteModal, nameFullScan, loadReportsInfo: scheduleReportsInfo, siteModalOpen: () => !!siteModal };
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot); else boot();
 })();

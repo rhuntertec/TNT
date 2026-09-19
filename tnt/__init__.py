@@ -5,7 +5,7 @@ the tray/UI client lives in the sibling ``client`` package and talks to this
 package only over the local HTTP API.
 """
 
-__version__ = "1.16.0"
+__version__ = "1.20.0"
 APP_NAME = "TNT"
 APP_LONG_NAME = "TNT - TEC Network Tool"
 SERVICE_NAME = "TNTService"

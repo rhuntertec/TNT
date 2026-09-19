@@ -80,11 +80,22 @@ class FakePing:
         self._next += 1
         v = _view(tid, host, light="grey" if self.paused else "green")
         v["label"] = label
+        v["name"] = None
         self.views[tid] = v
         return dict(v)
 
     def remove_target(self, tid: int) -> bool:
         return self.views.pop(tid, None) is not None
+
+    def set_target_name(self, tid: Any, name: Optional[str]) -> Optional[Dict[str, Any]]:
+        try:
+            v = self.views.get(int(tid))
+        except (TypeError, ValueError):
+            v = None
+        if v is None:
+            return None
+        v["name"] = (str(name).strip()[:80] if name is not None else "") or None
+        return dict(v)
 
     def load_defaults(self) -> List[Dict[str, Any]]:
         self.add_target("10.0.0.251")
@@ -698,6 +709,34 @@ def test_body_too_large_is_rejected(server):
         conn.close()
 
 
+
+def test_throughput_route_needs_the_monitor_then_hands_over_its_view(server, engine):
+    """The fake engine has no ``throughput``: 503 until one is attached.  Once it is, the route is
+    a straight pass-through - the window is clamped by the monitor, not by the router, so there is
+    one definition of "which windows exist" rather than two that can drift."""
+    from tnt import throughput as tp_mod
+
+    status, data = call_json(server, "GET", "/api/throughput")
+    assert status == 503 and data["error"]["code"] == "unavailable"
+
+    asked: List[Any] = []
+
+    class FakeMonitor:
+        def view(self, window_s: Any = None) -> Dict[str, Any]:
+            asked.append(window_s)
+            return {"ts": 1.0, "window_s": tp_mod.clamp_window(window_s), "step_s": 1,
+                    "history_s": tp_mod.HISTORY_S, "windows": list(tp_mod.WINDOWS), "nics": [], "note": None}
+
+    engine.throughput = FakeMonitor()
+    status, data = call_json(server, "GET", "/api/throughput")
+    assert status == 200 and set(data) == set(tp_mod.VIEW_KEYS) and asked == [None]
+    status, data = call_json(server, "GET", "/api/throughput?window_s=1800")
+    assert status == 200 and data["window_s"] == 1800 and asked[-1] == "1800"
+    # a stale page's window is answered rather than refused: the card's whole job is to draw a line
+    status, data = call_json(server, "GET", "/api/throughput?window_s=nonsense")
+    assert status == 200 and data["window_s"] == tp_mod.DEFAULT_WINDOW_S
+
+
 def test_reports_routes_need_the_report_manager(server):
     """The fake engine has no ``reports``: every /api/reports route is 503 and /api/status carries null.
     Only the Full Scan's Wi-Fi post may exceed the 1 MB body cap (tests/test_reports.py sends one)."""
@@ -923,6 +962,25 @@ def test_targets_post_delete_defaults_samples(server, engine):
 
     status, lst = call_json(server, "POST", "/api/targets/defaults")
     assert status == 200 and sorted(t["host"] for t in lst) == ["1.1.1.1", "10.0.0.251"]
+
+
+def test_target_rename_route(server, engine):
+    status, view = call_json(server, "POST", "/api/targets", {"host": "8.8.8.8", "label": "Google"})
+    tid = view["id"]
+    assert view["name"] is None
+    status, view = call_json(server, "PATCH", f"/api/targets/{tid}", {"name": "  Google DNS  "})
+    assert status == 200 and view["name"] == "Google DNS" and view["label"] == "Google" and view["id"] == tid
+    status, lst = call_json(server, "GET", "/api/targets")
+    assert [t["name"] for t in lst] == ["Google DNS"]
+    # null or blank clears the custom name (reverts to the label/host)
+    for blank in (None, "   "):
+        status, view = call_json(server, "PATCH", f"/api/targets/{tid}", {"name": blank})
+        assert status == 200 and view["name"] is None, blank
+    status, data = call_json(server, "PATCH", "/api/targets/999999", {"name": "x"})
+    assert status == 404 and data["error"]["code"] == "not_found"
+    engine.ping = None
+    status, data = call_json(server, "PATCH", f"/api/targets/{tid}", {"name": "x"})
+    assert status == 503 and data["error"]["code"] == "unavailable"
 
 
 def test_target_history_uses_db(server, engine):
@@ -1780,10 +1838,23 @@ PORT_RESULT = {**dict.fromkeys(tnt_portcheck.PORTCHECK_RESULT_KEYS), "ts": T0, "
 CAPTURE_NAME = "TNT-capture-20260101-120000.pcapng"
 CAPTURE_BYTES = b"\x0a\x0d\x0d\x0a" + bytes(24)
 CAPTURE_FILE = {"name": CAPTURE_NAME, "size": 4096, "created_ts": T0, "packets": 12}
-CAPTURE_JOB = {**dict.fromkeys(tnt_capture.CAPTURE_JOB_KEYS), "id": 1, "state": "capturing",
-               "adapter": dict(SWITCH_ADAPTER, type_name="Ethernet", wifi=False),
-               "filters": {"host": None, "port": None, "protocol": None}, "full_packets": True, "seconds": 60,
-               "size_mb": 128, "started_ts": T0, "elapsed_s": 0.0, "ts": T0}
+CAPTURE_ADAPTER = {**dict.fromkeys(tnt_capture.CAPTURE_ADAPTER_KEYS), **SWITCH_ADAPTER,
+                   "type_name": "Ethernet", "wifi": False}
+CAPTURE_LIMITS = {**dict.fromkeys(tnt_capture.LIMIT_KEYS), "max_rows": tnt_capture.MAX_ROWS,
+                  "max_packets": tnt_capture.MAX_PACKETS, "seconds": list(tnt_capture.CAPTURE_SECONDS),
+                  "sizes_mb": list(tnt_capture.CAPTURE_SIZES_MB), "default_seconds": tnt_capture.DEFAULT_SECONDS,
+                  "default_mb": tnt_capture.DEFAULT_MB}
+CAPTURE_SESSION = {**dict.fromkeys(tnt_capture.SESSION_KEYS), "id": 1, "state": "capturing", "source": "live",
+                   "adapter": CAPTURE_ADAPTER, "file": None, "saved": False, "started_ts": T0, "first_ts": None,
+                   "elapsed_s": 0.0, "packets": 0, "shown": 0, "bytes": 0, "dropped": 0, "truncated": False,
+                   "calls": 0, "stop_reason": None, "error": None, "ts": T0}
+CAPTURE_ROW = {**dict.fromkeys(tnt_capture.ROW_KEYS), "no": 1, "ts": T0, "rel": 0.0, "src": "192.0.2.10",
+               "dst": "192.0.2.1", "src_mac": "02:00:5e:10:00:01", "dst_mac": "02:00:5e:10:00:02", "proto": "ICMP",
+               "sport": None, "dport": None, "length": 74, "info": "Echo (ping) request"}
+CAPTURE_CALL_ID = "tnt-test-call-1-9f2c1a7b"
+CAPTURE_CALL = {"id": CAPTURE_CALL_ID, "call_id": "tnt-test-call-1", "from_uri": "sip:alice@192.0.2.10",
+                "to_uri": "sip:bob@192.0.2.20", "state": "answered"}
+CAPTURE_WAV = b"RIFF" + bytes(4) + b"WAVEfmt " + bytes(8)
 
 
 class FakeNatChecker:
@@ -1852,14 +1923,29 @@ class FakePortChecker:
         return dict(PORT_RESULT, port=tnt_portcheck.validate_port(port))
 
 
+class CaptureCalls(list):
+    """The capture fake's ``calls``: the recorder every fake here keeps, and - because ``GET /api/capture/calls`` asks
+    the manager for ``mgr.calls`` itself - the SIP call list method too."""
+
+    def __init__(self, answer: List[Dict[str, Any]]) -> None:
+        super().__init__()
+        self.answer = answer
+
+    def __call__(self) -> List[Dict[str, Any]]:
+        self.append(("calls",))
+        return [dict(call) for call in self.answer]
+
+
 class FakeCaptureManager:
-    """Stand-in for tnt.capture.CaptureManager (status / start / stop / open_file / delete_file); ``opened`` keeps every
-    file object handed out for a download."""
+    """Stand-in for tnt.capture.CaptureManager, the live analyser behind /api/capture (status / start / stop / save /
+    discard / open_file / packets / packet / calls / call_audio / file_download / delete_file / files / tile);
+    ``opened`` keeps every file object handed out for a download.  ``tile()`` is never recorded: /api/status asks for it
+    on every poll."""
 
     def __init__(self) -> None:
-        self.calls: List[Any] = []
-        self.job: Optional[Dict[str, Any]] = None
-        self.files = [dict(CAPTURE_FILE)]
+        self.calls = CaptureCalls([dict(CAPTURE_CALL)])
+        self.session: Optional[Dict[str, Any]] = None
+        self.file_list = [dict(CAPTURE_FILE)]
         self.opened: List[Any] = []
         self.fail_with: Optional[BaseException] = None
 
@@ -1868,29 +1954,79 @@ class FakeCaptureManager:
         if self.fail_with is not None:
             raise self.fail_with
 
+    def _session(self) -> Optional[Dict[str, Any]]:
+        return dict(self.session) if self.session is not None else None
+
     def status(self) -> Dict[str, Any]:
         self._call("status")
-        return {"available": True, "reason": None, "adapters": [dict(CAPTURE_JOB["adapter"])], "capture": self.job,
-                "files": [dict(f) for f in self.files]}
+        return {**dict.fromkeys(tnt_capture.CAPTURE_STATUS_KEYS), "available": True, "reason": None,
+                "adapters": [dict(CAPTURE_ADAPTER)], "session": self._session(),
+                "files": [dict(f) for f in self.file_list], "limits": dict(CAPTURE_LIMITS)}
 
     def start(self, *, adapter: Any, **kwargs: Any) -> Dict[str, Any]:
         self._call("start", adapter, kwargs)
-        self.job = dict(CAPTURE_JOB)
-        return dict(self.job)
+        self.session = dict(CAPTURE_SESSION)
+        return dict(self.session)
 
     def stop(self) -> Optional[Dict[str, Any]]:
         self._call("stop")
-        return dict(self.job, state="done", file=CAPTURE_NAME) if self.job else None
+        if self.session is None:
+            return None
+        self.session = dict(self.session, state="stopped", stop_reason="user", elapsed_s=2.5)
+        return dict(self.session)
 
-    def open_file(self, name: Any) -> Any:
+    def save(self) -> Dict[str, Any]:
+        self._call("save")
+        self.session = dict(self.session or CAPTURE_SESSION, state="stopped", saved=True, file=CAPTURE_NAME)
+        return dict(self.session)
+
+    def discard(self) -> None:
+        self._call("discard")
+        self.session = None
+
+    def open_file(self, name: Any) -> Dict[str, Any]:
         self._call("open_file", name)
+        self.session = dict(CAPTURE_SESSION, state="loaded", source="file", adapter=None, file=name, saved=True,
+                            packets=12, shown=12)
+        return dict(self.session)
+
+    def packets(self, *, since: Any = None, limit: Any = None, ip: Any = None, mac: Any = None,
+                protos: Any = None) -> Dict[str, Any]:
+        self._call("packets", since, limit, ip, mac, list(protos or []))
+        return {**dict.fromkeys(tnt_capture.PACKETS_KEYS), "rows": [dict(CAPTURE_ROW)], "total": 12, "shown": 12,
+                "matched": 1, "last": 1, "dropped_before": False, "session": self._session()}
+
+    def packet(self, no: Any) -> Dict[str, Any]:
+        self._call("packet", no)
+        return {**dict.fromkeys(tnt_capture.DETAIL_KEYS), "row": dict(CAPTURE_ROW),
+                "layers": [{"name": "ETH", "summary": "02:00:5e:10:00:01 -> 02:00:5e:10:00:02", "start": 0,
+                            "length": 14, "fields": []}],
+                "hex": ["0000  02 00 5e 10 00 02 02 00  5e 10 00 01 08 00"], "bytes": 74}
+
+    def call_audio(self, call_id: Any) -> bytes:
+        self._call("call_audio", call_id)
+        return CAPTURE_WAV
+
+    def file_download(self, name: Any) -> Any:
+        self._call("file_download", name)
         self.opened.append(io.BytesIO(CAPTURE_BYTES))
         return self.opened[-1], len(CAPTURE_BYTES)
 
     def delete_file(self, name: Any) -> List[Dict[str, Any]]:
         self._call("delete_file", name)
-        self.files = [f for f in self.files if f["name"] != name]
-        return [dict(f) for f in self.files]
+        self.file_list = [f for f in self.file_list if f["name"] != name]
+        return [dict(f) for f in self.file_list]
+
+    def files(self) -> List[Dict[str, Any]]:
+        self._call("files")
+        return [dict(f) for f in self.file_list]
+
+    def tile(self) -> Dict[str, Any]:
+        session = self.session or {}
+        return {**dict.fromkeys(tnt_capture.TILE_KEYS), "available": True, "reason": None,
+                "running": session.get("state") == "capturing", "adapter": (session.get("adapter") or {}).get("name"),
+                "packets": int(session.get("packets") or 0), "calls": int(session.get("calls") or 0),
+                "files": len(self.file_list)}
 
 
 class FakeTftpServer:
@@ -1971,14 +2107,34 @@ NETWORK_TOOL_CHANGES = (
     ("POST", "/api/netcheck/switch", {"adapter": None, "seconds": None}),
     ("DELETE", "/api/netcheck/switch", None),
     ("POST", "/api/netcheck/portforward", {"port": 8000}),
-    ("POST", "/api/tools/capture", {"adapter": "Ethernet"}),
-    ("DELETE", "/api/tools/capture", None),
-    ("DELETE", f"/api/tools/capture/files/{CAPTURE_NAME}", None),
-    ("GET", f"/api/tools/capture/files/{CAPTURE_NAME}", None),
+    ("POST", "/api/capture/start", {"adapter": "Ethernet"}),
+    ("POST", "/api/capture/stop", None),
+    ("POST", "/api/capture/save", None),
+    ("POST", "/api/capture/discard", None),
+    ("POST", "/api/capture/open", {"name": CAPTURE_NAME}),
+    ("DELETE", f"/api/capture/files/{CAPTURE_NAME}", None),
+    ("GET", f"/api/capture/files/{CAPTURE_NAME}", None),
     ("POST", "/api/tftp/start", {"adapter": None, "uploads": False}),
     ("POST", "/api/tftp/stop", None),
     ("POST", "/api/tftp/uploads", {"on": True}),
     ("PUT", "/api/tftp/settings", {"max_upload_mb": 512}),
+)
+
+#: Every route of the Packet capture page, in the order the module docstring lists them.  All of them are admin-gated,
+#: so the same table proves the 503 and the administrator check for the whole page.
+CAPTURE_ROUTES = (
+    ("GET", "/api/capture", None),
+    ("POST", "/api/capture/start", {"adapter": "Ethernet"}),
+    ("POST", "/api/capture/stop", None),
+    ("POST", "/api/capture/save", None),
+    ("POST", "/api/capture/discard", None),
+    ("POST", "/api/capture/open", {"name": CAPTURE_NAME}),
+    ("GET", "/api/capture/packets", None),
+    ("GET", "/api/capture/packets/1", None),
+    ("GET", "/api/capture/calls", None),
+    ("GET", f"/api/capture/calls/{CAPTURE_CALL_ID}/audio", None),
+    ("GET", f"/api/capture/files/{CAPTURE_NAME}", None),
+    ("DELETE", f"/api/capture/files/{CAPTURE_NAME}", None),
 )
 
 
@@ -2014,6 +2170,12 @@ def test_typed_errors_name_real_exception_classes():
         ("tnt.tftp", "TftpPortInUse"): (RuntimeError, 409, "tftp_port_in_use"),
         ("tnt.capture", "CaptureFileBusy"): (RuntimeError, 409, "conflict"),
         ("tnt.capture", "CaptureFileMissing"): (LookupError, 404, "not_found"),
+        ("tnt.capture", "CaptureBusy"): (RuntimeError, 409, "conflict"),
+        ("tnt.capture", "CaptureUnavailable"): (RuntimeError, 409, "unavailable"),
+        ("tnt.proav", "ProAvUnavailable"): (RuntimeError, 409, "unavailable"),
+        ("tnt.sipflow", "FlowError"): (RuntimeError, 400, "bad_request"),
+        ("tnt.sipalg", "AlgUnavailable"): (RuntimeError, 409, "unavailable"),
+        ("tnt.sipnat", "NatError"): (RuntimeError, 409, "unavailable"),
     }
     table = {(module, name): answer for module, classes in api_routes.TYPED_ERRORS.items() for name, answer in classes.items()}
     assert table == {key: (status, code) for key, (_base, status, code) in expected.items()}
@@ -2037,17 +2199,16 @@ def test_netcheck_routes_503_when_components_missing(server, engine):
 
 def test_capture_routes_503_when_component_missing(server, engine):
     engine.capture = None
-    routes = (("GET", "/api/tools/capture", None), ("POST", "/api/tools/capture", {"adapter": "Ethernet"}),
-              ("DELETE", "/api/tools/capture", None), ("GET", f"/api/tools/capture/files/{CAPTURE_NAME}", None),
-              ("DELETE", f"/api/tools/capture/files/{CAPTURE_NAME}", None))
     server.wifi_reveal_check = lambda peer, local: "denied"
-    for method, path, body in routes:                      # the administrator check comes first
+    for method, path, body in CAPTURE_ROUTES:              # the administrator check comes first
         status, data = call_json(server, method, path, body)
         assert status == 403 and data["error"]["code"] == "admin_required", (method, path)
     server.wifi_reveal_check = lambda peer, local: "allowed"
-    for method, path, body in routes:
+    for method, path, body in CAPTURE_ROUTES:
         status, data = call_json(server, method, path, body)
         assert status == 503 and data["error"]["code"] == "unavailable", (method, path)
+    status, data = call_json(server, "GET", "/api/status")      # the tile too: null without the component
+    assert status == 200 and data["capture"] is None
 
 
 def test_tftp_routes_503_when_component_missing(server, engine):
@@ -2135,15 +2296,12 @@ def test_port_forward_route(server, network_tools):
 
 def test_capture_routes_need_an_administrator(server, network_tools, monkeypatch):
     mgr = network_tools["capture"]
-    routes = (("GET", "/api/tools/capture", None), ("POST", "/api/tools/capture", {"adapter": "Ethernet"}),
-              ("DELETE", "/api/tools/capture", None), ("GET", f"/api/tools/capture/files/{CAPTURE_NAME}", None),
-              ("DELETE", f"/api/tools/capture/files/{CAPTURE_NAME}", None))
     seen: List[Any] = []
     server.wifi_reveal_check = lambda peer, local: seen.append((peer, local)) or "denied"
-    for method, path, body in routes:
+    for method, path, body in CAPTURE_ROUTES:
         status, data = call_json(server, method, path, body)
         assert status == 403 and data["error"] == {"code": "admin_required", "message": api_routes.CAPTURE_ADMIN_REQUIRED_MSG}, path
-    status, _headers, payload = call(server, "HEAD", f"/api/tools/capture/files/{CAPTURE_NAME}")
+    status, _headers, payload = call(server, "HEAD", f"/api/capture/files/{CAPTURE_NAME}")
     assert status == 403 and payload == b""
     peer, local = seen[0]
     assert peer[0].startswith("127.") and int(local[1]) == server.port
@@ -2153,7 +2311,7 @@ def test_capture_routes_need_an_administrator(server, network_tools, monkeypatch
 
     for check in (lambda peer, local: "unknown", lambda peer, local: None, boom):
         server.wifi_reveal_check = check
-        for method, path, body in routes:
+        for method, path, body in CAPTURE_ROUTES:
             status, data = call_json(server, method, path, body)
             assert status == 403 and data["error"] == {"code": "admin_required",
                                                        "message": api_routes.CAPTURE_ADMIN_UNVERIFIED_MSG}, path
@@ -2161,48 +2319,153 @@ def test_capture_routes_need_an_administrator(server, network_tools, monkeypatch
 
     monkeypatch.setattr(tnt.peer, "reveal_allowed", lambda peer, local: "denied")
     server.wifi_reveal_check = None                                  # the production path: tnt.peer decides
-    status, data = call_json(server, "GET", "/api/tools/capture")
+    status, data = call_json(server, "GET", "/api/capture")
     assert status == 403 and data["error"]["message"] == api_routes.CAPTURE_ADMIN_REQUIRED_MSG
     assert mgr.calls == [] and mgr.opened == []
 
 
 def test_capture_routes(server, network_tools):
+    """The session's life through the routes: status, start, stop, save, open a saved file, discard, and the file list
+    (download, HEAD, delete)."""
     mgr = network_tools["capture"]
     server.wifi_reveal_check = lambda peer, local: "allowed"
-    status, data = call_json(server, "GET", "/api/tools/capture")
-    assert status == 200 and list(data) == list(tnt_capture.CAPTURE_STATUS_KEYS) and data["capture"] is None
-    start = {"adapter": "Ethernet", "seconds": 10, "size_mb": 64, "full_packets": False, "host": "192.0.2.10", "port": None,
-             "protocol": "icmp", "comment": "not a start key"}
-    status, data = call_json(server, "POST", "/api/tools/capture", start)
-    assert status == 200 and data == {"capture": CAPTURE_JOB} and list(data["capture"]) == list(tnt_capture.CAPTURE_JOB_KEYS)
-    status, data = call_json(server, "POST", "/api/tools/capture", {"seconds": None})    # keys left out take the defaults
+    status, data = call_json(server, "GET", "/api/capture")
+    assert status == 200 and list(data) == list(tnt_capture.CAPTURE_STATUS_KEYS) and data["session"] is None
+    assert list(data["adapters"][0]) == list(tnt_capture.CAPTURE_ADAPTER_KEYS) and data["adapters"] == [CAPTURE_ADAPTER]
+    assert list(data["limits"]) == list(tnt_capture.LIMIT_KEYS) and data["limits"] == CAPTURE_LIMITS
+    assert list(data["files"][0]) == list(tnt_capture.CAPTURE_FILE_KEYS) and data["files"] == [CAPTURE_FILE]
+    start = {"adapter": "Ethernet", "max_seconds": 300, "max_mb": 64, "comment": "not a start key"}
+    status, data = call_json(server, "POST", "/api/capture/start", start)
+    assert status == 200 and data == {"session": CAPTURE_SESSION} and list(data["session"]) == list(tnt_capture.SESSION_KEYS)
+    status, data = call_json(server, "POST", "/api/capture/start", {"adapter": "Ethernet"})   # the rest take the defaults
     assert status == 200
-    status, data = call_json(server, "DELETE", "/api/tools/capture")                     # stop and keep
-    assert status == 200 and data["capture"]["state"] == "done" and data["capture"]["file"] == CAPTURE_NAME
-    status, headers, payload = call(server, "GET", f"/api/tools/capture/files/{CAPTURE_NAME}")
+    status, data = call_json(server, "POST", "/api/capture/stop")                             # end it now and keep it
+    assert status == 200 and list(data) == ["session"] and data["session"]["state"] == "stopped"
+    assert data["session"]["stop_reason"] == "user"
+    status, data = call_json(server, "POST", "/api/capture/save")                             # keep it as a saved file
+    assert status == 200 and list(data) == ["session", "files"]
+    assert data["session"]["saved"] is True and data["session"]["file"] == CAPTURE_NAME
+    assert data["files"] == [CAPTURE_FILE] and list(data["files"][0]) == list(tnt_capture.CAPTURE_FILE_KEYS)
+    status, data = call_json(server, "POST", "/api/capture/open", {"name": CAPTURE_NAME})     # read a saved one back
+    assert status == 200 and list(data) == ["session"] and list(data["session"]) == list(tnt_capture.SESSION_KEYS)
+    assert data["session"]["state"] == "loaded" and data["session"]["source"] == "file" and data["session"]["file"] == CAPTURE_NAME
+    status, data = call_json(server, "POST", "/api/capture/discard")                          # throw it away
+    assert status == 200 and data == {"session": None}
+    status, headers, payload = call(server, "GET", f"/api/capture/files/{CAPTURE_NAME}")
     assert status == 200 and payload == CAPTURE_BYTES and headers["content-length"] == str(len(CAPTURE_BYTES))
     assert headers["content-disposition"] == f'attachment; filename="{CAPTURE_NAME}"'
-    status, headers, payload = call(server, "HEAD", f"/api/tools/capture/files/{CAPTURE_NAME}")
+    status, headers, payload = call(server, "HEAD", f"/api/capture/files/{CAPTURE_NAME}")
     assert status == 200 and payload == b"" and headers["content-type"] == "application/octet-stream"
     assert len(mgr.opened) == 2 and all(f.closed for f in mgr.opened), "the download closes its file, HEAD included"
-    status, data = call_json(server, "DELETE", f"/api/tools/capture/files/{CAPTURE_NAME}")
+    status, data = call_json(server, "DELETE", f"/api/capture/files/{CAPTURE_NAME}")
     assert status == 200 and data == {"files": []}
-    assert mgr.calls == [("status",), ("start", "Ethernet", {k: v for k, v in start.items() if k not in ("adapter", "comment")}),
-                         ("start", None, {"seconds": None}), ("stop",), ("open_file", CAPTURE_NAME),
-                         ("open_file", CAPTURE_NAME), ("delete_file", CAPTURE_NAME)]
-    for exc, expected, code in ((ValueError(tnt_capture.PORT_ICMP_TEXT), 400, "bad_request"),
-                                (tnt_pktmon.PktmonUnavailable(tnt_pktmon.FOLDER_NOT_SECURED_TEXT), 409, "unavailable"),
-                                (tnt_pktmon.PktmonBusy(tnt_pktmon.LOCK_TEXTS["switchport"]), 409, "conflict")):
+    assert mgr.calls == [("status",), ("start", "Ethernet", {"max_seconds": 300, "max_mb": 64}),
+                         ("start", "Ethernet", {}), ("stop",), ("save",), ("files",), ("open_file", CAPTURE_NAME),
+                         ("discard",), ("file_download", CAPTURE_NAME), ("file_download", CAPTURE_NAME),
+                         ("delete_file", CAPTURE_NAME)]
+
+
+def test_capture_packets_route_hands_the_query_on(server, network_tools):
+    """The packet list's filters reach the manager exactly as they arrived (only the service decides what a filter is),
+    and ``proto`` is read both ways the page may send it: repeated, and comma separated."""
+    mgr = network_tools["capture"]
+    server.wifi_reveal_check = lambda peer, local: "allowed"
+    status, data = call_json(server, "GET", "/api/capture/packets")
+    assert status == 200 and list(data) == list(tnt_capture.PACKETS_KEYS) and data["session"] is None
+    assert data["rows"] == [CAPTURE_ROW] and list(data["rows"][0]) == list(tnt_capture.ROW_KEYS)
+    assert data["total"] == 12 and data["matched"] == 1 and data["last"] == 1 and data["dropped_before"] is False
+    query = "since=120&limit=50&ip=192.0.2.10&mac=02:00:5e:10:00:01&proto=sip&proto=rtp"
+    status, data = call_json(server, "GET", "/api/capture/packets?" + query)
+    assert status == 200 and list(data) == list(tnt_capture.PACKETS_KEYS)
+    status, data = call_json(server, "GET", "/api/capture/packets?proto=sip,rtp&proto=dns")   # the same list, one parameter
+    assert status == 200
+    status, data = call_json(server, "GET", "/api/capture/packets?proto=&limit=nonsense")     # blanks are dropped, not guessed
+    assert status == 200
+    assert mgr.calls == [("packets", None, None, None, None, []),
+                         ("packets", "120", "50", "192.0.2.10", "02:00:5e:10:00:01", ["sip", "rtp"]),
+                         ("packets", None, None, None, None, ["sip", "rtp", "dns"]),
+                         ("packets", None, "nonsense", None, None, [])]
+
+
+def test_capture_packet_detail_route(server, network_tools):
+    mgr = network_tools["capture"]
+    server.wifi_reveal_check = lambda peer, local: "allowed"
+    status, data = call_json(server, "GET", "/api/capture/packets/7")
+    assert status == 200 and list(data) == list(tnt_capture.DETAIL_KEYS)
+    assert data["row"] == CAPTURE_ROW and data["bytes"] == 74 and data["hex"][0].startswith("0000")
+    assert data["layers"][0]["name"] == "ETH"
+    assert mgr.calls == [("packet", "7")], "the packet number reaches the manager as it was sent"
+
+
+def test_capture_calls_and_call_audio_routes(server, network_tools):
+    """The SIP calls of the open capture, and one call rebuilt as a WAV file the browser can play."""
+    mgr = network_tools["capture"]
+    server.wifi_reveal_check = lambda peer, local: "allowed"
+    status, data = call_json(server, "GET", "/api/capture/calls")
+    assert status == 200 and data == {"calls": [CAPTURE_CALL]}
+    status, headers, payload = call(server, "GET", f"/api/capture/calls/{CAPTURE_CALL_ID}/audio")
+    assert status == 200 and payload == CAPTURE_WAV and headers["content-length"] == str(len(CAPTURE_WAV))
+    assert headers["content-type"] == "audio/wav"
+    assert headers["content-disposition"] == f'attachment; filename="TNT-call-{CAPTURE_CALL_ID}.wav"'
+    assert mgr.calls == [("calls",), ("call_audio", CAPTURE_CALL_ID)]
+
+
+def test_capture_errors_reach_their_status(server, network_tools):
+    """tnt.capture's four typed errors and a ValueError from start(), each answered with the service's own text."""
+    mgr = network_tools["capture"]
+    server.wifi_reveal_check = lambda peer, local: "allowed"
+    for exc, expected, code in ((ValueError(tnt_capture.ADAPTER_TEXT.format(name="Ethernet 2")), 400, "bad_request"),
+                                (ValueError(tnt_capture.SECONDS_TEXT), 400, "bad_request"),
+                                (ValueError(tnt_capture.SIZE_TEXT), 400, "bad_request"),
+                                (tnt_capture.CaptureBusy(tnt_capture.BUSY_TEXT), 409, "conflict"),
+                                (tnt_capture.CaptureUnavailable(tnt_capture.DISK_TEXT.format(mb=1536)), 409, "unavailable"),
+                                (RuntimeError("the capture fell over"), 500, "internal_error")):
         mgr.fail_with = exc
-        status, data = call_json(server, "POST", "/api/tools/capture", {"adapter": "Ethernet"})
+        status, data = call_json(server, "POST", "/api/capture/start", {"adapter": "Ethernet"})
         assert status == expected and data["error"] == {"code": code, "message": str(exc)}, code
     mgr.fail_with = tnt_capture.CaptureFileBusy(tnt_capture.FILE_BUSY_TEXT)
-    status, data = call_json(server, "DELETE", f"/api/tools/capture/files/{CAPTURE_NAME}")
+    status, data = call_json(server, "DELETE", f"/api/capture/files/{CAPTURE_NAME}")
     assert status == 409 and data["error"] == {"code": "conflict", "message": "The file is being downloaded"}
     mgr.fail_with = tnt_capture.CaptureFileMissing(tnt_capture.FILE_MISSING_TEXT)
-    for method in ("GET", "DELETE"):
-        status, data = call_json(server, method, "/api/tools/capture/files/TNT-capture-2026.pcapng")
-        assert status == 404 and data["error"] == {"code": "not_found", "message": "The capture file was not found"}, method
+    for method, path, body in (("GET", "/api/capture/files/TNT-capture-2026.pcapng", None),
+                               ("DELETE", "/api/capture/files/TNT-capture-2026.pcapng", None),
+                               ("POST", "/api/capture/open", {"name": "TNT-capture-2026.pcapng"}),
+                               ("GET", "/api/capture/packets/9999", None),
+                               ("GET", f"/api/capture/calls/{CAPTURE_CALL_ID}/audio", None)):
+        status, data = call_json(server, method, path, body)
+        assert status == 404 and data["error"] == {"code": "not_found",
+                                                   "message": "The capture file was not found"}, (method, path)
+    mgr.fail_with = tnt_capture.CaptureUnavailable(f"{CAPTURE_NAME} is not a capture TNT can read")
+    status, data = call_json(server, "POST", "/api/capture/open", {"name": CAPTURE_NAME})
+    assert status == 409 and data["error"] == {"code": "unavailable", "message": str(mgr.fail_with)}
+
+
+def test_status_carries_the_capture_tile(server, engine, network_tools):
+    """``GET /api/status`` carries TILE_KEYS and nothing else of the capture: counts and the adapter's name, so the
+    Packet capture tile needs no administrator (the packets themselves still do)."""
+    mgr = network_tools["capture"]
+    checks: List[Any] = []
+    server.wifi_reveal_check = lambda peer, local: checks.append(peer) or "denied"
+    status, data = call_json(server, "GET", "/api/status")
+    assert status == 200 and list(data["capture"]) == list(tnt_capture.TILE_KEYS)
+    assert data["capture"] == {"available": True, "reason": None, "running": False, "adapter": None, "packets": 0,
+                               "calls": 0, "files": 1}
+    mgr.session = dict(CAPTURE_SESSION, packets=412, calls=2)
+    status, data = call_json(server, "GET", "/api/status")
+    assert status == 200 and data["capture"]["running"] is True and data["capture"]["adapter"] == "Ethernet"
+    assert data["capture"]["packets"] == 412 and data["capture"]["calls"] == 2
+    assert checks == [], "the tile is counts only: it never asks whether the caller is an administrator"
+
+    class Broken:
+        def tile(self):
+            raise RuntimeError("no capture for you")
+
+    engine.capture = Broken()
+    status, data = call_json(server, "GET", "/api/status")
+    assert status == 200 and data["capture"] is None and data["version"] == __version__
+    engine.capture = None
+    status, data = call_json(server, "GET", "/api/status")
+    assert status == 200 and data["capture"] is None
 
 
 def test_tftp_routes(server, network_tools):
@@ -2248,7 +2511,8 @@ def test_tftp_routes(server, network_tools):
 
 @pytest.fixture
 def capture_folder(server, engine, tmp_path):
-    """A real tnt.capture.CaptureManager on a temporary captures folder (only its file methods run), for an administrator."""
+    """A real tnt.capture.CaptureManager on a temporary captures folder (only file_download / delete_file / files run,
+    so no ETW session is ever created), for an administrator."""
     folder = tmp_path / "captures"
     folder.mkdir()
     engine.capture = tnt_capture.CaptureManager(engine.bus, captures_dir_fn=lambda: folder)
@@ -2261,7 +2525,7 @@ def test_capture_download_head_then_delete(server, capture_folder):
     succeeds (Windows refuses to delete an open file)."""
     data = b"\x0a\x0d\x0d\x0a" + bytes(range(256)) * 700              # a little under three 64 KiB chunks
     (capture_folder / CAPTURE_NAME).write_bytes(data)
-    url = f"/api/tools/capture/files/{CAPTURE_NAME}"
+    url = f"/api/capture/files/{CAPTURE_NAME}"
     status, headers, payload = call(server, "GET", url)
     assert status == 200 and payload == data
     assert headers["content-type"] == "application/octet-stream" and headers["content-length"] == str(len(data))
@@ -2273,7 +2537,7 @@ def test_capture_download_head_then_delete(server, capture_folder):
     assert status == 200 and body == {"files": []} and not (capture_folder / CAPTURE_NAME).exists()
     for name in (CAPTURE_NAME, "CON", "TNT-capture-2026.pcapng", "..%5C" + CAPTURE_NAME):
         for method in ("GET", "DELETE"):
-            status, body = call_json(server, method, f"/api/tools/capture/files/{name}")
+            status, body = call_json(server, method, f"/api/capture/files/{name}")
             assert status == 404 and body["error"] == {"code": "not_found", "message": tnt_capture.FILE_MISSING_TEXT}, (method, name)
 
 
@@ -2283,7 +2547,7 @@ def test_capture_download_the_client_abandons_does_not_hold_the_file(server, cap
     path = capture_folder / CAPTURE_NAME
     with open(path, "wb") as fh:
         fh.truncate(64 * 1024 * 1024)                                   # far more than the socket buffers take in
-    url = f"/api/tools/capture/files/{CAPTURE_NAME}"
+    url = f"/api/capture/files/{CAPTURE_NAME}"
     sock = socket.create_connection(("127.0.0.1", server.port), timeout=10)
     try:
         sock.sendall(f"GET {url} HTTP/1.1\r\nHost: 127.0.0.1:{server.port}\r\n\r\n".encode("ascii"))
@@ -2601,15 +2865,13 @@ def test_sse_stream_delivers_hello_and_published_event(server, engine):
     assert server.clients_sse == 0
 
 
-def test_sse_capture_state_goes_to_administrators_only(server, engine):
-    """``capture.state`` carries the capture job (adapter, host / port filters, file name), which every /api/tools/capture route
-    refuses to anyone who is not a Windows administrator: the event stream leaves it out for them too (asked once per stream,
-    at the first such event, failing closed) and still forwards everything else."""
-    from tnt import capture as tnt_capture
-
-    assert api_routes.ADMIN_ONLY_EVENTS == frozenset({tnt_capture.EVENT})
-    job = {"capture": {"id": "c1", "state": "capturing", "adapter": {"name": "Ethernet", "index": 12, "mac": "02:00:5E:10:00:01"},
-                       "filters": {"host": "192.0.2.50", "port": 5060, "protocol": "udp"}, "file": None}}
+def test_sse_capture_events_go_to_administrators_only(server, engine):
+    """``capture.state`` carries the session (the adapter, the file name) and ``capture.sip`` a SIP call (its URIs), which
+    every /api/capture route refuses to anyone who is not a Windows administrator: the event stream leaves both out for them
+    too (asked once per stream, at the first such event, failing closed) and still forwards everything else."""
+    assert api_routes.ADMIN_ONLY_EVENTS == frozenset({tnt_capture.EVENT, tnt_capture.SIP_EVENT})
+    state = {"session": CAPTURE_SESSION}
+    sip = {"call": CAPTURE_CALL}
     for decision in ("denied", "unknown", "allowed"):
         checks: List[Any] = []
         server.wifi_reveal_check = lambda peer, local, d=decision: checks.append(peer) or d
@@ -2618,14 +2880,17 @@ def test_sse_capture_state_goes_to_administrators_only(server, engine):
         t = threading.Thread(target=_read_sse_frames, args=(server.port, "event: ping.sample", frames, ready), daemon=True)
         t.start()
         assert ready.wait(10), frames
-        engine.bus.publish("capture.state", job, ts=T0)
-        engine.bus.publish("capture.state", job, ts=T0)
+        engine.bus.publish(tnt_capture.EVENT, state, ts=T0)
+        engine.bus.publish(tnt_capture.EVENT, state, ts=T0)
+        engine.bus.publish(tnt_capture.SIP_EVENT, sip, ts=T0)
         engine.bus.publish("ping.sample", {"target_id": 1, "ok": True, "rtt_ms": 12.5, "light": "green"}, ts=T0)
         t.join(10)
         assert not t.is_alive(), frames
-        captures = [json.loads(f.split("data: ", 1)[1].strip()) for f in frames if "event: capture.state" in f]
-        assert captures == ([dict(job, ts=T0)] * 2 if decision == "allowed" else []), decision
-        assert len(checks) == 1, decision                        # once per stream, at the first capture event
+        sessions = [json.loads(f.split("data: ", 1)[1].strip()) for f in frames if f"event: {tnt_capture.EVENT}" in f]
+        calls = [json.loads(f.split("data: ", 1)[1].strip()) for f in frames if f"event: {tnt_capture.SIP_EVENT}" in f]
+        assert sessions == ([dict(state, ts=T0)] * 2 if decision == "allowed" else []), decision
+        assert calls == ([dict(sip, ts=T0)] if decision == "allowed" else []), decision
+        assert len(checks) == 1, decision            # once per stream, at the first admin-only event, for both types
         assert any("event: ping.sample" in f for f in frames), decision
         deadline = time.time() + 5
         while server.clients_sse and time.time() < deadline:
@@ -3322,7 +3587,7 @@ def test_engine_stop_is_bounded_when_db_close_hangs(data_dir, monkeypatch):
 
 def test_engine_wires_the_network_tools(data_dir, monkeypatch):
     """Start order: NatChecker and PortChecker after the IP location manager, TftpServer right after the DHCP server (its
-    folder secured), SwitchPortFinder and CaptureManager right after the LAN peers (recover() on tnt-pktmon-recover, not
+    folder secured), SwitchPortFinder and CaptureManager right after the LAN peers (recover() on tnt-capture-recover, not
     waited for), all before the network watcher.  Neither start nor stop runs pktmon or netsh."""
     from tnt import firewall, paths, winacl
     from tnt.engine import Engine
@@ -3367,8 +3632,8 @@ def test_engine_wires_the_network_tools(data_dir, monkeypatch):
         # the TFTP folder is created and secured at start; the captures folder only when a capture or search starts
         assert paths.tftp_dir().is_dir() and (os.path.normcase(str(paths.tftp_dir())), winacl.TFTP_SDDL) in secured
         assert not paths.captures_dir().exists() and all(sddl != winacl.CAPTURES_SDDL for _path, sddl in secured)
-        assert recovering == ["tnt-pktmon-recover"], "recover() runs on its own thread"
-        assert any(t.name == "tnt-pktmon-recover" and t.daemon and t.is_alive() for t in threading.enumerate()), \
+        assert recovering == ["tnt-capture-recover"], "recover() runs on its own thread"
+        assert any(t.name == "tnt-capture-recover" and t.daemon and t.is_alive() for t in threading.enumerate()), \
             "start() did not wait for it"
         assert eng.speed is not None and eng.speed._pinger is eng.pinger, "the latency-under-load probe gets the pinger"
         assert eng.natcheck._refresh_fn == eng.linkmap.refresh_public_ip == eng.portcheck._refresh_fn
@@ -3546,23 +3811,25 @@ def test_selfcheck_modules_include_geoip():
     for name in ("mmap", "tnt.mmdb", "tnt.geohints", "tnt.geohints_data", "tnt.geoip"):
         assert name in mods, name
         importlib.import_module(name)
-    assert mods[mods.index("tnt.netwatch") + 1:mods.index("tnt.netwatch") + 5] == ["tnt.mmdb", "tnt.geohints",
-                                                                                   "tnt.geohints_data", "tnt.geoip"]
 
 
 def test_selfcheck_modules_include_the_network_tools():
-    """The network tools follow tnt.geoip and import with no side effect (no socket, no Packet Monitor, no DLL call)."""
+    """The network tools are in the self-check list and import with no side effect (no socket, no Packet Monitor,
+    no DLL call).
+
+    Where they sit in the list is no longer pinned: it holds every module of the package now, which
+    tests/test_packaging.py enforces, and an adjacency assertion on top of that only says how it happens to be
+    sorted."""
     import importlib
 
     from tnt import service
 
     mods = list(service.SELFCHECK_MODULES)
-    new = ["tnt.winacl", "tnt.natcheck", "tnt.portcheck", "tnt.pcapng", "tnt.lldp", "tnt.pktmon", "tnt.switchport",
-           "tnt.capture", "tnt.tftp", "tnt.speedtest.quality"]
-    at = mods.index("tnt.geoip") + 1
-    assert mods[at:at + len(new)] == new and len(set(mods)) == len(mods)
-    for name in new:
+    for name in ("tnt.winacl", "tnt.natcheck", "tnt.portcheck", "tnt.pcapng", "tnt.lldp", "tnt.pktmon",
+                 "tnt.switchport", "tnt.capture", "tnt.tftp", "tnt.speedtest.quality"):
+        assert name in mods, name
         importlib.import_module(name)
+    assert len(set(mods)) == len(mods), "no module is checked twice"
 
 
 def test_selfcheck_geoip_checks_are_offline(monkeypatch):

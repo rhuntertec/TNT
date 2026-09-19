@@ -1,6 +1,10 @@
 /* TNT — views/tools.js
-   Field tools, mounted in one order (CARD_ORDER): LAN throughput, Port forward, Traceroute, the DHCP
-   server, the TFTP server, the Subnet calculator, DNS, Packet capture and the saved Wi-Fi networks.
+   Field tools. A Quick Tools row sits above every card: one-click tools that need no settings and no result
+   pane (IP Release/Renew and Flush DNS today, more later). It is not collapsible — app.js owns the buttons'
+   behaviour through TNT.app.quickRun / TNT.app.quickSync, and only their markup lives here.
+   Under it the cards, mounted in one order (CARD_ORDER): LAN throughput, Port forward check, Traceroute, the
+   DHCP server, the TFTP server, the Subnet calculator, DNS and the saved Wi-Fi networks. (Packet capture has
+   its own page and tile now, not a card here.)
    The DHCP server is special (its own builder here): a big on/off switch, a status badge, adapter /
    pool / lease settings, a "check for other DHCP servers" probe with an inline result box, a loud
    danger modal when another server is already active, and a realtime clients table built on the shared
@@ -27,16 +31,21 @@
   // the tool cards below (all but the DHCP server, which has its own builder), in their relative order
   const EXTRA_CARDS = [
     { key: 'lan', title: 'LAN throughput', icon: 'lan', create: () => TNT.tools.lan.create() },
-    { key: 'portforward', title: 'Port forward', icon: 'target', create: (ctx) => TNT.tools.portforward.create(ctx) },
+    { key: 'portforward', title: 'Port forward check', icon: 'target', create: (ctx) => TNT.tools.portforward.create(ctx) },
     { key: 'traceroute', title: 'Traceroute', icon: 'route', create: () => TNT.tools.traceroute.create() },
     { key: 'tftp', title: 'TFTP server', icon: 'tftp', create: (ctx) => TNT.tools.tftp.create(ctx) },
     { key: 'subnet', title: 'Subnet calculator', icon: 'network', create: () => TNT.tools.subnetcalc.create() },
     { key: 'dns', title: 'DNS', icon: 'dns', create: () => TNT.tools.dns.create() },
-    { key: 'capture', title: 'Packet capture', icon: 'capture', create: () => TNT.tools.capture.create() },
     { key: 'wifi', title: 'Saved Wi-Fi networks', icon: 'wifi', create: () => TNT.tools.wifi.create() },
   ];
   // the full mount order, top to bottom, the DHCP server card ('dhcp', its own builder) among the modules above
-  const CARD_ORDER = ['lan', 'portforward', 'traceroute', 'dhcp', 'tftp', 'subnet', 'dns', 'capture', 'wifi'];
+  const CARD_ORDER = ['lan', 'portforward', 'traceroute', 'dhcp', 'tftp', 'subnet', 'dns', 'wifi'];
+  // the Quick Tools row above the cards: one click, no settings. app.js runs them (TNT.app.quickRun) and owns the
+  // busy / flash behaviour; the ids are its (TNT.app.QUICK_TOOL_IDS), so it can find the button while the page is open.
+  const QUICK_TOOLS = [
+    { tool: 'renew', icon: 'renew', label: 'IP Release/Renew', title: "Release this PC's IP addresses and renew them from the DHCP server" },
+    { tool: 'flush', icon: 'flush', label: 'Flush DNS', title: "Flush this PC's DNS cache" },
+  ];
   // the cards the user opened ('dhcp' and the keys above): module level, so they stay open when Tools is left and
   // opened again; a reload starts with every card collapsed
   let openCards = [];
@@ -652,8 +661,10 @@
     // the same size switch as the TFTP server's (and every other card's controls), not a bespoke large one
     els.toggle = TNT.ui.toggle({ checked: false, on: 'On', off: 'Off', accent: 'var(--green)', onChange: (checked) => { if (checked) { openCard('dhcp'); turnOn(false); } else turnOff(); } });
     els.toggle.input.setAttribute('aria-label', 'DHCP server on or off');
+    // the badge and the switch ride together on the right of the row, as the TFTP server's do (.tool-head-right)
+    els.head = h('div', { class: 'tool-head-right' }, els.badge, els.toggle);
     const titleRow = h('div', { class: 'switch-row' },
-      h('div', { class: 'card-title' }, TNT.ui.icon('dhcp'), 'DHCP server'), els.badge, h('span', { class: 'spacer' }), els.toggle);
+      h('div', { class: 'card-title' }, TNT.ui.icon('dhcp'), 'DHCP server'), els.head);
     els.summary = h('div', { class: 'dhcp-summary' });
 
     els.adapter = h('select', { class: 'input', 'aria-label': 'Adapter' }, h('option', { value: '' }, 'Auto (Ethernet)'));
@@ -690,7 +701,7 @@
       h('div', { class: 'card-title' }, els.clientsTitle, els.counts, h('span', { class: 'spacer' }), els.refreshBtn),
       tableWrap);
     els.card = h('div', { class: 'card', data: { tool: 'dhcp' } }, titleRow, body);
-    makeCollapsible(els.card, titleRow, body, 'dhcp', 'DHCP server', [els.badge, els.toggle]);
+    makeCollapsible(els.card, titleRow, body, 'dhcp', 'DHCP server', [els.head]);
     els.unavailable = h('div', { class: 'card', hidden: true }, TNT.ui.emptyState('The DHCP server is not available on this service'));
   }
 
@@ -719,6 +730,22 @@
     return cards;
   }
 
+  /** The Quick Tools row: a plain (never collapsible) card of one-click buttons above the tool cards. Each button
+   *  carries the id app.js looks for, so a run started here keeps working while the page is open. */
+  function buildQuickTools() {
+    const { h } = TNT.util;
+    const ids = (TNT.app && TNT.app.QUICK_TOOL_IDS) || {};
+    const row = h('div', { class: 'quick-tools' });
+    for (const q of QUICK_TOOLS) {
+      row.appendChild(h('button', {
+        class: 'btn quick-tool', type: 'button', id: ids[q.tool] || ('btn-quick-' + q.tool), title: q.title, 'aria-label': q.label,
+        on: { click: () => { if (TNT.app && TNT.app.quickRun) TNT.app.quickRun(q.tool); } },
+      }, TNT.ui.icon(q.icon), h('span', { class: 'quick-label' }, q.label)));
+    }
+    const title = h('div', { class: 'card-title' }, TNT.ui.icon('spark'), 'Quick Tools');
+    return h('div', { class: 'card', data: { tool: 'quick' } }, title, row);
+  }
+
   TNT.views.tools = {
     mount(el) {
       const { h } = TNT.util;
@@ -726,12 +753,14 @@
       els = {};
       status = null; busy = false; busyMode = ''; dirty = false; loading = false; loadAgain = false; netPending = false; danger = null;
       unavailable = false; scanError = null;
-      cardToggles = {}; attentionShown = null;     // openCards stays: the cards opened before are built open
+      cardToggles = {}; attentionShown = null;
+      openCards = [];     // every time the Tools page opens, all cards start collapsed (a running DHCP alert still opens its card)
       const head = h('div', { class: 'section-head' }, h('h2', null, h('span', { class: 'section-accent' }), 'Tools'));
       buildDhcpCard();
       const cards = buildCards();
       root.appendChild(head);
-      root.appendChild(h('div', { class: 'stack' }, cards));
+      root.appendChild(h('div', { class: 'stack' }, buildQuickTools(), ...cards));
+      if (TNT.app && TNT.app.quickSync) TNT.app.quickSync();
       TNT.hosttable.syncTargets(TNT.state && TNT.state.targets, true);
       renderBadge();
       renderToggle();

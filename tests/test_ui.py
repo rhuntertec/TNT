@@ -33,14 +33,19 @@ MOCK = ROOT / "tools" / "mock_api.py"
 JS_FILES = [
     "js/api.js", "js/charts.js", "js/wifichart.js", "js/hosttable.js",
     "js/tools/subnet.js", "js/tools/traceroute.js", "js/tools/lan.js", "js/tools/portforward.js", "js/tools/subnetcalc.js", "js/tools/dns.js",
-    "js/tools/wifi.js", "js/tools/tftp.js", "js/tools/capture.js",
-    "js/reportsui.js", "js/netcheck.js",
+    "js/tools/wifi.js", "js/tools/tftp.js",
+    "js/reportsui.js", "js/netcheck.js", "js/throughput.js",
     "js/views/ipinfo.js", "js/views/ping.js",
     "js/views/outages.js", "js/views/speed.js", "js/views/discovery.js", "js/views/tools.js", "js/views/wifi.js",
-    "js/views/reports.js",
+    "js/views/reports.js", "js/views/capture.js", "js/views/proav.js", "js/views/sip.js",
     "js/egg.js", "js/app.js",
 ]
-VIEW_NAMES = ["ipinfo", "ping", "outages", "speed", "discovery", "wifi", "tools", "reports"]
+VIEW_NAMES = ["ipinfo", "ping", "outages", "speed", "discovery", "wifi", "tools", "reports", "capture", "proav"]
+# the tiles of index.html, in order: the four full-height ones, then the six that carry `class="tile half"`
+TILE_NAMES = ["ipinfo", "ping", "outages", "speed", "discovery", "wifi", "tools", "reports", "capture", "proav",
+              "sip"]
+# every tile is half height now: the first four used to be 150 px and carried three or four lines
+HALF_TILES = list(TILE_NAMES)
 MOCK_BRIDGE = ROOT / "tools" / "mock_wifi_bridge.js"
 
 
@@ -196,18 +201,18 @@ def test_discovery_view_markup_and_helpers():
 
 def test_tools_view_markup_tile_and_danger_modal():
     html = _read("index.html")
-    assert 'data-view="tools" href="#tools" style="--accent: var(--red)"' in html
+    assert 'class="tile half" data-view="tools" href="#tools" style="--accent: var(--red)"' in html
     assert 'data-icon="tools"' in html and 'id="tile-tools"' in html
     app = _read("js/app.js")
     assert "tools: 'var(--red)'" in app and "'discovery', 'wifi', 'tools'" in app
     assert "tools:" in app and "warning:" in app and "dhcp:" in app  # icons
     # the Tools tile: the DHCP server's state, then the other tools by name as plain text
     assert "tileEls.tools" in app and "DHCP client" in app and "Tools for the field" not in app
-    assert "const TOOLS_TILE_ITEMS = ['LAN throughput', 'Port forward', 'Traceroute', 'TFTP server', 'Subnet calc', 'DNS', 'Packet capture', 'WiFi passwords'];" in app
-    assert "TOOLS_TILE_ITEMS.map((name) => line(esc(name), 'tile-tool'))" in app
-    # in two columns where the tile has room, so the list does not make the Tools tile's row taller than the others
-    assert "'<div class=\"tile-tools\">' + TOOLS_TILE_ITEMS.map(" in app
-    assert ".tile-tools { display: grid; grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));" in _read("css/tnt.css")
+    # Packet capture left the list when it became a page and a tile of its own
+    assert "const TOOLS_TILE_ITEMS = ['LAN throughput', 'Port forward check', 'Traceroute', 'TFTP server', 'Subnet calc', 'DNS', 'WiFi passwords'];" in app
+    # the half-height tile has room for one line: the names run together on it, ellipsized, the full list in the tooltip
+    assert "line('<span class=\"tile-ellipsis muted\" title=\"' + esc(TOOLS_TILE_ITEMS.join(', ')) + '\">' + esc(TOOLS_TILE_ITEMS.join(' · ')) + '</span>')" in app
+    assert ".tile-line .tile-ellipsis { flex: 0 1 auto; min-width: 0; max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }" in _read("css/tnt.css")
     assert "ev.on('dhcp.state'" in app and "ev.on('dhcp.lease'" in app
     api = _read("js/api.js")
     for fn in ("dhcpStatus", "dhcpLeases", "dhcpScan", "dhcpStart", "dhcpStop", "dhcpSettings", "dhcpForget"):
@@ -502,12 +507,13 @@ def test_tools_batch_markup_settings_wan_and_cards():
         assert t in tools, t
     assert "TNT.tools.traceroute.create()" in tools and "TNT.tools.lan.create()" in tools and "TNT.tools.subnetcalc.create()" in tools
     # card order on the Tools page: LAN throughput, Port forward, Traceroute, the DHCP server, TFTP server, Subnet
-    # calculator, DNS, Packet capture, Saved Wi-Fi networks (one ordered list of keys, the DHCP card among them)
+    # calculator, DNS, Saved Wi-Fi networks (one ordered list of keys, the DHCP card among them). Packet capture is
+    # not a card any more: it has its own page and tile
     assert "cards.push(els.card, els.unavailable)" in tools       # the DHCP card sits in the ordered list
-    assert "const CARD_ORDER = ['lan', 'portforward', 'traceroute', 'dhcp', 'tftp', 'subnet', 'dns', 'capture', 'wifi'];" in tools
-    assert (tools.index("'LAN throughput'") < tools.index("'Port forward'") < tools.index("'Traceroute'") < tools.index("'TFTP server'")
-            < tools.index("'Subnet calculator'") < tools.index("'DNS'") < tools.index("'Packet capture'") < tools.index("'Saved Wi-Fi networks'"))
-    assert "More tools" not in tools
+    assert "const CARD_ORDER = ['lan', 'portforward', 'traceroute', 'dhcp', 'tftp', 'subnet', 'dns', 'wifi'];" in tools
+    assert (tools.index("'LAN throughput'") < tools.index("'Port forward check'") < tools.index("'Traceroute'") < tools.index("'TFTP server'")
+            < tools.index("'Subnet calculator'") < tools.index("'DNS'") < tools.index("'Saved Wi-Fi networks'"))
+    assert "More tools" not in tools and "'capture'" not in tools
     tr = _read("js/tools/traceroute.js")
     for s in ("'trace.start'", "'trace.hop'", "'trace.done'", "TNT.api.traceroute(", "TNT.api.tracerouteLast()", "totalelectronics.com",
               "the service keeps tracing", "err.status === 409", "TNT.tools.traceroute = {"):
@@ -532,7 +538,7 @@ def test_tools_batch_markup_settings_wan_and_cards():
     assert not re.search(r"#[0-9A-Fa-f]{3,6}\b", new_css), "hard-coded colour in the new tools CSS"
     # the tool modules load before app.js: TNT.util / TNT.ui may only be touched inside functions
     for rel in ("js/tools/subnet.js", "js/tools/traceroute.js", "js/tools/lan.js", "js/tools/portforward.js", "js/tools/subnetcalc.js",
-                "js/netcheck.js", "js/tools/tftp.js", "js/tools/capture.js"):
+                "js/netcheck.js", "js/tools/tftp.js", "js/views/capture.js"):
         top_level = [ln for ln in _read(rel).splitlines() if re.match(r"^  (const|let|var) ", ln)]
         assert not any(("TNT.util." in ln or "TNT.ui." in ln) and "=>" not in ln for ln in top_level), (rel, top_level)
 
@@ -728,8 +734,8 @@ def test_network_change_wiring():
         assert s in app, s
     # every view that shows network state has the hook; the Tools view hands it to its cards
     for rel in ("js/views/ipinfo.js", "js/views/discovery.js", "js/views/tools.js", "js/views/outages.js",
-                "js/tools/lan.js", "js/tools/subnetcalc.js", "js/tools/wifi.js", "js/tools/tftp.js", "js/tools/capture.js",
-                "js/tools/portforward.js"):
+                "js/tools/lan.js", "js/tools/subnetcalc.js", "js/tools/wifi.js", "js/tools/tftp.js", "js/views/capture.js",
+                "js/views/proav.js", "js/tools/portforward.js"):
         assert "netChanged(" in _read(rel), rel
     tools = _read("js/views/tools.js")
     assert "if (m.netChanged) m.netChanged(info, state)" in tools and "danger.networkChanged()" in tools
@@ -758,7 +764,7 @@ def test_network_change_wiring():
 def test_network_change_is_in_the_design_doc():
     docs = _doc("docs/DESIGN.md")
     for s in ("Network changed", "status.net.generation", "adapter warnings", "gateway off subnet", "checking…", "no default gateway",
-              "WiFi, Tools", "--tile-tight", "8 → 4 + 4"):
+              "WiFi, Tools", "--tile-tight", "9 → 4 + 4 + 1"):
         assert s in docs, s
     assert "Tools for the field" not in docs
 
@@ -1226,17 +1232,23 @@ def test_wifi_helpers_with_node(tmp_path):
 # ---------------------------------------------------------------------------
 def test_wifi_tile_view_and_accent():
     html = _read("index.html")
-    tiles = re.findall(r'<a class="tile" data-view="([a-z]+)" href="#\1" style="--accent: var\(--([a-z]+)\)">', html)
-    # WiFi before Tools, then Reports as the eighth tile
-    assert tiles == [("ipinfo", "blue"), ("ping", "green"), ("outages", "yellow"), ("speed", "purple"),
-                     ("discovery", "orange"), ("wifi", "teal"), ("tools", "red"), ("reports", "grey")]
+    tiles = re.findall(r'<a class="tile( half)?" data-view="([a-z]+)" href="#\2" style="--accent: var\(--([a-z]+)\)">', html)
+    # the four full-height tiles, then the seven half-height ones: WiFi before Tools, Reports, then Packet
+    # capture, Pro AV and SIP. SIP's --sand is the eleventh accent: the palette's ten were all spent.
+    assert [(name, accent) for _, name, accent in tiles] == [
+        ("ipinfo", "blue"), ("ping", "green"), ("outages", "yellow"), ("speed", "purple"), ("discovery", "orange"),
+        ("wifi", "teal"), ("tools", "red"), ("reports", "grey"), ("capture", "pink"), ("proav", "lime"),
+        ("sip", "sand")]
+    assert [name for half, name, _ in tiles if half] == HALF_TILES
     assert 'data-icon="wifi"></span><span class="tile-title">WiFi</span>' in html and 'id="tile-wifi"' in html
     # the chart helpers load after charts.js (they extend its base class), the view with the others
     assert html.index("js/charts.js") < html.index("js/wifichart.js") < html.index("js/views/wifi.js") < html.index("js/app.js")
     # the tiles are plain markup in index.html, in this order: there is no saved tile order anywhere
     # that could leave the new tile out (the only reorderable tiles are the Ping page's targets)
     app = _read("js/app.js")
-    assert "wifi: 'var(--teal)'" in app and "'discovery', 'wifi', 'tools', 'reports'];" in app
+    assert "wifi: 'var(--teal)'" in app and "'discovery', 'wifi', 'tools', 'reports', 'capture', 'proav', 'sip'];" in app
+    # app.js names the half-height tiles too (the markup carries the class): the two lists must not drift apart
+    assert "const HALF_TILES = " + repr(HALF_TILES).replace('"', "'") + ";" in app
     assert "tileEls.wifi" in app and "tileSummary(ws.last, ws.bridgeState(), ws.error)" in app
     assert "TNT.wifiSurvey.startTilePolling(" in app and "spectrum:" in app
     assert "localStorage.setItem('tnt.tiles" not in app
@@ -2088,9 +2100,15 @@ def test_small_screen_layout_rules():
         assert decl(sel).get("flex") == "none", sel
     # toolbars, form rows and chip lines wrap instead of overflowing their card
     for sel in (".form-row", ".section-head", ".section-head .actions", ".row", ".modal-foot", ".tile-line", ".tr-map",
-                ".setting", ".dhcp-summary", ".tool-summary", ".lan-self", ".ptile-sub", ".adapter-head", ".peer-meta",
+                ".dhcp-summary", ".tool-summary", ".lan-self", ".ptile-sub", ".adapter-head", ".peer-meta",
                 ".legend", ".chips", ".lan-result"):
         assert decl(sel).get("flex-wrap") == "wrap", sel
+    # a settings row is two columns rather than a wrapping flex line, so every control in the dialog starts at
+    # the same x; at phone width the column goes and the control drops under its description instead
+    setting = decl(".setting")
+    assert setting.get("display") == "grid" and "--setting-control" in setting.get("grid-template-columns", "")
+    narrow = _css_decls(_css_media(css, "(max-width: 700px)"), ".setting")
+    assert narrow.get("grid-template-columns") == "minmax(0, 1fr)", narrow
     # flex and grid children may shrink below their content width
     for sel in (".page", ".view", ".card", ".tile", ".tile-body", ".field", ".input", ".ptile-head", ".ptile-host",
                 ".lm-node", ".lm-chips", ".peer-text", ".modal-body", ".status-pill"):
@@ -2111,16 +2129,21 @@ def test_small_screen_layout_rules():
     assert text.get("overflow") == "hidden" and text.get("text-overflow") == "ellipsis" and text.get("min-width") == "0"
     for sel in (".brand", ".topbar-right > .live-badge", ".topbar-right > .btn"):
         assert decl(sel).get("flex") == "none", sel
-    # the quick tools (IP Release/Renew, Flush DNS: .btn children of the row too) are 44 px icon-only buttons below 1200 px, so
-    # the row still fits down to 800 px; their aria-label names them there
-    narrow = _css_media(css, "(max-width: 1199.98px)")
-    assert _css_decls(narrow, ".topbar-quick .quick-label").get("display") == "none"
-    assert _css_decls(narrow, ".topbar-quick").get("width") == "44px" and _css_decls(narrow, ".topbar-quick").get("padding") == "0"
+    # the header holds the status pill, LIVE and the gear and nothing else: the quick tools and Full Scan moved to
+    # their own pages, so no width band has to shrink a button to keep the row
     html = _read("index.html")
-    for tool_id, name in (("btn-ip-renew", "IP Release/Renew"), ("btn-flush-dns", "Flush DNS")):
-        assert re.search(r'<button class="btn topbar-quick" id="' + tool_id + r'" type="button" title="[^"]+" aria-label="' + re.escape(name) + '">', html), tool_id
-    # ping tiles keep room for the grip and the remove button beside the (ellipsized) name
-    assert decl(".ptile-head").get("padding-right") == "74px" and decl(".ptile-host").get("text-overflow") == "ellipsis"
+    bar = re.search(r'<div class="topbar-right">(.*?)</header>', html, re.S).group(1)
+    assert re.findall(r'id="([a-z-]+)"', bar) == ["status-pill", "status-light", "status-text", "live-badge", "live-spark", "live-text", "btn-settings"]
+    # the section shortcuts sit on the same row, in the space left over between the wordmark and the pill: they take
+    # only free space (flex: 1 1 0) and their clipping box is as tall as the row, so the row never grows for them
+    jumps = _css_decls(base, ".tile-jumps")
+    assert jumps.get("flex") == "1 1 0" and jumps.get("min-width") == "0" and jumps.get("overflow") == "hidden"
+    for gone in ("btn-ip-renew", "btn-flush-dns", "btn-full-scan", "topbar-quick", "topbar-scan"):
+        assert gone not in html and gone not in css, gone
+    # the quick tools are a row of ordinary buttons in a card on the Tools page now; it wraps instead of shrinking them
+    assert decl(".quick-tools").get("flex-wrap") == "wrap"
+    # ping tiles keep room for the tool cluster (grip, expand, rename, remove) beside the (ellipsized) name
+    assert decl(".ptile-head").get("padding-right") == "130px" and decl(".ptile-host").get("text-overflow") == "ellipsis"
     app = _read("js/app.js")
     assert "pill.title = o.text" in app   # the full status behind the ellipsis
     # a tile click on a short window brings its view up under the header (only a tile click)
@@ -2246,10 +2269,17 @@ def test_netinfo(mock):
 
 def test_targets_crud_samples_history(mock):
     st, _, t = _req(mock.port, "POST", "/api/targets", {"host": "8.8.8.8", "label": "Google DNS"})
-    assert st == 201 and t["host"] == "8.8.8.8" and t["label"] == "Google DNS" and t["kind"] == "internet"
+    assert st == 201 and t["host"] == "8.8.8.8" and t["label"] == "Google DNS" and t["kind"] == "internet" and t["name"] is None
     tid = t["id"]
     st, _, lst = _req(mock.port, "GET", "/api/targets")
     assert st == 200 and any(x["id"] == tid for x in lst)
+    # PATCH a custom name (like tnt.api.routes rename_target): trimmed, label untouched; null/blank clears it
+    st, _, v = _req(mock.port, "PATCH", f"/api/targets/{tid}", {"name": "  My DNS  "})
+    assert st == 200 and v["name"] == "My DNS" and v["label"] == "Google DNS"
+    st, _, v = _req(mock.port, "PATCH", f"/api/targets/{tid}", {"name": None})
+    assert st == 200 and v["name"] is None
+    st, _, err = _req(mock.port, "PATCH", "/api/targets/999999", {"name": "x"})
+    assert st == 404 and err["error"]["code"] == "not_found"
     # duplicate host returns the existing target
     st, _, again = _req(mock.port, "POST", "/api/targets", {"host": "8.8.8.8"})
     assert st == 201 and again["id"] == tid
@@ -2272,6 +2302,30 @@ def test_targets_crud_samples_history(mock):
     assert st == 200 and [x["host"] for x in lst] == ["gateway", "1.1.1.1", "totalelectronics.com"]
     # the gateway alias is resolved afresh from the network the PC is on now
     assert lst[0]["ip"] == "10.0.0.251" and lst[0]["resolved"] is True and lst[0]["kind"] == "local"
+
+
+def test_ping_tile_rename_and_detail_wiring():
+    """The custom-name (pencil) editor, the expand-to-detail modal and their supporting pieces are wired."""
+    api = _read("js/api.js")
+    assert "renameTarget:" in api and "'/targets/' + encodeURIComponent(id), { name:" in api
+    app = _read("js/app.js")
+    assert "function targetName(t) { return t ? (t.name || t.label || t.host) : ''; }" in app
+    assert "function originalTargetName" in app and "originalTargetName, pad2 }" in app
+    assert "edit: '<svg " in app and "expand: '<svg " in app       # the two new icons
+    assert "(opts.wide ? ' wide' : '')" in app                     # wide modal for the detail view
+    ping = _read("js/views/ping.js")
+    for s in ("ptile-tools", "ptile-expand", "ptile-edit", "class: 'ptile-tool ptile-grip'",
+              "function enterEdit", "function saveName", "function openDetail",
+              "TNT.api.renameTarget(rec.t.id, next)", "new TNT.charts.LineChart(canvas, { unit: 'ms',",
+              "const DETAIL_WINDOWS =", "TNT.ui.segmented(DETAIL_WINDOWS", "function setWindow",
+              "TNT.api.history(t.id,",     # longer windows read the db minute aggregates (persist across restarts)
+              "TNT.views.outages.outageTable(rows, 'No outages recorded for this target.')"):
+        assert s in ping, s
+    out = _read("js/views/outages.js")
+    assert "function outageTable" in out and "function outageRow" in out and "outageTable,\n    outageRow," in out
+    css = _read("css/tnt.css")
+    for s in (".ptile-tools {", ".ptile-tool {", ".modal.wide {", ".ptile-detail-chart {", ".ptile-name-edit {"):
+        assert s in css, s
 
 
 def test_outages_and_timeline(mock):
@@ -3321,6 +3375,89 @@ def test_unknown_routes(mock):
     assert st == 405
 
 
+
+# ---------------------------------------------------------------------------
+# realtime throughput: the mock's feed and the shape it has to keep
+# ---------------------------------------------------------------------------
+def test_the_mocks_throughput_matches_the_services(mock):
+    """The card is written against one shape; a drift here is a card that works against the dev
+    server and not against the service, which is the one bug the dev server exists to prevent."""
+    from tnt import throughput
+
+    mod = mock.mod
+    assert mod.TP_WINDOWS == throughput.WINDOWS and mod.TP_NIC_KEYS == throughput.NIC_KEYS
+    assert mod.TP_VIEW_KEYS == throughput.VIEW_KEYS
+    assert mod.TP_DEFAULT_WINDOW_S == throughput.DEFAULT_WINDOW_S
+    assert mod.TP_HISTORY_S == throughput.HISTORY_S and mod.TP_MAX_POINTS == throughput.MAX_POINTS
+    # the bucket and mean helpers are copies of the service's: they must agree sample for sample
+    rows = [[100, 10, 1, 5, 2], [101, 20, 3, 7, 4], [102, 30, 2, 9, 0], [105, 90, 9, 3, 3]]
+    for step in (1, 3, 10):
+        assert mod._tp_bucket(rows, step) == throughput._bucket(rows, step), step
+    assert mod._tp_mean(rows, 1) == throughput._mean(rows, 1)
+
+
+def test_the_mock_serves_a_throughput_window(mock):
+    now = time.time()
+    for i in range(35):
+        mock.state.throughput_tick(now - 34 + i)
+    st, _, data = _req(mock.port, "GET", "/api/throughput?window_s=30")
+    assert st == 200
+    assert set(data) == set(mock.mod.TP_VIEW_KEYS)
+    assert data["window_s"] == 30 and data["step_s"] == 1 and data["note"] is None
+    assert data["windows"] == list(mock.mod.TP_WINDOWS)
+    assert data["nics"], "the mock's PC has no adapter moving anything"
+    for nic in data["nics"]:
+        assert set(nic) == set(mock.mod.TP_NIC_KEYS)
+        assert all(len(s) == 5 for s in nic["samples"])
+        assert nic["rx_bytes"] > 0 and nic["rx_packets"] > 0
+    assert data["nics"][0]["primary"] is True       # the internet-facing NIC leads
+    # an adapter that is up but moving nothing is left out, exactly as the service leaves it out
+    assert "vEthernet (Default Switch)" not in [n["name"] for n in data["nics"]]
+
+    # a window nobody should have asked for is answered, never 400ed
+    for bad, want in (("", 30), ("soon", 30), ("45", 30), ("1800", 1800), ("99999", 1800)):
+        st, _, data = _req(mock.port, "GET", "/api/throughput?window_s=" + bad)
+        assert st == 200 and data["window_s"] == want, bad
+    st, _, data = _req(mock.port, "GET", "/api/throughput?window_s=1800")
+    assert data["step_s"] == 3 and len(data["nics"][0]["samples"]) <= mock.mod.TP_MAX_POINTS
+
+
+def test_the_throughput_sample_event_reaches_the_stream(mock):
+    """The card's only live feed: its rows are the view's rows without the series."""
+    conn = http.client.HTTPConnection("127.0.0.1", mock.port, timeout=5)
+    try:
+        conn.request("GET", "/api/events")
+        resp = conn.getresponse()
+        assert resp.status == 200
+
+        def read_event():
+            lines = []
+            while True:
+                ln = resp.readline().decode("utf-8").rstrip("\r\n")
+                if ln == "":
+                    if any(l.startswith("event:") for l in lines):
+                        ev = next(l[6:].strip() for l in lines if l.startswith("event:"))
+                        return ev, json.loads("".join(l[5:].strip() for l in lines if l.startswith("data:")))
+                    lines = []
+                    continue
+                lines.append(ln)
+
+        assert read_event()[0] == "hello"
+        ts = float(int(time.time()))
+        mock.state.throughput_tick(ts)
+        ev, data = read_event()
+        assert ev == "throughput.sample"
+        assert set(data) == {"ts", "nics"} and data["ts"] == ts and data["nics"]
+        extra = {"samples", "avg_rx_bps", "avg_tx_bps", "peak_rx_bps", "peak_tx_bps"}
+        for nic in data["nics"]:
+            assert set(nic) == set(mock.mod.TP_NIC_KEYS) - extra
+        # unlike the view, the event carries the idle adapters too: that is how a NIC which
+        # starts carrying traffic reaches an open card without it refetching anything
+        assert "vEthernet (Default Switch)" in [n["name"] for n in data["nics"]]
+    finally:
+        conn.close()
+
+
 def test_sse_stream_hello_then_ping_samples(mock):
     conn = http.client.HTTPConnection("127.0.0.1", mock.port, timeout=5)
     try:
@@ -3436,8 +3573,8 @@ def test_wifi_page_mounts_in_a_browser_without_errors(browser_page):
     dom = browser_page("#wifi")
     # the mock bridge records uncaught errors, rejections and console.error calls here
     assert 'data-mock-errors="[]"' in dom
-    assert len(re.findall(r'<a class="tile[^"]*" data-view="', dom)) == 8
-    assert re.search(r'<a class="tile active" data-view="wifi" href="#wifi"', dom)
+    assert len(re.findall(r'<a class="tile[^"]*" data-view="', dom)) == len(TILE_NAMES)
+    assert re.search(r'<a class="tile half active" data-view="wifi" href="#wifi"', dom)
     tile = _tile_body(dom, "wifi")
     assert re.search(r'<span class="num">\d+</span><span class="muted">networks ·</span><span class="muted">\d+ APs</span>', tile)
     assert "Scanning every 10 s" in dom and "briefly add latency" in dom
@@ -3449,6 +3586,42 @@ def test_wifi_page_mounts_in_a_browser_without_errors(browser_page):
     assert re.search(r'<span class="survey-net-name">[0-9A-F:]{17}</span><span class="survey-net-sub"><span class="badge grey"[^>]*>hidden</span>', dom)
     assert "Contoso Access Systems" in dom and "likely Fabrikam Networks" in dom   # vendors via GET /api/oui
     assert 'aria-label="6 GHz spectrum: 5 access points"' in dom
+
+
+def test_capture_page_mounts_in_a_browser_without_errors(browser_page):
+    """The Packet capture page against the mock (an administrator, nothing capturing): the Capture card with its adapter
+    picker, limits and buttons, the empty packet list with its filters, and the yellow warning under both."""
+    dom = browser_page("#capture")
+    assert 'data-mock-errors="[]"' in dom
+    assert len(re.findall(r'<a class="tile[^"]*" data-view="', dom)) == len(TILE_NAMES)
+    assert re.search(r'<a class="tile half active" data-view="capture" href="#capture"', dom)
+    # the tile: not capturing, and the saved captures the mock starts with
+    tile = _tile_body(dom, "capture")
+    assert '<span class="strong">Not capturing</span>' in tile
+    assert re.search(r'<span class="num">\d+</span><span class="muted">saved capture', tile)
+    view = dom.split('id="view"', 1)[1].split("<section class=\"diagnostics\"", 1)[0]
+    assert "Packet capture</h2>" in view and 'style="--accent: var(--pink);"' in view
+    # an administrator: the admin box and the "not available" box stay hidden and the page itself is shown
+    assert '<div class="dhcp-info warn" hidden=""><svg' in view and "needs a Windows administrator account</span></div>" in view
+    assert '<div class="stack">' in view and '<div class="card" data-card="capture">' in view
+    # the Capture card: an adapter that is up, the service's own time and size limits, and Start (Stop/Save/Discard hidden)
+    assert re.search(r'<select class="input" aria-label="Adapter"><option value="Ethernet">Ethernet</option>', view)
+    assert re.findall(r'<select class="input" aria-label="Stop after">.*?</select>', view, re.S)
+    assert ">1 min</option>" in view and ">60 min</option>" in view and ">64 MB</option>" in view and ">1024 MB</option>" in view
+    assert re.search(r'<button class="btn btn-primary" type="button" title="Start[^"]*">(?:(?!</button>).)*Start</button>', view, re.S)
+    for label in ("Stop", "Save to disk", "Discard"):
+        assert re.search(r'<button class="btn" type="button"[^>]*hidden=""[^>]*>(?:(?!</button>).)*' + label + "</button>", view, re.S), label
+    assert '<div class="cap-status muted" role="status" aria-live="polite"><span class="strong">Not capturing</span>' in view
+    # the packet list: the filter fields, every protocol button off, the columns and the empty state
+    assert 'aria-label="Filter by IP address"' in view and 'aria-label="Filter by MAC address"' in view
+    protos = re.findall(r'<button class="cap-proto" type="button" title="[^"]*" aria-pressed="false">(?:<svg.*?</svg>)?([A-Z].*?)</button>', view, re.S)
+    assert protos == ["ICMP", "ARP", "DNS", "DHCP", "HTTP", "HTTPS", "TCP", "UDP", "RTSP", "RTP", "SIP calls"]
+    assert '<button class="btn btn-sm cap-calls-btn" type="button" hidden=""' in view and "No calls found yet</button>" in view
+    assert re.findall(r"<th[^>]*>([^<]+)</th>", view) == ["No.", "Time", "Since start", "Source", "Destination", "Protocol", "Length", "Info"]
+    assert '<table class="table cap-table" hidden="">' in view and "<tbody></tbody>" in view
+    assert '<div class="cap-empty">Pick an adapter and hit Start, or open a capture you saved earlier.</div>' in view
+    assert '<span class="muted small">0 packets</span>' in view
+    assert '<div class="dhcp-info warn cap-warning">' in view and "a copy you save elsewhere is not protected." in view
 
 
 def test_wifi_selected_network_is_highlighted_everywhere_in_a_browser(browser_page):
@@ -3465,7 +3638,7 @@ def test_wifi_selected_network_is_highlighted_everywhere_in_a_browser(browser_pa
 def test_wifi_tile_on_the_dashboard_waits_for_a_late_bridge(browser_page):
     dom = browser_page("?wifi=late#ipinfo")
     assert 'data-mock-errors="[]"' in dom
-    assert re.search(r'<a class="tile active" data-view="ipinfo"', dom)
+    assert re.search(r'<a class="tile half active" data-view="ipinfo"', dom)
     tile = _tile_body(dom, "wifi")
     assert "networks" in tile and "APs" in tile and "tile-ellipsis" in tile
 
@@ -3497,7 +3670,8 @@ def test_wifi_states_render_their_message_in_a_browser(browser_page, mode, texts
 
 
 # the real index.html in one sandboxed iframe per window width (scripts off: the tile row is static markup and
-# CSS), measured with its eight tiles and again with a copy of the last one as a ninth (never committed)
+# CSS), measured with its own tiles and again with a copy of the last one added (never committed), so the rules
+# that balance the rows are exercised at both counts
 _TILE_PROBE = r"""<!doctype html><html><head><meta charset="utf-8"><title>tile probe</title></head><body>
 <pre id="probe">pending</pre>
 <script>
@@ -3537,8 +3711,8 @@ for (const w of WIDTHS) {
 
 
 def test_tile_grid_keeps_equal_widths_in_a_browser(browser_page, mock, monkeypatch):
-    """The eight tiles, and a temporary ninth, at desktop down to small-window widths: balanced rows, every tile in
-    every row the same width, nothing past the row's right edge, every title on one line."""
+    """The eleven tiles, and a temporary twelfth, at desktop down to small-window widths: balanced rows, every tile
+    in every row the same width, nothing past the row's right edge, every title on one line."""
     widths = [1920, 1600, 1440, 1366, 1024, 980, 960, 900, 800, 740, 720, 700]
     page = _TILE_PROBE.replace("__WIDTHS__", json.dumps(widths)).encode("utf-8")
     original = mock.mod.Handler._static
@@ -3558,13 +3732,14 @@ def test_tile_grid_keeps_equal_widths_in_a_browser(browser_page, mock, monkeypat
     m = re.search(r'<pre id="probe">(.*?)</pre>', dom, re.S)
     assert m and m.group(1) != "pending", "the probe page did not finish"
     res = json.loads(m.group(1))
-    expect = {  # window width: (tiles per row with the eight tiles, with a ninth)
-        1920: ([4, 4], [4, 4, 1]), 1600: ([4, 4], [4, 4, 1]), 1440: ([4, 4], [4, 4, 1]), 1366: ([4, 4], [4, 4, 1]),
-        1024: ([4, 4], [4, 4, 1]), 960: ([4, 4], [4, 4, 1]), 900: ([4, 4], [4, 4, 1]), 800: ([3, 3, 2], [3, 3, 3]),
-        720: ([3, 3, 2], [3, 3, 3]), 700: ([2, 2, 2, 2], [2, 2, 2, 2, 1]),
+    expect = {  # window width: (tiles per row with the eleven tiles, with a twelfth)
+        1920: ([4, 4, 3], [4, 4, 4]), 1600: ([4, 4, 3], [4, 4, 4]), 1440: ([4, 4, 3], [4, 4, 4]), 1366: ([4, 4, 3], [4, 4, 4]),
+        1024: ([4, 4, 3], [4, 4, 4]), 980: ([4, 4, 3], [4, 4, 4]), 960: ([4, 4, 3], [4, 4, 4]), 900: ([4, 4, 3], [4, 4, 4]),
+        800: ([3, 3, 3, 2], [3, 3, 3, 3]), 740: ([3, 3, 3, 2], [3, 3, 3, 3]), 720: ([3, 3, 3, 2], [3, 3, 3, 3]),
+        700: ([2, 2, 2, 2, 2, 1], [2, 2, 2, 2, 2, 2]),
     }
-    for w, (rows8, rows9) in expect.items():
-        for key, rows in (("real", rows8), ("extra", rows9)):
+    for w, (real_rows, extra_rows) in expect.items():
+        for key, rows in (("real", real_rows), ("extra", extra_rows)):
             tiles = res[str(w)][key]
             tops = sorted({t["y"] for t in tiles})
             assert [sum(1 for t in tiles if t["y"] == y) for y in tops] == rows, (w, key, tiles)
@@ -3590,7 +3765,9 @@ def test_open_views_follow_a_network_change_in_a_browser(browser_page, mock):
         mock.state.switch_network("a")
     assert 'data-mock-errors="[]"' in dom
     tile = _tile_body(dom, "ipinfo")
-    assert "Wi-Fi" in tile and "192.168.50.23/24" in tile and "192.168.50.1" in tile and "10.0.0.112" not in tile
+    # the adapter and its address; the gateway is on the page, not on a two-line tile
+    assert "Wi-Fi" in tile and "192.168.50.23/24" in tile and "10.0.0.112" not in tile
+    assert "192.168.50.1" not in tile and "Gateway" not in tile
     view = dom.split('id="view"', 1)[1]
     # the adapters were read again without a reload: the Wi-Fi card, the new default gateway, nothing of the old network
     assert '<code class="copy" title="Click to copy">192.168.50.23</code>' in view and "10.0.0.112" not in view
@@ -3631,23 +3808,36 @@ def test_tools_page_follows_a_network_change_in_a_browser(browser_page, mock):
     assert "Wi-Fi — 192.168.50.23/24 (DHCP) (internet)" in dom
     assert "192.168.50.23" in re.search(r'<div class="lan-self">(.*?)</div>', dom, re.S).group(1)
     assert "SITE-B-PC" in dom and "TEC-LAPTOP-02" not in dom
-    # the Tools tile: the DHCP server's line, then the tools by name
+    # the Tools tile (half height): the DHCP server's line, then the tools by name on one ellipsized line
     tile = _tile_body(dom, "tools")
-    assert re.findall(r'<div class="tile-line tile-tool">([^<]+)</div>', tile) == ["LAN throughput", "Port forward", "Traceroute", "TFTP server",
-                                                                                    "Subnet calc", "DNS", "Packet capture", "WiFi passwords"]
-    assert "DHCP server" in tile and "Tools for the field" not in tile
+    names = ["LAN throughput", "Port forward check", "Traceroute", "TFTP server", "Subnet calc", "DNS", "WiFi passwords"]
+    assert re.search(r'<span class="tile-ellipsis muted" title="' + re.escape(", ".join(names)) + '">'
+                     + re.escape(" · ".join(names)) + "</span>", tile), tile
+    assert "DHCP server" in tile and "Tools for the field" not in tile and "Packet capture" not in tile
 
 
 # ---------------------------------------------------------------------------
-# the DNS card, the collapsible Tools cards and the top bar's quick tools (IP Release/Renew, Flush DNS)
+# the DNS card, the collapsible Tools cards and the Quick Tools row (IP Release/Renew, Flush DNS)
 # ---------------------------------------------------------------------------
 def test_quick_tools_markup_css_and_controller():
-    html = _read("index.html")
-    renew = re.search(r'<button class="btn topbar-quick" id="btn-ip-renew" type="button" title="[^"]+" aria-label="IP Release/Renew">'
-                      r'<span data-icon="renew"></span><span class="quick-label">IP Release/Renew</span></button>', html)
-    flush = re.search(r'<button class="btn topbar-quick" id="btn-flush-dns" type="button" title="[^"]+" aria-label="Flush DNS">'
-                      r'<span data-icon="flush"></span><span class="quick-label">Flush DNS</span></button>', html)
-    assert renew and flush and renew.start() < flush.start() < html.index('id="btn-full-scan"') < html.index('id="status-pill"')
+    # the Quick Tools row is built by the Tools page, above every card and never collapsible; app.js still owns the
+    # buttons (their ids are its) so a run survives leaving the page and coming back
+    tools = _read("js/views/tools.js")
+    assert ("const QUICK_TOOLS = [\n"
+            "    { tool: 'renew', icon: 'renew', label: 'IP Release/Renew', title: \"Release this PC's IP addresses and renew them from the DHCP server\" },\n"
+            "    { tool: 'flush', icon: 'flush', label: 'Flush DNS', title: \"Flush this PC's DNS cache\" },\n"
+            "  ];") in tools
+    for s in ("const ids = (TNT.app && TNT.app.QUICK_TOOL_IDS) || {};", "h('div', { class: 'quick-tools' })",
+              "class: 'btn quick-tool', type: 'button', id: ids[q.tool] || ('btn-quick-' + q.tool)",
+              "'aria-label': q.label,", "if (TNT.app && TNT.app.quickRun) TNT.app.quickRun(q.tool);",
+              "h('span', { class: 'quick-label' }, q.label)", "TNT.ui.icon('spark'), 'Quick Tools'",
+              "h('div', { class: 'card', data: { tool: 'quick' } }, title, row)",
+              "root.appendChild(h('div', { class: 'stack' }, buildQuickTools(), ...cards));",
+              "if (TNT.app && TNT.app.quickSync) TNT.app.quickSync();"):
+        assert s in tools, s
+    # the row is a plain card: makeCollapsible never touches it, so it has no chevron and cannot be closed
+    quick = tools[tools.index("function buildQuickTools()"):tools.index("TNT.views.tools = {")]
+    assert "makeCollapsible" not in quick
     api = _read("js/api.js")
     for s in ("dnsLookup: (name, server, type) => api.post('/tools/dns/lookup', Object.assign({ name }, server ? { server } : {}, type ? { type } : {}), "
               "{ timeout: 30000 }),",
@@ -3657,12 +3847,15 @@ def test_quick_tools_markup_css_and_controller():
         assert s in api, s
     app = _read("js/app.js")
     for s in ("dns: '<svg ", "flush: '<svg ", "renew: '<svg ", "chevron: '<svg ",
-              "$('#btn-ip-renew').addEventListener('click', () => quickRun('renew'));",
-              "$('#btn-flush-dns').addEventListener('click', () => quickRun('flush'));",
+              "renew: { id: 'btn-ip-renew',", "flush: { id: 'btn-flush-dns',",
+              "QUICK_TOOL_IDS: { renew: QUICK_TOOLS.renew.id, flush: QUICK_TOOLS.flush.id },",
               "busyLabel: 'Renewing…'", "busyLabel: 'Flushing…'", "run: () => api.ipRenew()", "run: () => api.flushDns()",
-              "if (!btn || st.busy) return;", "btn.setAttribute('aria-busy', 'true');", "btn.disabled = on;",
+              "if (!started || st.busy) return;", "btn.setAttribute('aria-busy', 'true');", "btn.disabled = on;",
               "const o = api.quick.outcome(tool, result, error);", "quickFlash(btn, tool, o.ok);", "toast(o.text, o.kind,",
               "btn.classList.add(ok ? 'flash-ok' : 'flash-bad');", "'\\nLast run ' + fmtTime(ts)",
+              # the row only exists while Tools is open: a run finishes on the button that is on the page now, and a
+              # freshly mounted row shows a tool that is still running as busy again
+              "const btn = $('#' + q.id) || started;", "function quickSync() {", "if (btn && quickState[tool].busy) quickBusy(btn, tool, true);",
               # the pause around a renew is part of the renew: no "Monitoring paused/resumed" toasts while it runs and just after
               "const RENEW_QUIET_MS = 5000;", "if (tool === 'renew') quietPauseUntil = Infinity;",
               "if (tool === 'renew') quietPauseUntil = Date.now() + RENEW_QUIET_MS;",
@@ -3682,10 +3875,10 @@ def test_quick_tools_markup_css_and_controller():
     reduced = _css_media(css, "(prefers-reduced-motion: reduce)")
     assert "var(--green)" in _css_decls(reduced, ".btn.flash-ok").get("background", "")
     assert "var(--red)" in _css_decls(reduced, ".btn.flash-bad").get("background", "")
-    busy = _css_decls(base, '.btn.topbar-quick[aria-busy="true"]')
+    busy = _css_decls(base, '.btn.quick-tool[aria-busy="true"]')
     assert busy.get("opacity") == "1" and "var(--yellow)" in busy.get("background", "")
-    top_css = css[css.index("/* IP Release/Renew and Flush DNS"):css.index("/* ---------- layout")]
-    assert not re.search(r"#[0-9A-Fa-f]{3,6}\b", top_css), "hard-coded colour in the quick tools CSS"
+    quick_css = css[css.index("/* The quick tools (IP Release/Renew, Flush DNS)"):css.index("/* ---------- layout")]
+    assert not re.search(r"#[0-9A-Fa-f]{3,6}\b", quick_css), "hard-coded colour in the quick tools CSS"
 
 
 def test_collapsible_tool_cards_and_dns_card_markup():
@@ -3693,15 +3886,15 @@ def test_collapsible_tool_cards_and_dns_card_markup():
     assert html.index("js/tools/subnetcalc.js") < html.index("js/tools/dns.js") < html.index("js/tools/wifi.js") < html.index("js/views/tools.js")
     tools = _read("js/views/tools.js")
     assert "{ key: 'dns', title: 'DNS', icon: 'dns', create: () => TNT.tools.dns.create() }," in tools
-    for s in ("makeCollapsible(els.card, titleRow, body, 'dhcp', 'DHCP server', [els.badge, els.toggle]);",
+    for s in ("makeCollapsible(els.card, titleRow, body, 'dhcp', 'DHCP server', [els.head]);",
               "makeCollapsible(card, title, mod.body, c.key, c.title, [mod.head]);",
               "'aria-expanded': 'false', 'aria-controls': body.id", "row.insertBefore(btn, row.firstChild);", "body.hidden = !open;",
               "const hit = t.closest('button, a, input, select, textarea, label, .badge');", "(controls || []).some((c) => c && c.contains(t))",
               "if (checked) { openCard('dhcp'); turnOn(false); }", "if (att && att !== attentionShown) openCard('dhcp');",
               "withCardOpen,", "dhcpAttention,"):
         assert s in tools, s
-    # the opened cards outlive the view (module level, never reset by mount or unmount): only a reload starts collapsed
-    assert re.search(r"^  let openCards = \[\];", tools, re.M) and tools.count("openCards = [") == 1
+    # every time the Tools page opens, all cards start collapsed: mount() resets openCards (module-level decl + the reset)
+    assert re.search(r"^  let openCards = \[\];", tools, re.M) and tools.count("openCards = [") == 2
     assert tools.count("checkAttention();") == 2          # after a status is applied and after a failed pre-start check
     dns = _read("js/tools/dns.js")
     for s in ("TNT.tools.dns = { create, resultView, validName, validServer, validType, TYPES };", "TNT.api.dnsLookup(n.name, s.server, t.type)",
@@ -3734,9 +3927,11 @@ def test_collapsible_tool_cards_and_dns_card_markup():
 def test_dns_card_collapsible_cards_and_quick_tools_are_in_the_design_doc():
     docs = _doc("docs/DESIGN.md")
     for s in ("collapsible cards", "`.card-toggle`", "\"DNS\" card", "nslookup", "non-authoritative", "IP Release/Renew", "Flush DNS",
-              "`.flash-ok`", "`.flash-bad`", "Renewing…", "below 1200 px", "calculator, DNS, Packet capture, Saved Wi-Fi networks",
-              "Subnet calc, DNS, Packet capture, WiFi passwords"):
+              "`.flash-ok`", "`.flash-bad`", "Renewing…", "**Quick Tools** row", "never collapsible itself",
+              "Subnet calculator, DNS, Saved Wi-Fi networks", "Subnet calc · DNS · WiFi passwords"):
         assert s in docs, s
+    # Packet capture left the Tools page and its tile's tool list for a page and a tile of its own
+    assert "Packet capture is no longer a card here" in docs and "Packet capture is not among them any" in docs
 
 
 _DNS_NAME_CASES = ["", "   ", "www.example.com", "  www.example.com.  ", "example.com..", ".example.com", "-bad.example", "bad-.example",
@@ -3883,7 +4078,7 @@ def test_tools_collapse_helpers_and_quick_tool_outcomes_with_node(tmp_path):
     r = subprocess.run(["node", str(driver)] + [str(f) for f in files], capture_output=True, text=True, encoding="utf-8", timeout=30)
     assert r.returncode == 0, r.stderr
     out = json.loads(r.stdout)
-    assert out["cards"] == ["LAN throughput", "Port forward", "Traceroute", "TFTP server", "Subnet calculator", "DNS", "Packet capture", "Saved Wi-Fi networks"]
+    assert out["cards"] == ["LAN throughput", "Port forward check", "Traceroute", "TFTP server", "Subnet calculator", "DNS", "Saved Wi-Fi networks"]
     # the open cards: added once, removed, never changed in place; none open when the page loads
     assert out["open"] == [["dns"], ["dhcp"], ["dhcp", "dns"], ["lan"], []] and out["untouched"] == ["dhcp", "dns"] and out["openAtLoad"] == []
     # what opens the DHCP card by itself: a failed pre-start check, an error, a firewall failure, a warning not already in the red scan box
@@ -4129,6 +4324,11 @@ async function run() {
   await until(() => frame.contentDocument && frame.contentDocument.querySelectorAll('#view .card-toggle').length >= 8, 8000);
   const win = frame.contentWindow, doc = frame.contentDocument;
   out.initial = cards(doc);
+  // the Quick Tools row: the first card of the stack, never collapsible, its buttons carrying app.js's ids
+  const row = doc.querySelector('#view [data-tool="quick"]');
+  out.quick = { first: row.parentElement.firstElementChild === row, toggles: row.querySelectorAll('.card-toggle').length,
+                buttons: Array.from(row.querySelectorAll('.quick-tool')).map((b) => b.id),
+                labels: Array.from(row.querySelectorAll('.quick-tool .quick-label')).map((s) => s.textContent) };
   // a control in a title row never toggles its card: the Traceroute badge, the DHCP server's badge
   doc.querySelector('[data-tool="traceroute"] .card-title .badge').click();
   doc.querySelector('[data-tool="dhcp"] .switch-row .badge').click();
@@ -4140,7 +4340,7 @@ async function run() {
   lan.click(); out.lanOpened = card(doc, 'lan');
   lan.click(); out.lanClosed = card(doc, 'lan');
   lan.click();
-  // leaving Tools and coming back keeps the opened cards open
+  // leaving Tools and coming back collapses every card again (the page always opens fully collapsed)
   win.location.hash = '#ipinfo';
   await until(() => !doc.querySelector('#view .card-toggle'), 4000);
   win.location.hash = '#tools';
@@ -4209,17 +4409,19 @@ def test_tools_cards_collapse_dns_lookup_and_flush_dns_in_a_browser(browser_page
     assert "failed" not in res, res.get("failed")
     assert res["errors"] == "[]"
     # every card starts collapsed, its chevron first in the title row and named after the tool
-    assert [(c["tool"], c["label"]) for c in res["initial"]] == [("lan", "LAN throughput"), ("portforward", "Port forward"),
+    assert [(c["tool"], c["label"]) for c in res["initial"]] == [("lan", "LAN throughput"), ("portforward", "Port forward check"),
                                                                   ("traceroute", "Traceroute"), ("dhcp", "DHCP server"), ("tftp", "TFTP server"),
-                                                                  ("subnet", "Subnet calculator"), ("dns", "DNS"), ("capture", "Packet capture"),
-                                                                  ("wifi", "Saved Wi-Fi networks")]
+                                                                  ("subnet", "Subnet calculator"), ("dns", "DNS"), ("wifi", "Saved Wi-Fi networks")]
     assert all(c["expanded"] == "false" and c["hidden"] and c["first"] for c in res["initial"]), res["initial"]
+    # the Quick Tools row sits above them all in a card of its own, and has no chevron to collapse it
+    assert res["quick"] == {"first": True, "toggles": 0, "buttons": ["btn-ip-renew", "btn-flush-dns"],
+                            "labels": ["IP Release/Renew", "Flush DNS"]}
     assert all(c["expanded"] == "false" and c["hidden"] for c in res["afterControls"]), res["afterControls"]
     assert res["afterTitle"]["expanded"] == "true" and res["afterTitle"]["hidden"] is False
     assert res["lanOpened"]["expanded"] == "true" and res["lanClosed"]["expanded"] == "false" and res["lanClosed"]["hidden"] is True
-    assert {c["tool"]: c["expanded"] for c in res["afterReturn"]} == {"dhcp": "false", "tftp": "false", "lan": "true", "portforward": "false",
-                                                                      "traceroute": "false", "subnet": "false", "dns": "true", "capture": "false",
-                                                                      "wifi": "false"}
+    # opening dns and lan, then leaving Tools and coming back: every card is collapsed again
+    assert {c["tool"]: c["expanded"] for c in res["afterReturn"]} == {"dhcp": "false", "tftp": "false", "lan": "false", "portforward": "false",
+                                                                      "traceroute": "false", "subnet": "false", "dns": "false", "wifi": "false"}
     assert res["invalid"] == {"text": '"not a name" is not a DNS name or IP address', "hidden": False, "ariaInvalid": "true"}
     assert res["invalidCleared"] is True
     d = res["dns"]
@@ -4250,8 +4452,10 @@ function measure(doc, win) {
     const r = el.getBoundingClientRect();
     return { id: el.id, top: Math.round(r.top), right: Math.round(r.right * 10) / 10, w: Math.round(r.width) };
   });
+  const brand = doc.querySelector('.brand').getBoundingClientRect();
   return { height: Math.round(bar.getBoundingClientRect().height), inner: doc.documentElement.clientWidth, kids,
-           labels: win.getComputedStyle(doc.querySelector('#btn-ip-renew .quick-label')).display !== 'none',
+           brandRight: Math.round(brand.right * 10) / 10, brandTop: Math.round(brand.top),
+           caption: win.getComputedStyle(doc.querySelector('.brand-caption')).display !== 'none',
            pill: Math.round(doc.getElementById('status-pill').getBoundingClientRect().width) };
 }
 for (const w of WIDTHS) {
@@ -4268,25 +4472,306 @@ for (const w of WIDTHS) {
 </script></body></html>"""
 
 
-def test_top_bar_stays_one_row_with_the_quick_tools_in_a_browser(browser_page, mock, monkeypatch):
-    """Brand, IP Release/Renew, Flush DNS, Full Scan, the status pill, LIVE and the gear on one row from 1920 px down to 660 px
-    (two rows at most on a phone-width window below that): the quick tools show their labels from 1200 px, icons only below;
-    nothing leaves the window and the status pill keeps room for its light."""
-    widths = [1920, 1440, 1366, 1280, 1200, 1199, 1100, 1024, 960, 900, 853, 800, 780, 760, 720, 700, 680, 660, 640, 600, 560]
+#: Below this the stylesheet deliberately lets the controls drop a row (`.topbar-right { flex-wrap: wrap }`,
+#: "one row would squeeze the status pill to nothing"). Above it the bar is one 64 px row at every width. The app's
+#: own window never goes under 1024 px, so the second row is browser-only territory.
+TOPBAR_ONE_ROW_MIN_W = 660
+
+
+def test_top_bar_stays_one_row_in_a_browser(browser_page, mock, monkeypatch):
+    """Brand, the status pill, LIVE and the gear on one row down to `TOPBAR_ONE_ROW_MIN_W`, now that the quick tools
+    and Full Scan have their own pages: nothing leaves the window, the caption under the wordmark goes below 780 px
+    and the status pill keeps room for its light. Below that the controls may take a second row by design, but never
+    a third and never past the right edge.
+
+    The pill's width is the mock's live status text, which is why the two-row case shows up only sometimes: a bar
+    that fits "All good" at 560 px does not fit "totalelectronics.com a little slow". Both are correct."""
+    widths = [1920, 1440, 1366, 1280, 1200, 1199, 1100, 1024, 960, 900, 853, 800, 780, 779, 760, 720, 700, 680, 660, 640, 600, 560]
     _serve_probe(mock, monkeypatch, "topbar-probe.html", _TOPBAR_PROBE.replace("__WIDTHS__", json.dumps(widths)))
     res = _probe_result(browser_page("topbar-probe.html", budget_ms=10000, size=(1920, 900)))
     for w in widths:
         r = res[str(w)]
-        tops = [k["top"] for k in r["kids"]]
-        if w >= 660:
-            assert r["height"] <= 70, (w, r)                                   # one 64 px row
-            assert max(tops) - min(tops) <= 12, (w, r["kids"])                 # every control on it
-        else:
-            assert r["height"] <= 130, (w, r)                                  # a phone-width window: two rows at most
+        tops = [k["top"] for k in r["kids"]] + [r["brandTop"]]
+        one_row = w >= TOPBAR_ONE_ROW_MIN_W
+        assert r["height"] <= (70 if one_row else 130), (w, r)                 # one 64 px row, or two below 660
+        assert max(tops) - min(tops) <= (12 if one_row else 76), (w, r["kids"])
         assert max(k["right"] for k in r["kids"]) <= r["inner"] + 0.5, (w, r)  # none pushed past the right edge
-        assert r["labels"] is (w >= 1200), (w, r["labels"])
+        assert r["brandRight"] < min(k["right"] - k["w"] for k in r["kids"]), (w, r)   # and none over the wordmark
+        assert r["caption"] is (w >= 780), (w, r["caption"])
         assert r["pill"] >= 60, (w, r["pill"])                                 # the status light stays in view
-    assert [k["id"] for k in res["1366"]["kids"]] == ["btn-ip-renew", "btn-flush-dns", "btn-full-scan", "status-pill", "live-badge", "btn-settings"]
+    assert [k["id"] for k in res["1366"]["kids"]] == ["status-pill", "live-badge", "btn-settings"]
+
+
+# ---------------------------------------------------------------------------
+# the tile shortcuts: the small squares that ride up into the header row once the tiles are scrolled away
+# ---------------------------------------------------------------------------
+#: the one word under each icon, in tile order
+JUMP_LABELS = ["Network", "Ping", "Outages", "Speed", "Discovery", "WiFi", "Tools", "Reports", "Capture", "ProAV",
+               "SIP"]
+
+
+def test_tile_shortcut_squares_source():
+    """The squares are built from the tiles (so a new tile gets one for free), live in the header's own row in the
+    free space between the wordmark and the status pill, and slide: down and clipped away while the tiles are in
+    sight, up into the row when they are gone."""
+    html = _read("index.html")
+    assert '<nav class="tile-jumps" id="tile-jumps" aria-label="Sections"></nav>' in html
+    # in the header row itself, between the wordmark and the controls
+    header = re.search(r'<header class="topbar" id="topbar">(.*?)</header>', html, re.S).group(1)
+    assert header.index("</a>") < header.index('id="tile-jumps"') < header.index('class="topbar-right"')
+    css = _css_base(_read("css/tnt.css"))
+    root, row, jump = (_css_decls(css, sel) for sel in (".tile-jumps", ".tile-jumps-row", ".tile-jump"))
+    # it takes only the space left over, so the header's own controls never move when the squares come and go
+    assert root.get("flex") == "1 1 0" and root.get("min-width") == "0"
+    # the clipping box they hide inside: the bar's own 8 px padding wider top and bottom, and no taller than a
+    # square, so the header's row is exactly the height it was without them
+    assert root.get("overflow") == "hidden" and root.get("margin") == "-8px 0" and root.get("padding") == "8px 0"
+    assert root.get("pointer-events") == "none" and _css_decls(css, ".tile-jumps.on").get("pointer-events") == "auto"
+    # down: a whole row's height lower (plus the bar's padding) and out of the tab order; up: back to zero
+    assert row.get("transform") == "translateY(calc(100% + 8px))" and row.get("visibility") == "hidden"
+    on = _css_decls(css, ".tile-jumps.on .tile-jumps-row")
+    assert on.get("transform") == "translateY(0)" and on.get("visibility") == "visible"
+    for decls in (row, on):
+        assert decls.get("transition", "").startswith("transform 0.26s"), decls
+    # a square: the whole thing is the link, the icon over the word, in the tile's own colour, the height of the pill
+    assert jump.get("display") == "flex" and jump.get("flex-direction") == "column"
+    assert jump.get("width") == "var(--jump)" and jump.get("height") == "var(--jump)"
+    assert "var(--accent)" in jump.get("background", "")
+    assert row.get("--jump") == "44px" and row.get("height") == "var(--jump)"   # the status pill's height
+    # up they claim the width nine squares need, and the status pill (which ellipsizes) is what gives it up
+    assert _css_decls(css, ".tile-jumps.on").get("flex") == "0 1 auto"
+    assert _css_decls(css, ".topbar-right").get("flex-shrink") == "10"
+    assert jump.get("font-size") == "calc(var(--jump) * 0.18)"
+    for width, size in ((900, "40px"), (700, "38px")):   # narrower windows, smaller squares; the row never wraps
+        assert _css_decls(_css_media(_read("css/tnt.css"), f"(max-width: {width}px)"), ".tile-jumps-row").get("--jump") == size
+    assert row.get("flex-wrap") == "nowrap" and row.get("overflow-x") == "auto"
+    assert _css_decls(css, ".tile-jump.active").get("background", "").startswith("color-mix(")
+    app = _read("js/app.js")
+    for sel in ("const JUMP_NAMES = { ipinfo: 'Network', capture: 'Capture', proav: 'ProAV' };", "function buildJumps()",
+                "for (const tile of tiles.querySelectorAll('a.tile:not([hidden])'))", r"JUMP_NAMES[name] || title.split(/\s+/)[0]",
+                "class: 'tile-jump', href: tile.getAttribute('href')", "'--accent': ACCENT[name] || 'var(--blue)'",
+                "window.addEventListener('scroll', syncJumps, { passive: true })",
+                "window.addEventListener('resize', syncJumps, { passive: true })",
+                "buildJumps();", "markJumps(name);", "markJumps(null);"):
+        assert sel in app, sel
+    # the trigger: the tiles' bottom edge against the header's, with a few px of hysteresis so it cannot flicker
+    assert "const gone = tiles.getBoundingClientRect().bottom - (bar ? bar.getBoundingClientRect().bottom : 0);" in app
+    assert "if (gone <= 0) setJumps(true);" in app and "else if (gone >= JUMP_HIDE_PX) setJumps(false);" in app
+    # nothing on the page is covered, so nothing had to make room: no --strip-h, and the saved-reports panel is as it was
+    assert "--strip-h" not in app and "--strip-h" not in css
+    assert _css_decls(css, ".rpt-browser").get("top") == "76px"
+    # a page without tiles (Diagnostics) has nothing to jump back to
+    assert "if (!tiles || tiles.hidden) { setJumps(false); return; }" in app
+
+
+# the real page (scripts on) in a same-origin iframe: the shortcut squares as the page is scrolled and one is clicked
+_JUMPS_PROBE = r"""<!doctype html><html><head><meta charset="utf-8"><title>jumps probe</title></head><body style="margin:0">
+<pre id="probe">pending</pre>
+<iframe id="app" src="/index.html#capture" style="width:1280px;height:740px;border:0;display:block"></iframe>
+<script>
+const out = {};
+const frame = document.getElementById('app');
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+async function until(fn, ms) {
+  const end = Date.now() + ms;
+  for (;;) {
+    let v = null;
+    try { v = fn(); } catch (e) { v = null; }
+    if (v) return v;
+    if (Date.now() > end) return null;
+    await sleep(40);
+  }
+}
+function strip(doc, win) {
+  const root = doc.getElementById('tile-jumps'), row = root.querySelector('.tile-jumps-row');
+  const r = row.getBoundingClientRect(), box = root.getBoundingClientRect();
+  const head = doc.getElementById('topbar').getBoundingClientRect();
+  const brand = doc.querySelector('.brand').getBoundingClientRect();
+  const right = doc.querySelector('.topbar-right').getBoundingClientRect();
+  return { on: root.classList.contains('on'), vis: win.getComputedStyle(row).visibility,
+           rowTop: Math.round(r.top), rowBottom: Math.round(r.bottom),
+           boxTop: Math.round(box.top), boxBottom: Math.round(box.bottom), boxLeft: Math.round(box.left),
+           headTop: Math.round(head.top), headBottom: Math.round(head.bottom), headH: Math.round(head.height),
+           brandRight: Math.round(brand.right), rightLeft: Math.round(right.left),
+           pill: Math.round(doc.getElementById('status-pill').getBoundingClientRect().width),
+           inner: doc.documentElement.clientWidth };
+}
+function squares(doc) {
+  return Array.from(doc.querySelectorAll('.tile-jump')).map((a) => {
+    const r = a.getBoundingClientRect(), label = a.querySelector('.tile-jump-label');
+    // the top of the square (over the icon) and the bottom of it (over the word): both are the link itself
+    const at = (x, y) => {
+      const el = doc.elementFromPoint(Math.round(x), Math.round(y));
+      const hit = el && el.closest ? el.closest('.tile-jump') : null;
+      return hit ? hit.dataset.view : (el ? el.className : null);
+    };
+    return { view: a.dataset.view, label: label.textContent, href: a.getAttribute('href'),
+             w: Math.round(r.width), h: Math.round(r.height), top: Math.round(r.top),
+             left: Math.round(r.left), right: Math.round(r.right),
+             icon: !!a.querySelector('svg.icon'), clipped: label.scrollWidth > label.clientWidth + 0.5,
+             active: a.classList.contains('active'), current: a.getAttribute('aria-current'),
+             hitTop: at(r.left + r.width / 2, r.top + 2), hitBottom: at(r.left + r.width / 2, r.bottom - 2) };
+  });
+}
+//: where the page's first card sits in the document, to prove the squares move nothing
+const cardTop = (doc, win) => Math.round(doc.querySelector('#view .card').getBoundingClientRect().top + win.scrollY);
+async function run() {
+  // the count comes from the test, not a number written here: the squares are appended one at a time, so a
+  // stale count is passed through on the way to the real one and the probe starts measuring a half-built row
+  await until(() => frame.contentDocument
+    && frame.contentDocument.querySelectorAll('.tile-jump').length === __TILES__, 8000);
+  const doc = frame.contentDocument, win = frame.contentWindow;
+  await until(() => doc.querySelector('#view .card'), 8000);
+  // this probe measures layout, not the slide: the resting state, not a frame of a transition
+  const style = doc.createElement('style');
+  style.textContent = '*, *::before, *::after { transition: none !important; }';
+  doc.head.appendChild(style);
+  out.rest = strip(doc, win);
+  out.restSquares = squares(doc);
+  // the page has to be long enough to scroll the tiles out of sight before any of this means anything, and how
+  // long the open section happens to be is not what is under test: the mock's capture page leaves barely a hundred
+  // pixels of room, and a test that ran before this one and emptied its file list takes that away. So the view is
+  // given a floor first, exactly as revealView() does when a tile is clicked.
+  // revealView() overwrites #view's own min-height, so the floor goes on the page as well: without it the
+  // scrollTo is clamped by however tall the open section happens to be, which is not what is under test
+  const floor = () => { doc.getElementById('view').style.minHeight = '1600px';
+                        doc.getElementById('page').style.minHeight = '2400px'; };
+  floor();
+  // down the page: the tiles go up behind the header and the squares come up into the header row. (A headless
+  // browser dumping the DOM paints no frames, and a scroll event is dispatched as part of painting one, so the
+  // probe sends it itself; everything the page then reads -- the scroll offset, both edges -- is the browser's own.)
+  const scroll = (top) => { win.scrollTo({ top: top }); win.dispatchEvent(new win.Event('scroll')); };
+  // A real browser fires scroll on every frame while the page settles; this one fires none of its own, so a
+  // single synthetic event can land mid-settle, be answered from the geometry of that instant, and never be
+  // reconsidered. Keep firing until the strip agrees with where the page ended up.
+  const settle = async (want) => {
+    for (let i = 0; i < 60; i++) {
+      win.dispatchEvent(new win.Event('scroll'));
+      if (doc.getElementById('tile-jumps').classList.contains('on') === want) return true;
+      await sleep(40);
+    }
+    return false;
+  };
+  //: how far the page could scroll against how far it had to, so a failure says which of the two ran out
+  const headroom = () => ({ maxScroll: Math.round(doc.documentElement.scrollHeight - win.innerHeight),
+                            needed: Math.round(doc.getElementById('tiles').getBoundingClientRect().bottom
+                                               + win.scrollY - 64), y: Math.round(win.scrollY) });
+  scroll(2000);
+  out.headroom = headroom();
+  await until(() => doc.getElementById('tile-jumps').classList.contains('on'), 4000);
+  await sleep(60);
+  out.shown = strip(doc, win);
+  out.shownSquares = squares(doc);
+  // nothing moves when they come and go: the same page measured up, down and up again, with nothing in between
+  // (the page fills in as its data arrives, so this has to be one instant, not two)
+  const jumps = doc.getElementById('tile-jumps');
+  // the status pill's text is live: the mock's ping state changes it mid-probe, and a pill that got wider because
+  // the service now says "1.1.1.1 dropping packets" is not the squares pushing it. Hold the text still for these
+  // three reads, which are about what the squares do and nothing else.
+  doc.getElementById('status-text').textContent = 'All good';
+  const stand = () => [cardTop(doc, win), Math.round(doc.getElementById('topbar').getBoundingClientRect().height),
+                       Math.round(doc.getElementById('status-pill').getBoundingClientRect().width)];
+  out.moves = [stand()];
+  jumps.classList.remove('on'); out.moves.push(stand());
+  jumps.classList.add('on'); out.moves.push(stand());
+  out.tilesGone = Math.round(doc.getElementById('tiles').getBoundingClientRect().bottom) <= out.shown.headBottom;
+  // clicking one goes to that section, back to the top, and the squares sink again
+  doc.querySelector('.tile-jump[data-view="tools"]').click();
+  await until(() => win.location.hash === '#tools', 4000);
+  await until(() => !doc.getElementById('tile-jumps').classList.contains('on'), 4000);
+  await sleep(60);
+  out.afterClick = Object.assign(strip(doc, win), { hash: win.location.hash, y: Math.round(win.scrollY),
+    active: squares(doc).filter((s) => s.active).map((s) => s.view),
+    tiles: Array.from(doc.querySelectorAll('.tile.active')).map((t) => t.dataset.view) });
+  // and scrolling back up on its own hides them again
+  scroll(2000);
+  await until(() => doc.getElementById('tile-jumps').classList.contains('on'), 4000);
+  scroll(0);
+  await until(() => !doc.getElementById('tile-jumps').classList.contains('on'), 4000);
+  await sleep(60);
+  out.afterUp = strip(doc, win);
+  // a short window: a tile click scrolls its section up under the header and the squares come up in the header
+  // row -- the heading has to be in view under it, not behind it. 560 px rather than the 614 px this used to
+  // use, because revealView only scrolls when the click would otherwise change nothing visible (vh - top <
+  // vh/3) and every tile is half height now: three rows of 84 px leave enough of the view showing at 614 px
+  // that there is nothing to do. The rule is the same; the window where it bites is shorter.
+  frame.style.width = '1093px';
+  frame.style.height = '560px';
+  await sleep(200);
+  win.location.hash = '#ipinfo';
+  await until(() => doc.querySelector('#view .card'), 4000);
+  floor();                                 // tall enough before the click, so revealView's scroll is never clamped
+  scroll(0);
+  await sleep(100);
+  doc.querySelector('#tiles a.tile[data-view="ping"]').click();
+  await until(() => win.location.hash === '#ping', 4000);
+  await until(() => doc.querySelector('#view .card'), 4000);
+  floor();
+  await until(() => doc.querySelector('#view .section-head h2'), 4000);
+  await settle(true);
+  const heading = doc.querySelector('#view .section-head h2');
+  //: what revealView() weighed, so a failure says whether the window was too tall or the tiles too short
+  const viewTop = Math.round(doc.getElementById('view').getBoundingClientRect().top + win.scrollY);
+  out.short = Object.assign(strip(doc, win), { y: Math.round(win.scrollY), vh: win.innerHeight,
+    squares: squares(doc), headingTop: Math.round(heading.getBoundingClientRect().top),
+    viewTop: viewTop, needsScrollBelow: Math.round(win.innerHeight * 2 / 3),
+    tilesBottom: Math.round(doc.getElementById('tiles').getBoundingClientRect().bottom) });
+  out.errors = doc.documentElement.getAttribute('data-mock-errors');
+  document.getElementById('probe').textContent = JSON.stringify(out);
+}
+run();
+</script></body></html>"""
+
+
+def test_tile_shortcuts_slide_in_and_out_in_a_browser(browser_page, mock, monkeypatch):
+    """One square per tile, hidden while the tiles are in sight: scrolling them away brings the squares up into the
+    header's own row, between the wordmark and the status pill, without moving anything; every square is whole and
+    clickable, and a click takes the page to that section and puts them back down (as does scrolling back up)."""
+    _serve_probe(mock, monkeypatch, "jumps-probe.html",
+                 _JUMPS_PROBE.replace("__TILES__", str(len(TILE_NAMES))))
+    res = _probe_result(browser_page("jumps-probe.html", budget_ms=20000, size=(1366, 900)))
+    assert res.get("errors") == "[]", res.get("errors")
+    rest, shown = res["rest"], res["shown"]
+    # at the top of the page: below the clipping box, invisible and out of the tab order
+    assert rest["on"] is False and rest["vis"] == "hidden" and rest["rowTop"] >= rest["boxBottom"], rest
+    # scrolled past the tiles: up in the header's row, inside it top and bottom
+    assert res["tilesGone"] is True and shown["on"] is True and shown["vis"] == "visible", (shown, res["headroom"])
+    assert shown["headTop"] <= shown["rowTop"] and shown["rowBottom"] <= shown["headBottom"], shown
+    # the header keeps its height and its own controls, and nothing on the page moves
+    assert shown["headH"] == rest["headH"] == 64, (rest["headH"], shown["headH"])
+    # the page's first card, the header's height and the status pill's width: identical up, down and up again
+    assert res["moves"][0] == res["moves"][1] == res["moves"][2], res["moves"]
+    for key in ("rest", "shown"):
+        r = res[key]
+        assert r["boxLeft"] >= r["brandRight"] and r["boxTop"] >= r["headTop"], (key, r)
+    for key in ("restSquares", "shownSquares"):
+        squares = res[key]
+        assert [s["view"] for s in squares] == TILE_NAMES and [s["label"] for s in squares] == JUMP_LABELS, key
+        assert [s["href"] for s in squares] == ["#" + n for n in TILE_NAMES], key
+        assert all(s["icon"] and not s["clipped"] for s in squares), key         # an icon over a word that fits
+        assert all(s["w"] == s["h"] == squares[0]["w"] for s in squares), key    # squares, all the same size
+        assert 36 <= squares[0]["w"] <= 48, squares[0]                           # small enough for the header's row
+    # every square is whole, in one row inside the header, clear of the wordmark and the controls, and the click
+    # lands on the square itself at its icon and at its word: the whole square is the link
+    shown_squares = res["shownSquares"]
+    assert len({s["top"] for s in shown_squares}) == 1
+    assert min(s["left"] for s in shown_squares) >= shown["brandRight"], (shown["brandRight"], shown_squares)
+    assert max(s["right"] for s in shown_squares) <= shown["rightLeft"], (shown["rightLeft"], shown_squares)
+    assert all(s["top"] >= shown["headTop"] for s in shown_squares), shown_squares
+    assert all(s["hitTop"] == s["hitBottom"] == s["view"] for s in shown_squares), [(s["hitTop"], s["hitBottom"]) for s in shown_squares]
+    # the open section is marked on its square, the way its tile is
+    assert [s["view"] for s in shown_squares if s["active"]] == ["capture"]
+    assert [s["current"] for s in shown_squares if s["active"]] == ["page"]
+    click = res["afterClick"]
+    assert click["hash"] == "#tools" and click["y"] == 0 and click["active"] == ["tools"] and click["tiles"] == ["tools"]
+    assert click["on"] is False and click["vis"] == "hidden"
+    assert res["afterUp"]["on"] is False and res["afterUp"]["vis"] == "hidden"
+    # the short window: the squares are up in the header and the section's heading is in view under it
+    short = res["short"]
+    assert short["on"] is True and short["y"] > 0 and short["vh"] == 560, short
+    assert short["headH"] == 64 and short["tilesBottom"] <= short["headBottom"], short
+    assert short["headBottom"] < short["headingTop"] < short["vh"] / 2, short
+    assert all(not s["clipped"] and s["w"] == 44 for s in short["squares"]), short["squares"]
 
 
 # ---------------------------------------------------------------------------
@@ -4372,14 +4857,11 @@ def _assert_report_shape(rep: Dict[str, Any]) -> None:
 
 def test_reports_tile_full_scan_button_and_wiring():
     html = _read("index.html")
-    # the two quick tools first on the right of the header, then Full Scan, immediately left of the status pill
-    assert re.search(r'<div class="topbar-right">\s*<button class="btn topbar-quick" id="btn-ip-renew" [^>]*>.*?</button>\s*'
-                     r'<button class="btn topbar-quick" id="btn-flush-dns" [^>]*>.*?</button>\s*'
-                     r'<button class="btn topbar-scan" id="btn-full-scan" type="button"><span data-icon="report"></span>'
-                     r'<span class="scan-label" id="full-scan-label">Full Scan</span></button>\s*<div class="status-pill', html)
-    tiles = re.findall(r'<a class="tile" data-view="([a-z]+)"', html)
-    assert len(tiles) == 8 and tiles[-1] == "reports"
-    assert '<a class="tile" data-view="reports" href="#reports" style="--accent: var(--grey)">' in html
+    # Full Scan is started from the Reports page's own button now; the header keeps the status pill, LIVE and the gear
+    assert "btn-full-scan" not in html and "full-scan-label" not in html and "topbar-scan" not in html
+    tiles = re.findall(r'<a class="tile(?: half)?" data-view="([a-z]+)"', html)
+    assert tiles == TILE_NAMES and tiles[-3:] == ["capture", "proav", "sip"]
+    assert '<a class="tile half" data-view="reports" href="#reports" style="--accent: var(--grey)">' in html
     assert '<span class="tile-icon" data-icon="report"></span><span class="tile-title">Reports</span>' in html
     assert html.index("js/reportsui.js") < html.index("js/views/ipinfo.js") and html.index("js/views/reports.js") < html.index("js/app.js")
     css = _read("css/tnt.css")
@@ -4387,13 +4869,15 @@ def test_reports_tile_full_scan_button_and_wiring():
     root = re.search(r":root\s*\{(.*?)\}", css, re.S).group(1)
     dark = re.search(r'\[data-theme="dark"\]\s*\{(.*?)\}', css, re.S).group(1)
     assert "--grey: var(--ink-soft)" in root and "--ink-soft: #B8B0CC" in dark        # the grey accent follows the theme
-    assert _css_decls(base, ".topbar-right > .btn").get("flex") == "none"               # Full Scan never shrinks; the pill does
-    scan = _css_decls(base, ".topbar-scan")
-    assert scan.get("min-width") == "132px" and scan.get("font-variant-numeric") == "tabular-nums"
-    assert "var(--pct)" in _css_decls(base, ".topbar-scan.running").get("background", "")
+    assert _css_decls(base, ".topbar-right > .btn").get("flex") == "none"               # the gear never shrinks; the pill does
+    reports = _read("js/views/reports.js")
+    assert "els.scanLabel = h('span', null, 'Full Scan');" in reports
+    assert "h('button', { class: 'btn btn-primary', type: 'button', on: { click: () => TNT.app.fullScanClick() } }, TNT.ui.icon('report'), els.scanLabel)" in reports
     app = _read("js/app.js")
+    # the controller stays in app.js, so a scan started from the page runs on while the page is left
+    assert "renderFullScanButton" not in app
     for s in ("reports: 'var(--grey)'", "tileEls.reports", "RU.createFullScan({ api, survey: TNT.wifiSurvey || null, live: () => api.events.state === 'live' })",
-              "$('#btn-full-scan').addEventListener('click', fullScanClick)", "fullScan.subscribe(onFullScanJob)",
+              "fullScan.subscribe(onFullScanJob)",
               "ev.on('report.progress', (d) => { if (d && d.job) fullScan.apply(d.job); })", "ev.on('report.saved'", "ev.on('report.deleted', scheduleReportsInfo)",
               "ev.on('report.updated', (d) => { scheduleReportsInfo(); if (d && fullScan.job && fullScan.job.report_id === d.id) fullScan.refresh(); })","ev.on('hello', () => { fullScan.refresh(); scheduleReportsInfo(); })",
               "report: '<svg", "swap: '<svg", "RU.siteCombo(", "'Save name'", "'Cancel scan'", "onEscape: () => combo.isOpen()",
@@ -5581,9 +6065,8 @@ def test_mock_networks_and_the_suggested_site(mock, fast_reports):
 def test_reports_page_mounts_in_a_browser_without_errors(browser_page):
     dom = browser_page("#reports", budget_ms=6000)
     assert 'data-mock-errors="[]"' in dom
-    assert len(re.findall(r'<a class="tile[^"]*" data-view="', dom)) == 8
-    assert re.search(r'<a class="tile active" data-view="reports" href="#reports"', dom)
-    assert dom.index('id="btn-full-scan"') < dom.index('id="status-pill"')
+    assert len(re.findall(r'<a class="tile[^"]*" data-view="', dom)) == len(TILE_NAMES)
+    assert re.search(r'<a class="tile half active" data-view="reports" href="#reports"', dom)
     tile = _tile_body(dom, "reports")
     assert re.search(r'<span class="num">\d+</span><span class="muted">reports ·</span><span class="muted">\d+ sites</span>', tile)
     assert '<div class="rpt">' in dom

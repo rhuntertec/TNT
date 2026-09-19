@@ -6,7 +6,8 @@ IcmpPinger -> PingManager -> LinkMap -> GeoIpManager (IP location data: loads th
 data, its thread downloads) -> NatChecker -> PortChecker -> OutageTracker -> SpeedScheduler ->
 DiscoveryScanner -> DhcpServer (constructed, never started by itself) -> TftpServer
 (constructed, its folder secured) -> LanPeers (beacon + throughput server, started) ->
-SwitchPortFinder -> CaptureManager (a crashed Packet Monitor session cleaned up on a thread) ->
+SwitchPortFinder -> CaptureManager (an ETW session and an unsaved capture a crash left behind cleaned up
+on a thread) ->
 NetWatcher (network-change watcher, started) -> ReportManager (Full Scan site reports) ->
 ApiServer -> maintenance thread (heartbeat + retention)``.
 
@@ -110,15 +111,16 @@ Contract gaps resolved here (documented deviations):
   right after the DHCP server, off after every start, with its folder created and secured at once (``ensure_root()``;
   a failure there is only the server's status warning); the switch port finder (``tnt.switchport.SwitchPortFinder``,
   ``engine.switchport``) and packet capture (``tnt.capture.CaptureManager``, ``engine.capture``) right after the LAN
-  peers.  Constructing them runs no network, Packet Monitor or netsh work; ``_start_capture`` starts the daemon thread
-  ``tnt-pktmon-recover`` (``CaptureManager.recover()`` stops a Packet Monitor session a crash left behind) and
-  ``start()`` never waits for it.  The NAT check and the port-forward test read the network through accessors that look
+  peers.  Constructing them runs no network, Packet Monitor, ETW or netsh work; ``_start_capture`` starts the daemon
+  thread ``tnt-capture-recover`` (``CaptureManager.recover()`` stops an ETW session a crash left behind, deletes the
+  unsaved capture files it left and counts the saved ones) and ``start()`` never waits for it.  The NAT check and the port-forward test read the network through accessors that look
   when they are called: the link map's ``public_ip``, the watcher's ``changed_ts`` and generation,
   ``LinkMap.refresh_public_ip`` and, for the port-forward test, the NAT check's last verdict.  None of them needs the
   database (TFTP without one skips its events rows), so none is part of the db retry.  ``_on_net_changed`` tells the
   NAT check after the link map and the TFTP server and switch port finder after the DHCP server (both stop on their
-  own helper threads); ``stop()`` stops the TFTP server right after the DHCP server and closes the capture, then the
-  switch port finder, right after the LAN peers (idle, each returns at once and runs no pktmon command);
+  own helper threads); ``stop()`` stops the TFTP server right after the DHCP server and closes the capture (a running
+  one ends with stop reason ``service`` and its file is kept for ``recover()`` to clean up), then the switch port
+  finder, right after the LAN peers (idle, each returns at once and runs no pktmon command);
   ``_run_retention`` also applies the capture retention.  The speed scheduler gets the pinger for its latency-under-load
   probe (which makes a private one per run).
 """
@@ -201,6 +203,7 @@ class Engine:
         self.bus: Any = None
         self.pinger: Any = None
         self.linkmap: Any = None
+        self.throughput: Any = None
         self.geoip: Any = None
         self.update: Any = None
         self.raw_log: Any = None
@@ -214,7 +217,8 @@ class Engine:
         self.reports: Any = None
         self.networks: Any = None
         # the network tools (see the module docstring)
-        self.natcheck = self.portcheck = self.switchport = self.capture = self.tftp = None
+        self.natcheck = self.portcheck = self.switchport = self.capture = self.tftp = self.proav = None
+        self.sipqual = self.sipalg = self.sipnat = self.sipflow = None
         self.api: Any = None
 
         self.started_ts: Optional[float] = None
@@ -302,6 +306,7 @@ class Engine:
         self._start_pinger()
         self._start_ping_manager()
         self._start_linkmap()
+        self._start_throughput()
         self._start_geoip()
         self._start_update()
         self._start_natcheck()
@@ -314,6 +319,8 @@ class Engine:
         self._start_lan()
         self._start_switchport()
         self._start_capture()
+        self._start_proav()
+        self._start_sip()
         self._start_netwatch()
         self._start_reports()
         self._start_api()
@@ -362,10 +369,13 @@ class Engine:
             # closes the beacon listener and the throughput server (a test in flight is cut)
             self._bounded("lan", self.lan.stop, deadline, 2.0)
         if getattr(self, "capture", None) is not None:
-            # a running capture is discarded (a session left behind is cleaned up at the next start)
+            # a running capture is ended and its ETW session let go; the unsaved file is left for recover()
             self._bounded("capture", lambda: self.capture.close(1.0), deadline, 1.5)
         if getattr(self, "switchport", None) is not None:
             self._bounded("switchport", lambda: self.switchport.close(1.0), deadline, 1.5)
+        if getattr(self, "proav", None) is not None:
+            # a running Pro AV listen is ended: its sockets are closed and its groups left
+            self._bounded("proav", lambda: self.proav.close(1.0), deadline, 1.5)
         self._join(self._disc_thread, deadline, 2.0)
         if self.speed is not None:
             self._bounded("speedtest", self.speed.stop, deadline, 3.0)
@@ -373,6 +383,8 @@ class Engine:
             self._bounded("outages", self.outages.stop, deadline, 2.0)
         if getattr(self, "linkmap", None) is not None:
             self._bounded("linkmap", self.linkmap.stop, deadline, 2.0)
+        if getattr(self, "throughput", None) is not None:
+            self._bounded("throughput", self.throughput.stop, deadline, 1.0)
         if getattr(self, "geoip", None) is not None:
             self._bounded("geoip", self.geoip.stop, deadline, 1.0)
         if getattr(self, "update", None) is not None:
@@ -494,7 +506,7 @@ class Engine:
                 continue
             log.info("database opened after retry; starting the monitoring components")
             self.errors.pop("db", None)
-            for name in ("networks", "ping", "outages", "speedtest", "dhcp", "dhcp-restore", "reports"):
+            for name in ("networks", "ping", "outages", "speedtest", "dhcp", "dhcp-restore", "reports", "sipqual"):
                 self.errors.pop(name, None)
             try:
                 if getattr(self, "networks", None) is None:
@@ -512,6 +524,10 @@ class Engine:
                     self._start_dhcp()
                 if getattr(self, "reports", None) is None:
                     self._start_reports()
+                if getattr(self, "sipqual", None) is None:
+                    from .sipqual import SipQualifier          # the only SIP part that reads the database
+
+                    self.sipqual = SipQualifier(self.db)
                 self._db_event("warning", "service", "database became available after a failed start; monitoring resumed")
             except Exception:  # noqa: BLE001
                 log.exception("starting components after the database retry failed")
@@ -637,6 +653,18 @@ class Engine:
         except Exception as exc:  # noqa: BLE001
             self.linkmap = None
             self._fail("linkmap", exc)
+
+    def _start_throughput(self) -> None:
+        """Per-second NIC byte/packet counters for the Network info throughput card."""
+        try:
+            from .throughput import ThroughputMonitor
+
+            tm = ThroughputMonitor(self.bus)
+            tm.start()
+            self.throughput = tm
+        except Exception as exc:  # noqa: BLE001
+            self.throughput = None
+            self._fail("throughput", exc)
 
     def _start_geoip(self) -> None:
         """IP location + ISP data (DB-IP Lite): loads what is installed, downloads on its own thread."""
@@ -884,8 +912,8 @@ class Engine:
 
     def _start_capture(self) -> None:
         """Packet capture (``tnt.capture.CaptureManager``, ``engine.capture``): constructed, then ``recover()`` runs on
-        the daemon thread ``tnt-pktmon-recover`` (a Packet Monitor session a crash left behind is stopped and the saved
-        captures are counted).  ``start()`` never waits for it."""
+        the daemon thread ``tnt-capture-recover`` (an ETW session and an unsaved capture a crash left behind are cleaned
+        up and the saved captures are counted).  ``start()`` never waits for it."""
         try:
             from .capture import CaptureManager
 
@@ -895,9 +923,59 @@ class Engine:
             self._fail("capture", exc)
             return
         try:
-            threading.Thread(target=self.capture.recover, name="tnt-pktmon-recover", daemon=True).start()
+            threading.Thread(target=self.capture.recover, name="tnt-capture-recover", daemon=True).start()
         except Exception:  # noqa: BLE001 - capture still works; a leftover session is cleaned up at the next start
-            log.exception("starting the Packet Monitor clean-up failed")
+            log.exception("starting the packet capture clean-up failed")
+
+    def _start_proav(self) -> None:
+        """The Pro AV scanner (``tnt.proav.ProAvScanner``, ``engine.proav``): constructed only.  No socket is opened
+        and no group joined until a scan runs.  It is given the switch-port finder's last neighbour so a scan can
+        report the switch this PC is plugged into alongside what it heard."""
+        try:
+            from .proav import ProAvScanner
+
+            self.proav = ProAvScanner(self.bus, switch_fn=self._switch_neighbour)
+        except Exception as exc:  # noqa: BLE001
+            self.proav = None
+            self._fail("proav", exc)
+
+    def _start_sip(self) -> None:
+        """The SIP page's four parts, constructed only: the qualifier (``tnt.sipqual.SipQualifier``,
+        ``engine.sipqual``), the ALG check (``tnt.sipalg.AlgChecker``, ``engine.sipalg``), the STUN test
+        (``tnt.sipnat.StunChecker``, ``engine.sipnat``) and the call-flow reader (``tnt.sipflow.FlowReader``,
+        ``engine.sipflow``).  No socket is opened and no file read until a request asks for one.
+
+        The qualifier is the only one that needs the database - it reads the ping history and the last speed test
+        and measures nothing itself - so it is the only one the db retry has to rebuild.  A failure in any one of
+        them costs that part of the page and nothing else, which is why they are four attributes and not one."""
+        try:
+            from .sipqual import SipQualifier
+
+            self.sipqual = SipQualifier(self.db) if self.db is not None else None
+            if self.db is None:
+                self.errors.setdefault("sipqual", "database unavailable")
+        except Exception as exc:  # noqa: BLE001
+            self.sipqual = None
+            self._fail("sipqual", exc)
+        for name, module, cls in (("sipalg", ".sipalg", "AlgChecker"), ("sipnat", ".sipnat", "StunChecker"),
+                                  ("sipflow", ".sipflow", "FlowReader")):
+            try:
+                import importlib
+
+                setattr(self, name, getattr(importlib.import_module(module, __package__), cls)())
+            except Exception as exc:  # noqa: BLE001
+                setattr(self, name, None)
+                self._fail(name, exc)
+
+    def _switch_neighbour(self) -> Any:
+        """The LLDP/CDP neighbour of the last switch-port lookup, or None.  Read, never started: a Pro AV scan does
+        not run Packet Monitor of its own."""
+        finder = getattr(self, "switchport", None)
+        if finder is None:
+            return None
+        job = finder.job() if hasattr(finder, "job") else None
+        neighbours = (job or {}).get("neighbors") or []
+        return neighbours[0] if neighbours else None
 
     # ------------------------------------------------------------ network changes
     def _start_netwatch(self) -> None:
@@ -991,7 +1069,8 @@ class Engine:
             self._disc_defaults_ts = 0.0
             if self._disc_thread is not None and self._disc_thread.is_alive():
                 self._disc_net_changed = True
-        for name in ("networks", "ping", "outages", "linkmap", "natcheck", "lan", "dhcp", "tftp", "switchport", "reports"):
+        for name in ("networks", "ping", "outages", "linkmap", "natcheck", "lan", "dhcp", "tftp", "switchport",
+                     "sipalg", "sipnat", "reports"):
             # networks first: the samples, outages and reports that follow are tagged with the network identified now
             fn = getattr(getattr(self, name, None), "on_network_change", None)
             if not callable(fn):

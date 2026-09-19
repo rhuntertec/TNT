@@ -87,6 +87,7 @@ CREATE TABLE IF NOT EXISTS targets (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     host       TEXT NOT NULL UNIQUE COLLATE NOCASE,
     label      TEXT,
+    name       TEXT,                           -- a custom display name the user sets (overrides label/host)
     kind       TEXT NOT NULL DEFAULT 'auto',   -- auto | local | internet
     enabled    INTEGER NOT NULL DEFAULT 1,
     sort_order INTEGER NOT NULL DEFAULT 0,
@@ -294,6 +295,12 @@ class Database:
         if self._conn.execute("SELECT 1 FROM discovery_hosts WHERE device_type = 'Wifi' LIMIT 1").fetchone():
             renamed = self._conn.execute("UPDATE discovery_hosts SET device_type = 'Ubiquiti' WHERE device_type = 'Wifi'").rowcount
             log.info("db migration: renamed %d discovered hosts from Wifi to Ubiquiti", renamed)
+        # v1.16: a ping target can carry a custom display name (overrides the label/host in the UI);
+        # NULL on rows written before, which read as no custom name.
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(targets)").fetchall()}
+        if "name" not in cols:
+            self._conn.execute("ALTER TABLE targets ADD COLUMN name TEXT")
+            log.info("db migration: added targets.name")
         # Full Scan site reports: the ``reports`` table and its indexes are plain CREATE ... IF NOT
         # EXISTS statements in _SCHEMA, which runs on every open, so an existing database gains them
         # there (SCHEMA_VERSION stays 1). Nothing else reads or rewrites older rows.
@@ -508,6 +515,10 @@ class Database:
 
     def set_target_kind(self, target_id: int, kind: str) -> None:
         self._exec("UPDATE targets SET kind=? WHERE id=?", (kind, target_id))
+
+    def set_target_name(self, target_id: int, name: Optional[str]) -> None:
+        """The custom display name (None clears it, reverting the UI to the label/host)."""
+        self._exec("UPDATE targets SET name=? WHERE id=?", (name, target_id))
 
     def set_target_order(self, ids: Iterable[int]) -> List[int]:
         """Put the given target ids first, in that order; everything else keeps its relative

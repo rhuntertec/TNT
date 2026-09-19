@@ -1,6 +1,7 @@
 /* TNT — charts.js
    Hand-written canvas charts: Sparkline (5-minute RTT), Timeline (24 h outages),
-   LineChart (speed history) and BarChart (by-hour patterns). All charts scale for
+   LineChart (speed history), BarChart (by-hour patterns) and Throughput (live per-NIC
+   send/receive over a moving window). All charts scale for
    devicePixelRatio, re-render on resize (ResizeObserver) and read their colours from the
    CSS custom properties so they follow the theme. Exposes window.TNT.charts. */
 (function () {
@@ -590,7 +591,7 @@
           ctx.lineTo(xOf(pts[pts.length - 1][0]), py1);
           ctx.closePath(); ctx.fill();
         }
-        ctx.strokeStyle = s.color; ctx.lineWidth = 2.5; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+        ctx.strokeStyle = s.line || s.color; ctx.lineWidth = 2.5; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
         ctx.beginPath();
         ctx.moveTo(xOf(pts[0][0]), yOf(pts[0][1]));
         for (let i = 1; i < pts.length; i++) ctx.lineTo(xOf(pts[i][0]), yOf(pts[i][1]));
@@ -763,9 +764,211 @@
     }
   }
 
+  /* --------------------------------------------------------------- throughput */
+  /** Round a rate up to a readable axis top: 1, 1.5, 2, 2.5, 3, 4, 5, 6, 8 or 10 × a power of ten. */
+  function niceCeil(v) {
+    if (!(v > 0)) return 0;
+    const mag = Math.pow(10, Math.floor(Math.log10(v)));
+    for (const m of [1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10]) { if (m * mag >= v - 1e-9) return m * mag; }
+    return 10 * mag;
+  }
+
+  /** One NIC's live throughput: receive and send as filled lines over a moving window, each with
+      its window average drawn across as a dashed rule.
+      Points are placed by their timestamp, not by their index, so a second nobody sampled is a
+      gap in the line rather than a straight run across it — the service stops sampling while the
+      machine sleeps, and a line drawn through that would be a claim about time nobody measured.
+      The y axis is bits per second and rescales to whatever is in the window (never below
+      MIN_TOP_BPS, so an idle adapter's stray packet is not amplified to full height). */
+  class Throughput extends Chart {
+    constructor(canvas, opts) {
+      super(canvas, opts);
+      this.rx = [];                 // [[ts, bps], ...] ascending, receive
+      this.tx = [];                 // [[ts, bps], ...] ascending, send
+      this.windowS = (opts && opts.windowS) || 30;
+      this.stepS = (opts && opts.stepS) || 1;
+      this.windowLabel = (opts && opts.windowLabel) || '30 seconds';
+      this.now = 0;
+      this.avgRx = 0;
+      this.avgTx = 0;
+      // how a rate is written on the axis and in the tooltip; the card passes its own
+      this.fmt = (opts && opts.fmt) || ((v) => Math.round(v) + ' bps');
+      this.timeFmt = (opts && opts.timeFmt) || clockS;
+    }
+
+    /** {rx, tx, now, windowS, stepS, windowLabel, avgRx, avgTx} — any key may be left out. */
+    setSeries(o) {
+      const s = o || {};
+      if (s.rx) this.rx = s.rx;
+      if (s.tx) this.tx = s.tx;
+      if (s.now) this.now = s.now;
+      if (s.windowS) this.windowS = s.windowS;
+      if (s.stepS) this.stepS = s.stepS;
+      if (s.windowLabel !== undefined) this.windowLabel = s.windowLabel;
+      if (s.avgRx !== undefined) this.avgRx = s.avgRx || 0;
+      if (s.avgTx !== undefined) this.avgTx = s.avgTx || 0;
+      this.render();
+    }
+
+    /** Top of the y axis: the tallest point in the window rounded up, with headroom. */
+    top() {
+      const t0 = this.now - this.windowS;
+      let peak = 0;
+      for (const set of [this.rx, this.tx]) {
+        for (const p of set) { if (p[0] >= t0 && p[1] > peak) peak = p[1]; }
+      }
+      return Math.max(Throughput.MIN_TOP_BPS, niceCeil(peak * 1.15));
+    }
+
+    /** The points inside the window, cut into runs with no gap wider than two steps. */
+    runs(points) {
+      const t0 = this.now - this.windowS;
+      const gap = Math.max(2, this.stepS * 2 + 0.5);
+      const out = [];
+      let run = null;
+      for (const p of points) {
+        if (p[0] < t0 || p[0] > this.now + 1) continue;
+        if (run && p[0] - run[run.length - 1][0] > gap) run = null;
+        if (!run) { run = []; out.push(run); }
+        run.push(p);
+      }
+      return out;
+    }
+
+    draw(ctx, w, h) {
+      const c = this.c, font = this.font;
+      const px0 = 2, px1 = w - 2, py0 = 14, py1 = h - 15;
+      if (px1 <= px0 || py1 <= py0) return;
+      const t0 = this.now - this.windowS, span = Math.max(1, this.windowS);
+      const top = this.top();
+      const x = (ts) => px0 + ((ts - t0) / span) * (px1 - px0);
+      const y = (bps) => py1 - Math.max(0, Math.min(1, bps / top)) * (py1 - py0);
+
+      // plot area and the Task Manager grid: ten columns, five rows, faint
+      ctx.fillStyle = c.paper2;
+      roundRect(ctx, px0, py0, px1 - px0, py1 - py0, 6);
+      ctx.fill();
+      ctx.save();
+      ctx.beginPath();
+      roundRect(ctx, px0, py0, px1 - px0, py1 - py0, 6);
+      ctx.clip();
+      ctx.strokeStyle = alpha(c.inkSoft, 0.16);
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      for (let i = 1; i < 10; i++) {
+        const gx = Math.round(px0 + ((px1 - px0) * i) / 10) + 0.5;
+        ctx.moveTo(gx, py0); ctx.lineTo(gx, py1);
+      }
+      for (let i = 1; i < 5; i++) {
+        const gy = Math.round(py0 + ((py1 - py0) * i) / 5) + 0.5;
+        ctx.moveTo(px0, gy); ctx.lineTo(px1, gy);
+      }
+      ctx.stroke();
+
+      // receive under send: receive is usually the taller of the two, so it goes down first
+      this._series(ctx, this.rx, c.blue, x, y, py1);
+      this._series(ctx, this.tx, c.orange, x, y, py1);
+
+      // the window averages, drawn across the whole plot
+      // receive labels at the left, send at the right: the two rules sit on top of each other
+      // whenever a machine is downloading, which is most of the time
+      this._average(ctx, this.avgRx, c.blue, 'avg ↓', px0, px1, py0, y, font, 'left');
+      this._average(ctx, this.avgTx, c.orange, 'avg ↑', px0, px1, py0, y, font, 'right');
+      ctx.restore();
+
+      // frame, then the three labels Task Manager puts around the plot
+      ctx.strokeStyle = alpha(c.inkSoft, 0.35);
+      ctx.lineWidth = 1;
+      roundRect(ctx, px0 + 0.5, py0 + 0.5, px1 - px0 - 1, py1 - py0 - 1, 6);
+      ctx.stroke();
+      ctx.font = '700 10px ' + font;
+      ctx.fillStyle = c.inkSoft;
+      ctx.textAlign = 'right';
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillText(this.fmt(top), px1, py0 - 4);
+      ctx.fillText('0', px1, py1 + 11);
+      ctx.textAlign = 'left';
+      ctx.fillText(this.windowLabel, px0, py1 + 11);
+
+      this._hits(px0, px1, py0, py1, x);
+    }
+
+    _series(ctx, points, color, x, y, py1) {
+      for (const run of this.runs(points)) {
+        if (!run.length) continue;
+        ctx.beginPath();
+        ctx.moveTo(x(run[0][0]), y(run[0][1]));
+        for (let i = 1; i < run.length; i++) ctx.lineTo(x(run[i][0]), y(run[i][1]));
+        // the fill closes down to the baseline; the stroke is re-run so it is not filled over
+        ctx.lineTo(x(run[run.length - 1][0]), py1);
+        ctx.lineTo(x(run[0][0]), py1);
+        ctx.closePath();
+        ctx.fillStyle = alpha(color, 0.3);
+        ctx.fill();
+        ctx.beginPath();
+        ctx.moveTo(x(run[0][0]), y(run[0][1]));
+        for (let i = 1; i < run.length; i++) ctx.lineTo(x(run[i][0]), y(run[i][1]));
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1.6;
+        ctx.lineJoin = 'round';
+        ctx.stroke();
+      }
+    }
+
+    _average(ctx, value, color, label, px0, px1, py0, y, font, side) {
+      if (!(value > 0)) return;          // nothing moved: a rule along the floor says nothing
+      const gy = Math.round(y(value)) + 0.5;
+      ctx.save();
+      ctx.setLineDash([5, 4]);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      ctx.moveTo(px0 + 1, gy);
+      ctx.lineTo(px1 - 1, gy);
+      ctx.stroke();
+      ctx.restore();
+      const text = label + ' ' + this.fmt(value);
+      ctx.font = '800 10px ' + font;
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
+      const tw = ctx.measureText(text).width;
+      // above its own rule, or below it when the rule is near the top of the plot
+      const ty = gy - 3 < py0 + 10 ? gy + 11 : gy - 3;
+      const tx = side === 'right' ? px1 - tw - 5 : px0 + 5;
+      ctx.fillStyle = alpha(this.c.paper2, 0.85);
+      ctx.fillRect(tx - 2, ty - 9, tw + 4, 11);
+      ctx.fillStyle = color;
+      ctx.fillText(text, tx, ty);
+    }
+
+    /** One hit column per step, so hovering anywhere reads off both series at that second. */
+    _hits(px0, px1, py0, py1, x) {
+      const byTs = new Map();
+      const t0 = this.now - this.windowS;
+      for (const p of this.rx) { if (p[0] >= t0) byTs.set(p[0], { rx: p[1], tx: 0 }); }
+      for (const p of this.tx) {
+        if (p[0] < t0) continue;
+        const row = byTs.get(p[0]) || { rx: 0, tx: 0 };
+        row.tx = p[1];
+        byTs.set(p[0], row);
+      }
+      const half = Math.max(2, ((px1 - px0) * this.stepS) / (2 * Math.max(1, this.windowS)));
+      for (const [ts, row] of byTs) {
+        const cx = x(ts);
+        if (cx < px0 || cx > px1) continue;
+        this.hits.push({
+          x0: cx - half, x1: cx + half, y0: py0, y1: py1, priority: 1,
+          tip: '<b>' + this.timeFmt(ts) + '</b><br>↓ ' + this.fmt(row.rx) + '<br>↑ ' + this.fmt(row.tx),
+        });
+      }
+    }
+  }
+  //: An idle adapter's one stray packet must not fill the plot: 100 kbps is the shortest axis.
+  Throughput.MIN_TOP_BPS = 100000;
+
   TNT.charts = {
-    Chart, Sparkline, Timeline, LineChart, BarChart,
-    colors, roundRect, alpha,
+    Chart, Sparkline, Timeline, LineChart, BarChart, Throughput,
+    colors, roundRect, alpha, niceStep, niceCeil,
     rerenderAll() { for (const ch of Array.from(registry)) ch.render(); },
     count() { return registry.size; },
   };

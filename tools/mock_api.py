@@ -100,15 +100,36 @@ evolving data:
   the service's shapes and 400 texts, off at start, ``status.tftp`` its summary. A phone reads its configuration file ~1.5 s
   after a start (``tftp.transfer``); ``STATE.tftp_port_owners`` makes a start 409 ``tftp_port_in_use``, and a network change
   stops a running server with "stopped: the adapter changed";
-* packet capture (``tnt.capture``): ``/api/tools/capture`` and ``/api/tools/capture/files/{name}``, 403 ``admin_required``
-  while ``STATE.wifi_admin`` is off, one seeded file whose download is a tiny valid pcapng; a started capture runs
-  ``STATE.capture_s`` seconds (None: the seconds it was started with) with ``capture.state`` events (on ``/api/events`` only
-  while ``STATE.wifi_admin`` is on: the service sends the capture job to an administrator only), then lists a new file.
-  A browser page of another origin gets 403 ``forbidden`` from every POST, PUT and DELETE of these tools and the download;
+* packet capture (``tnt.capture``), the live analyser on its own page: ``/api/capture`` with ``start``, ``stop``, ``save``,
+  ``discard``, ``open``, ``packets``, ``packets/{no}``, ``calls``, ``calls/{id}/audio`` and ``files/{name}`` below it, every
+  one 403 ``admin_required`` while ``STATE.wifi_admin`` is off. A start invents traffic on a background thread, 8-25 packets
+  a second, until ``STATE.capture_s`` passes (None: the ``max_seconds`` it was started with) or the byte budget runs out,
+  then stops with the matching ``stop_reason``. The rows use documentation addresses (192.0.2.0/24, 198.51.100.0/24,
+  203.0.113.0/24, 2001:db8::/32) and locally administered MACs only - never a real public address, never a real MAC - mixed
+  so every protocol button of the page finds something (TCP, UDP, TLS, HTTP, DNS, ICMP, ARP, DHCP, RTSP, RTP, SIP), and a
+  few seconds in a scripted SIP call rings, answers, talks RTP both ways and hangs up: one ``capture.sip`` event, the call
+  on ``GET /api/capture/calls`` and ``calls/{id}/audio`` a real 8 kHz 16-bit mono WAV the page's player can play.
+  ``capture.state`` carries the session about once a second and on every change (on ``/api/events`` only while
+  ``STATE.wifi_admin`` is on, with ``capture.sip``: the service sends both to an administrator only). ``packets`` filters and
+  pages exactly as ``CaptureManager.packets`` does and ``packets/{no}`` answers the detail tree and hex dump of the bytes the
+  mock made up for that row. Saving lists a file whose download is a tiny valid pcapng, and opening one reads an invented
+  packet list of its length back. A browser page of another origin gets 403 ``forbidden`` from every POST and DELETE of
+  these routes and from the download. ``STATE.capture_reason`` is the text that makes capturing unavailable here (a
+  capture no longer shares Packet Monitor with the switch port search: it runs its own ETW session, so the two can run
+  together);
 * the latency-under-load grade (``tnt.speedtest.quality``): every speed test carries ``quality`` (graded by the service's rules
   from invented probe windows, None for a failed test), ``/api/speedtests`` rows leave it out, and a run starts with the
   0.8 s idle ``baseline`` phase. The DNS card's record types (``type``: MX, TXT, NS, SOA, CAA and NAPTR of example.com, SRV of
   _sip._tcp.example.com, PTR of 10.113.0.203.in-addr.arpa) answer typed lookups; Auto still reads CNAME, A and AAAA only.
+
+* the Pro AV page (``tnt.proav``), a whole invented broadcast-audio room: ``GET /api/proav`` is the STATUS with two
+  adapters, ``POST /api/proav/scan`` ``{"seconds"?, "adapter"?, "deep"?}`` starts a listen that finishes in
+  ``PROAV_FAKE_LISTEN_S`` however long was asked for (``proav.progress`` a dozen times, then ``proav.state``),
+  ``POST /api/proav/cancel`` ends it early and ``GET /api/proav/result`` is the whole RESULT. The room is a Dante
+  system on a GPS-locked grandmaster one boundary clock away, three announced AES67 streams (one still naming the
+  grandmaster it was set up against: the "bad" finding), a transparent clock, an IGMP querier and a UniFi AV switch
+  on LLDP. ``deep`` false leaves the Layer 2 listen and its three checks out. ``STATE.proav_reason`` makes scanning
+  unavailable.
 
 SSE framing: ``event: <type>`` / ``data: <json of the event's data>``; the first
 event is ``hello``; ``: ping`` comments every 15 s.
@@ -167,7 +188,13 @@ DEFAULTS: Dict[str, Any] = {
     "dhcp": {"adapter": "", "pool_start": "", "pool_end": "", "pool_size": 5, "lease_s": 3600,
              "static_ip": "172.16.4.100", "static_prefix": 24, "ping_check": True, "scan_wait_s": 8},
     "tftp": {"adapter": "", "max_upload_mb": 4096},
+    "sip": {"host": "", "port": 5060, "window_h": 24,
+            "stun": ["stun.l.google.com:19302", "stun.cloudflare.com:3478"]},
+    # Settings > Tools (tnt.config.TOOLS): a tool that is off has no tile, no page and no automated action
+    "tools": {"speed": True, "discovery": True, "wifi": True, "capture": True, "proav": True, "sip": True},
 }
+#: the main tools Settings can switch off, in tile order
+TOOLS = ("speed", "discovery", "wifi", "capture", "proav", "sip")
 #: settings a release removed: PUT /api/settings drops them instead of storing them (same as tnt.config._RETIRED_KEYS)
 RETIRED_SETTINGS = ("speedtest.ookla_path", "speedtest.ookla_server_id", "discovery.use_nmap", "discovery.nmap_path")
 
@@ -332,6 +359,78 @@ def net_adapter(index: int, name: str, description: str, mac: str, if_type: int,
             "status": status, "speed_bps": speed_bps, "mtu": mtu, "dhcp_enabled": dhcp, "dhcp_server": dhcp_server,
             "dns_suffix": suffix, "ipv4": v4, "ipv6": v6, "gateways": list(gateways), "dns": list(dns), "metric_v4": metric,
             "is_physical": physical, "is_loopback": False, "subnets": groups, "warnings": texts}
+
+
+# -- realtime throughput (tnt.throughput) ------------------------------------------------
+#: tnt.throughput.WINDOWS / NIC_KEYS / VIEW_KEYS; a test asserts these still match the service's.
+TP_WINDOWS = (10, 30, 60, 300, 1800)
+TP_DEFAULT_WINDOW_S = 30
+TP_HISTORY_S = 1800
+TP_MAX_POINTS = 600
+TP_NIC_KEYS = ("id", "index", "name", "description", "type", "primary", "link_bps",
+               "rx_bps", "tx_bps", "rx_pps", "tx_pps", "avg_rx_bps", "avg_tx_bps", "peak_rx_bps", "peak_tx_bps",
+               "rx_bytes", "tx_bytes", "rx_packets", "tx_packets", "samples")
+TP_VIEW_KEYS = ("ts", "window_s", "step_s", "history_s", "windows", "nics", "note")
+#: What each adapter pretends to carry: (receive Mbps, send Mbps, how much it swings).  An adapter that is
+#: not named here moves nothing, which is what the Hyper-V switch looks like on a real machine - and what
+#: gives the card a NIC to leave out.
+TP_SHAPES = {
+    "Ethernet": (7.4, 0.42, 0.85),
+    "Ethernet 2": (0.9, 0.11, 0.35),
+    "Wi-Fi": (4.2, 0.30, 0.90),
+    "Tailscale": (0.06, 0.44, 0.30),
+}
+#: Bytes per packet each way.  Receive is near a full frame and send is ack-sized, which is why a browsing
+#: machine's packet counts are so much closer together than its byte counts.
+TP_RX_FRAME = 1180
+TP_TX_FRAME = 320
+
+
+def tp_rate(name: str, ts: float) -> Tuple[int, int]:
+    """(receive, send) bits per second for one adapter at *ts*: a slow swell, a faster ripple and a burst
+    every so often, all worked out from the timestamp, so the backlog GET /api/throughput hands over and
+    the events that follow it describe the same traffic."""
+    shape = TP_SHAPES.get(name)
+    if not shape:
+        return (0, 0)
+    base_rx, base_tx, swing = shape
+    swell = 1.0 + swing * math.sin(ts / 17.0)
+    ripple = 1.0 + (swing / 3.0) * math.sin(ts / 2.3 + 1.7)
+    burst = 3.4 if (int(ts) % 47) < 4 else 1.0          # a download starting, every so often
+    rx = base_rx * swell * ripple * burst * 1e6
+    tx = base_tx * swell * ripple * (1.0 + (burst - 1.0) * 0.25) * 1e6
+    return (max(0, int(rx)), max(0, int(tx)))
+
+
+def _tp_bucket(samples: List[List[int]], step: int) -> List[List[int]]:
+    """tnt.throughput._bucket: average the per-second samples into `step` buckets, oldest first."""
+    if step <= 1:
+        return [list(s) for s in samples]
+    acc: Dict[int, List[float]] = {}
+    for s in samples:
+        key = int(s[0]) // step * step
+        row = acc.setdefault(key, [0.0, 0.0, 0.0, 0.0, 0.0])
+        for i in range(4):
+            row[i] += float(s[i + 1])
+        row[4] += 1.0
+    out = []
+    for key in sorted(acc):
+        row = acc[key]
+        n = row[4] or 1.0
+        out.append([key] + [int(round(row[i] / n)) for i in range(4)])
+    return out
+
+
+def _tp_mean(samples: List[List[int]], column: int) -> int:
+    if not samples:
+        return 0
+    return int(round(sum(float(s[column]) for s in samples) / len(samples)))
+
+
+def _tp_order(row: Dict[str, Any]) -> Tuple[int, int, str]:
+    """tnt.throughput._order: the internet-facing NIC first, then the busiest, then by name."""
+    return (0 if row.get("primary") else 1,
+            -(int(row.get("rx_bps") or 0) + int(row.get("tx_bps") or 0)), str(row.get("name") or ""))
 
 
 def net_profile(name: str) -> Dict[str, Any]:
@@ -682,9 +781,8 @@ SWITCH_NO_NEIGHBOR_TEXT = ("No LLDP or CDP heard in {seconds} s. The switch may 
                            "or LLDP is turned off on its port.")
 PKTMON_REASONS = ("Needs Windows 10 version 2004 (build 19041) or later", "Packet Monitor (pktmon.exe) is missing from this PC",
                   "Packet Monitor on this PC is too old for this: update Windows")
-#: who holds Packet Monitor -> the 409 the other one gets
-PKTMON_LOCK_TEXTS = {"switchport": "TNT is finding the switch port: try again when it finishes",
-                     "capture": "A packet capture is running: stop it first"}
+#: who holds Packet Monitor -> the 409 the other one gets (a packet capture runs its own ETW session and never takes it)
+PKTMON_LOCK_TEXTS = {"switchport": "TNT is finding the switch port: try again when it finishes"}
 #: what a listen hears: the invented switch of the build contract, on a documentation management address
 MOCK_NEIGHBOR = {"protocol": "lldp", "switch_name": "LAB-SW-01", "switch_description": "Example Switch 8P", "vendor": "Example Networks",
                  "chassis_id": "02:00:5E:10:00:02",
@@ -714,11 +812,14 @@ PORTCHECK_RATE_WINDOW_S = 3600.0
 #: the fake internet: something answers on TCP 8000, a test of port 9 reaches neither port checker, every other port stays shut
 PORTCHECK_OPEN_PORT = 8000
 PORTCHECK_ERROR_PORT = 9
-#: the network tools' routes (below /api) a browser page of another origin may not POST, PUT or DELETE, plus the capture downloads
-#: (tnt.api.routes._quick_tool_origin)
-NETWORK_TOOL_ROUTES = ("/netcheck/nat", "/netcheck/switch", "/netcheck/portforward", "/tools/capture", "/tftp/start", "/tftp/stop",
-                       "/tftp/uploads", "/tftp/settings")
-CAPTURE_FILES_ROUTE = "/tools/capture/files/"
+#: the network tools' routes (below /api) a browser page of another origin may not POST, PUT or DELETE, the packet capture
+#: routes that change something among them, plus the capture downloads (tnt.api.routes._quick_tool_origin, ._capture)
+NETWORK_TOOL_ROUTES = ("/proav/scan", "/proav/cancel",
+                       "/netcheck/nat", "/netcheck/switch", "/netcheck/portforward", "/capture/start", "/capture/stop",
+                       "/capture/save", "/capture/discard", "/capture/open", "/tftp/start", "/tftp/stop",
+                       "/tftp/uploads", "/tftp/settings",
+                       "/sip/alg", "/sip/stun", "/sip/stun/lifetime", "/sip/flow")
+CAPTURE_FILES_ROUTE = "/capture/files/"
 #: Tools: the TFTP server (tnt.tftp): keys, texts and limits
 TFTP_STATUS_KEYS = ("available", "running", "since_ts", "error", "warning", "adapter", "adapters", "listen", "root", "uploads", "firewall",
                     "conflict", "transfers", "history", "counts", "settings")
@@ -742,38 +843,105 @@ TFTP_STOPPED_TEXT = "stopped: the adapter changed"
 #: the files in the root folder: (name with "/", size, age in seconds at service start)
 TFTP_FILES = (("boot/pxelinux.0", 26_828, 86400 * 12), ("firmware/lab-sw-fw-2.4.1.bin", 7_843_532, 86400 * 3),
               ("phones/SEP02005E100001.cnf.xml", 4_912, 3600 * 5))
-#: Tools: packet capture (tnt.capture): keys, choices, the file name pattern and texts; the routes' 403 (tnt.api.routes)
-CAPTURE_JOB_KEYS = ("id", "state", "adapter", "filters", "full_packets", "seconds", "size_mb", "started_ts", "elapsed_s", "bytes", "file",
-                    "error", "note", "ts")
+#: Packet capture (tnt.capture), the live analyser on its own page: every shape it answers, keys in the service's order
+CAPTURE_STATUS_KEYS = ("available", "reason", "adapters", "session", "files", "limits")
+CAPTURE_SESSION_KEYS = ("id", "state", "source", "adapter", "file", "saved", "started_ts", "first_ts", "elapsed_s",
+                        "packets", "shown", "bytes", "dropped", "truncated", "calls", "stop_reason", "error", "ts")
+CAPTURE_ROW_KEYS = ("no", "ts", "rel", "src", "dst", "src_mac", "dst_mac", "proto", "sport", "dport", "length", "info")
 CAPTURE_FILE_KEYS = ("name", "size", "created_ts", "packets")
-CAPTURE_STATUS_KEYS = ("available", "reason", "adapters", "capture", "files")
 CAPTURE_ADAPTER_KEYS = ("name", "index", "mac", "type_name", "wifi")
-CAPTURE_FILTER_KEYS = ("host", "port", "protocol")
-CAPTURE_STATES = ("starting", "capturing", "converting", "done", "error", "cancelled")
-CAPTURE_RUNNING_STATES = ("starting", "capturing", "converting")
-CAPTURE_SECONDS = (10, 30, 60, 300, 900)
-CAPTURE_SECONDS_RANGE = (5, 1800)
+CAPTURE_LIMIT_KEYS = ("max_rows", "max_packets", "seconds", "sizes_mb", "default_seconds", "default_mb")
+CAPTURE_PACKETS_KEYS = ("rows", "total", "shown", "matched", "last", "dropped_before", "session")
+CAPTURE_DETAIL_KEYS = ("row", "layers", "hex", "bytes")
+CAPTURE_LAYER_KEYS = ("name", "summary", "start", "length", "fields")
+CAPTURE_FIELD_KEYS = ("name", "value", "start", "length")
+CAPTURE_TILE_KEYS = ("available", "reason", "running", "adapter", "packets", "calls", "files")
+#: the SIP call the capture rebuilds and its RTP streams (tnt.sipcalls: CALL_KEYS, STREAM_KEYS, MESSAGE_KEYS)
+SIP_CALL_KEYS = ("id", "call_id", "from_uri", "to_uri", "state", "start_ts", "answer_ts", "end_ts", "duration_s",
+                 "status", "messages", "streams", "note")
+SIP_STREAM_KEYS = ("id", "src", "sport", "dst", "dport", "ssrc", "payload_type", "codec", "packets", "lost",
+                   "out_of_order", "first_ts", "last_ts", "duration_s", "bytes", "jitter_ms", "decodable")
+SIP_MESSAGE_KEYS = ("ts", "kind", "method", "status", "reason", "src", "dst", "cseq", "cseq_method", "via_branch",
+                    "contact", "user_agent", "has_sdp", "sdp_c", "where", "side")
+CAPTURE_SESSION_STATES = ("capturing", "stopped", "loaded", "error")
+CAPTURE_STOP_REASONS = ("user", "seconds", "size", "packets", "adapter", "service")
+CAPTURE_SECONDS = (60, 300, 900, 1800, 3600)       # what the start choices offer, and what the API accepts
 CAPTURE_SIZES_MB = (64, 128, 256, 512, 1024)
-CAPTURE_PROTOCOLS = ("tcp", "udp", "icmp")
+CAPTURE_DEFAULT_SECONDS = 900
+CAPTURE_DEFAULT_MB = 256
+CAPTURE_MAX_ROWS = 50_000                          # rows held in memory; past that the oldest falls off the front
+CAPTURE_MAX_PACKETS = 5_000_000
+CAPTURE_ROW_LIMIT = 500                            # GET /api/capture/packets?limit= : its default and its cap
+CAPTURE_MAX_ROW_LIMIT = 2000
+CAPTURE_TICK_S = 1.0                               # how often capture.state goes out while a capture runs
 CAPTURE_FILE_RE = r"^TNT-capture-\d{8}-\d{6}\.pcapng$"
-CAPTURE_SECONDS_TEXT = "seconds must be a whole number from {lo} to {hi}"
-CAPTURE_SIZE_TEXT = "size_mb must be one of 64, 128, 256, 512 or 1024"
-CAPTURE_HOST_TEXT = "host must be an IP address"
-CAPTURE_PORT_TEXT = "port must be a whole number from 1 to 65535"
-CAPTURE_PROTOCOL_TEXT = "protocol must be tcp, udp, icmp or null"
-CAPTURE_PORT_ICMP_TEXT = "port cannot be combined with protocol icmp"
 CAPTURE_ADAPTER_TEXT = "adapter '{name}' is not up"
-CAPTURE_FULL_PACKETS_TEXT = "full_packets must be true or false"
+CAPTURE_SECONDS_TEXT = "max_seconds must be one of 60, 300, 900, 1800 or 3600"
+CAPTURE_SIZE_TEXT = "max_mb must be one of 64, 128, 256, 512 or 1024"
+CAPTURE_BUSY_TEXT = "A capture is already running: stop it first"
+CAPTURE_NOTHING_TEXT = "No capture is open"
 CAPTURE_FILE_MISSING_TEXT = "The capture file was not found"
+#: opening any capture file on this PC by its full path (tnt.capture.open_path)
+CAPTURE_PATH_TEXT = "path must be the full path of a file on this PC"
+CAPTURE_PATH_BIG_TEXT = "That file is larger than {mb} MB, which is more than TNT opens"
+CAPTURE_MAX_OPEN_BYTES = 4 * 1024 ** 3
+CAPTURE_MAX_PATH_LEN = 4096
+CAPTURE_PACKET_GONE_TEXT = "That packet is no longer in the list"
+CAPTURE_NO_AUDIO_TEXT = "That call has no audio TNT can play"
 #: the routes' 403 for a standard user, and for a caller the service could not identify (the mock's callers always are)
 CAPTURE_ADMIN_REQUIRED_MSG = "Packet capture needs a Windows administrator account."
 CAPTURE_ADMIN_UNVERIFIED_MSG = "Packet capture needs a Windows administrator account; this request could not be verified as one."
-#: the event types /api/events sends only while STATE.wifi_admin is on (the service's routes.ADMIN_ONLY_EVENTS: the capture job)
-ADMIN_ONLY_EVENTS = frozenset({"capture.state"})
-#: the capture the mock starts with (2026-01-01 12:00:00 local time) and the ETL bytes a second of capturing adds
+#: the event types /api/events sends only while STATE.wifi_admin is on (the service's routes.ADMIN_ONLY_EVENTS)
+ADMIN_ONLY_EVENTS = frozenset({"capture.state", "capture.sip"})
+#: the protocol keys the page's filter buttons send -> the proto and layer names they match (tnt.dissect.PROTO_FILTERS)
+CAPTURE_PROTO_FILTERS = {
+    "icmp": ("ICMP", "ICMPv6"), "arp": ("ARP",), "dns": ("DNS", "MDNS", "LLMNR", "NBNS"), "dhcp": ("DHCP", "DHCPv6"),
+    "http": ("HTTP",), "https": ("TLS", "QUIC"), "tls": ("TLS",), "sip": ("SIP",), "rtp": ("RTP", "RTCP"),
+    "rtsp": ("RTSP",), "tcp": ("TCP",), "udp": ("UDP",), "ipv4": ("IPv4",), "ipv6": ("IPv6",), "vlan": ("802.1Q",),
+    "ntp": ("NTP",), "snmp": ("SNMP",), "smb": ("SMB",), "tftp": ("TFTP",), "quic": ("QUIC",),
+}
+#: the saved capture the mock starts with (2026-01-01 12:00:00 local time), for the page's "Open…" dialog
 CAPTURE_SEED_FILE = "TNT-capture-20260101-120000.pcapng"
-CAPTURE_RATE_BPS = {True: 180_000, False: 24_000}
+CAPTURE_SEED_PACKETS = 412
+CAPTURE_SEED_BYTES = 318_704
+#: the fake live capture: packets a second, the pcapng block every frame adds to the file and the frames it loses
+CAPTURE_RATE_RANGE = (8.0, 25.0)
+CAPTURE_BLOCK_BYTES = 32
+CAPTURE_DROP_CHANCE = 0.002
 _CAPTURE_FILE = re.compile(CAPTURE_FILE_RE, re.ASCII)
+#: the invented network the capture sees: documentation addresses (RFC 5737, RFC 3849) and locally administered MACs
+#: only - never a real public address and never a real MAC
+CAPTURE_PC = {"ip": "192.0.2.50", "ip6": "2001:db8::50", "mac": "02:00:5e:00:00:50"}
+CAPTURE_GATEWAY = {"ip": "192.0.2.1", "ip6": "2001:db8::1", "mac": "02:00:5e:00:00:01"}
+CAPTURE_PHONE = {"ip": "192.0.2.60", "ip6": None, "mac": "02:00:5e:00:00:60"}
+CAPTURE_PBX = {"ip": "192.0.2.70", "ip6": None, "mac": "02:00:5e:00:00:70"}
+CAPTURE_CAMERA = {"ip": "192.0.2.31", "ip6": None, "mac": "02:00:5e:00:00:31"}
+CAPTURE_NVR = {"ip": "192.0.2.40", "ip6": None, "mac": "02:00:5e:00:00:40"}
+CAPTURE_LAN = (CAPTURE_PC, CAPTURE_GATEWAY, CAPTURE_PHONE, CAPTURE_PBX, CAPTURE_CAMERA, CAPTURE_NVR)
+CAPTURE_BROADCAST_MAC = "ff:ff:ff:ff:ff:ff"
+#: what this PC talks to on the internet (invented names on documentation addresses)
+CAPTURE_SERVERS = ({"name": "www.example.com", "ip": "203.0.113.10", "ip6": "2001:db8:a::10"},
+                   {"name": "totalelectronics.com", "ip": "198.51.100.40", "ip6": None},
+                   {"name": "updates.example.net", "ip": "203.0.113.72", "ip6": "2001:db8:b::72"},
+                   {"name": "api.example.org", "ip": "198.51.100.88", "ip6": None})
+CAPTURE_RESOLVERS = ("192.0.2.1", "203.0.113.53")
+#: the background mix, (kind, weight): every protocol button of the page has something to find
+CAPTURE_MIX = (("https", 26), ("tcp", 13), ("dns", 10), ("http", 8), ("udp", 7), ("icmp", 6), ("arp", 4),
+               ("rtsp", 3), ("dhcp", 2))
+#: the scripted SIP call, seconds after the capture began; RTP rows a second per direction (a real 20 ms stream is 50
+#: a second: the mock samples it so the list stays readable), and the call's invented parties
+CAPTURE_SIP_AT = {"invite": 3.0, "ringing": 3.35, "answer": 5.6, "ack": 5.65, "bye": 13.6, "byeok": 13.7}
+CAPTURE_SIP_RTP_HZ = 5.0
+CAPTURE_SIP_FROM = "sip:2001@192.0.2.70"
+CAPTURE_SIP_TO = "sip:2002@192.0.2.70"
+CAPTURE_SIP_RTP_PORTS = (16402, 20002)             # the phone's and the phone system's
+CAPTURE_SIP_CODEC = "PCMU/8000"
+CAPTURE_SIP_CONTACT = "sip:2001@192.0.2.60:5060"
+CAPTURE_SIP_UA = "TEC-Phone/3.4.1"
+#: the WAV calls/{id}/audio answers: a quiet two-tone warble, 8 kHz 16-bit mono (tnt.sipcalls.build_wav's shape)
+CAPTURE_WAV_RATE = 8000
+CAPTURE_WAV_SECONDS = 2.4
+CAPTURE_WAV_TONES = (440.0, 620.0)
 #: Speed: latency under load and call quality (tnt.speedtest.quality): keys, texts and the grading rules
 QUALITY_KEYS = ("version", "available", "reason", "target", "interval_ms", "payload_bytes", "windows", "bufferbloat", "call")
 WINDOW_KEYS = ("sent", "received", "skipped", "loss_pct", "median_ms", "mean_ms", "p95_ms", "max_ms", "jitter_ms")
@@ -937,6 +1105,410 @@ def network_tool_route(p: str) -> bool:
     return p in NETWORK_TOOL_ROUTES or (p.startswith(CAPTURE_FILES_ROUTE) and len(p) > len(CAPTURE_FILES_ROUTE))
 
 
+
+# --------------------------------------------------------------------------- SIP (its own page)
+#: The shapes the SIP page reads, from tnt.sipqual, tnt.sipalg, tnt.sipnat and tnt.sipflow.
+SIP_QUALIFIER_KEYS = ("ts", "window_h", "network_id", "site", "sip_host", "verdict", "grade", "legs", "headline",
+                      "findings", "speedtest_ts", "note")
+SIP_LEG_KEYS = ("kind", "label", "target", "grade", "mos", "r", "call_label", "avg_ms", "jitter_ms", "loss_pct",
+                "p95_ms", "samples", "window_h", "reason")
+SIP_HEADLINE_KEYS = ("leg", "label", "grade", "mos", "r", "call_label", "avg_ms", "jitter_ms", "loss_pct",
+                     "samples", "window_h", "reason")
+SIP_FINDING_KEYS = ("id", "level", "title", "detail", "advice", "evidence")
+SIP_ALG_KEYS = ("ts", "host", "port", "transport", "verdict", "probes", "changes", "public", "via_srv",
+                "findings", "note")
+SIP_PROBE_KEYS = ("port", "bound", "requested_port", "answered", "status", "reason", "elapsed_ms", "received",
+                  "rport", "changes", "error")
+SIP_CHANGE_KEYS = ("header", "sent", "seen")
+SIP_STUN_KEYS = ("ts", "servers", "local_port", "requested_port", "bound", "mapping", "public", "port_preserved",
+                 "findings", "note")
+SIP_SERVER_KEYS = ("host", "port", "answered", "mapped_ip", "mapped_port", "elapsed_ms", "error")
+SIP_FLOW_KEYS = ("ts", "sources", "calls", "skew", "findings", "counts")
+SIP_SOURCE_KEYS = ("slot", "name", "path", "size", "packets", "sip_messages", "rtp_packets", "calls", "first_ts",
+                   "last_ts", "error")
+SIP_LADDER_KEYS = ("index", "ts", "rel", "side", "src", "dst", "label", "kind", "method", "status", "reason",
+                   "cseq", "cseq_method", "has_sdp", "contact", "user_agent", "where", "note")
+SIP_FLOWCALL_KEYS = ("id", "call_ids", "from_uri", "to_uri", "state", "status", "start_ts", "answer_ts", "end_ts",
+                     "duration_s", "sides", "matched_by", "ladder", "streams", "findings", "note")
+
+#: The fake site's phone system, on a documentation address like everything else here.
+#: tnt.sipqual.MAX_LEGS_PER_KIND: most targets of one kind that become legs
+SIP_MAX_LEGS_PER_KIND = 3
+SIP_PBX_HOST = "pbx.example.net"
+SIP_PBX_IP = "198.51.100.25"
+SIP_PHONE_IP = "192.0.2.60"
+#: The phone as the capture shows it on the wire: a real private address, because "behind NAT" is
+#: RFC 1918 / CGNAT / fc00::/7 and the documentation ranges this file uses as public stand-ins are
+#: deliberately not counted as private (tnt.sipalg.behind_nat).
+SIP_NATTED_PHONE = "10.20.30.40"
+#: What the fake network's ALG does: "clean" (nothing in the way), "alg" (a router rewriting SIP) or
+#: "inconclusive" (the PBX never answered).  POST /mock/sip picks another.
+SIP_ALG_STATES = ("clean", "alg", "inconclusive")
+#: What the fake NAT does to a mapping: the two that matter for voice, plus the happy case.
+SIP_NAT_STATES = ("endpoint-independent", "address-dependent", "none")
+SIP_STUN_SERVERS = (("stun.l.google.com", 19302), ("stun.cloudflare.com", 3478))
+SIP_CAPTURE_A = {"slot": "a", "name": "client-side.pcapng", "path": "C:\\Captures\\client-side.pcapng",
+                 "size": 2_214_400}
+SIP_CAPTURE_B = {"slot": "b", "name": "server-side.pcapng", "path": "C:\\Captures\\server-side.pcapng",
+                 "size": 2_461_184}
+#: Seconds between the two captures' clocks, which is what makes merging them worth doing at all.
+SIP_SKEW_S = 4.8
+
+
+def sip_grade(avg: float, jitter: float, loss: float) -> str:
+    """tnt.sipqual.THRESHOLDS: the worst of the three decides, because a fast path that drops packets is not good."""
+    for grade, max_avg, max_jitter, max_loss in (("excellent", 60.0, 10.0, 0.1), ("good", 120.0, 20.0, 0.5),
+                                                 ("fair", 200.0, 40.0, 1.5), ("poor", 300.0, 60.0, 3.0)):
+        if avg <= max_avg and jitter <= max_jitter and loss <= max_loss:
+            return grade
+    return "bad"
+
+
+def sip_call_quality(avg: float, jitter: float, loss: float) -> Tuple[float, float]:
+    """The simplified E-model of tnt.speedtest.quality.call_quality, so the mock shows the numbers the page will."""
+    eff = avg + 2 * jitter + 10.0
+    r = 93.2 - eff / 40.0 if eff < 160 else 93.2 - (eff - 120) / 10.0
+    r = max(0.0, min(100.0, r - 2.5 * loss))
+    mos = max(1.0, 1 + 0.035 * r + 7e-6 * r * (r - 60) * (100 - r))
+    return round(r, 2), round(mos, 2)
+
+
+def sip_call_label(r: float) -> str:
+    for bound, text in ((90, "excellent"), (80, "good"), (70, "fair"), (60, "poor")):
+        if r >= bound:
+            return text
+    return "bad"
+
+
+def sip_headline(legs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """tnt.sipqual.headline: the weakest graded leg's numbers, because that is what limits the call."""
+    graded = [leg for leg in legs if leg["grade"] != "unknown"]
+    if not graded:
+        return {"leg": None, "label": None, "grade": "unknown", "mos": None, "r": None, "call_label": None,
+                "avg_ms": None, "jitter_ms": None, "loss_pct": None, "samples": 0, "window_h": None,
+                "reason": "there is no graded leg to take the numbers from"}
+    # worst grade, then lowest MOS, then slowest: on a healthy site every leg is excellent and the first of them
+    # would put the gateway's 3 ms on screen as what a call gets (tnt.sipqual._weakest)
+    worst = min(graded, key=lambda leg: (SIP_GRADES.index(leg["grade"]),
+                                         leg["mos"] if isinstance(leg.get("mos"), (int, float)) else 5.0,
+                                         -(leg["avg_ms"] if isinstance(leg.get("avg_ms"), (int, float)) else 0.0)))
+    return {"leg": worst["kind"], "label": worst["label"], "grade": worst["grade"], "mos": worst["mos"],
+            "r": worst["r"], "call_label": worst["call_label"], "avg_ms": worst["avg_ms"],
+            "jitter_ms": worst["jitter_ms"], "loss_pct": worst["loss_pct"], "samples": worst["samples"],
+            "window_h": worst["window_h"], "reason": None}
+
+
+def sip_finding(ident: str, level: str, title: str, detail: Optional[str] = None, advice: Optional[str] = None,
+                evidence: Any = None) -> Dict[str, Any]:
+    return {"id": ident, "level": level, "title": title, "detail": detail, "advice": advice, "evidence": evidence}
+
+
+SIP_GRADE_LEVEL = {"excellent": "good", "good": "good", "fair": "warn", "poor": "bad", "bad": "bad",
+                   "unknown": "info"}
+SIP_LEVELS = ("bad", "warn", "info", "good")
+SIP_GRADES = ("bad", "poor", "fair", "good", "excellent", "unknown")
+
+
+def sip_build_qualifier(legs: List[Dict[str, Any]], window_h: float,
+                        sip_host: Optional[str], network_id: Optional[int], speedtest_ts: Optional[float],
+                        bufferbloat: Optional[str], ts: float, left_out: int = 0) -> Dict[str, Any]:
+    """tnt.sipqual.build_qualifier: the verdict is the worst leg, and the headline leads whatever its level."""
+    graded = [leg for leg in legs if leg["grade"] != "unknown"]
+    verdict = min((leg["grade"] for leg in graded), key=SIP_GRADES.index) if graded else "unknown"
+    head = sip_headline(legs)
+    ident_for = {"lan": "sip.lan", "wan": "sip.wan", "sip": "sip.trunk"}
+    advice_for = {
+        "lan": "A bad LAN leg is in the building: the switch, the cabling, or Wi-Fi between the phone and the "
+               "gateway. Fix it here before looking outside.",
+        "wan": "A bad WAN leg with a clean LAN is the circuit or the provider - that is a call to someone else, "
+               "and these numbers are what to tell them.",
+        "sip": "This is the path the calls themselves take. Bad here with a clean internet leg points at the route "
+               "to the phone system rather than at the line.",
+    }
+    findings: List[Dict[str, Any]] = []
+    for leg in legs:
+        numbers = (f"{leg['avg_ms']} ms average, {leg['jitter_ms']} ms jitter, {leg['loss_pct']} % loss over "
+                   f"{leg['samples']} pings")
+        findings.append(sip_finding(
+            ident_for[leg["kind"]], SIP_GRADE_LEVEL[leg["grade"]], f"{leg['label']}: {leg['grade']}",
+            numbers + (f" - {leg['call_label']} (MOS {leg['mos']})" if leg["mos"] else ""),
+            None if leg["grade"] in ("excellent", "good") else advice_for[leg["kind"]],
+            {"avg_ms": leg["avg_ms"], "jitter_ms": leg["jitter_ms"], "loss_pct": leg["loss_pct"]}))
+    window_text = f"{int(window_h)} hours" if window_h >= 2 else f"{int(window_h * 60)} minutes"
+    if graded:
+        worst = min(graded, key=lambda leg: SIP_GRADES.index(leg["grade"]))
+        if verdict in ("excellent", "good"):
+            findings.append(sip_finding("sip.ready", "good", f"This network looks {verdict} for SIP",
+                                        f"Every leg measured over the last {window_text} is {verdict} or better"
+                                        + (f" \u2014 MOS {head['mos']} at {head['avg_ms']} ms."
+                                           if head["mos"] is not None else ".")))
+        else:
+            findings.append(sip_finding(
+                "sip.ready", "bad" if verdict in ("bad", "poor") else "warn",
+                f"Calls on this network would be {verdict}",
+                f"The {worst['label'].lower()} is the weakest leg over the last {window_text}: "
+                f"{worst['avg_ms']} ms average, {worst['loss_pct']} % loss, {worst['jitter_ms']} ms jitter.",
+                "Start with the leg named above - the other legs are not the problem."))
+    else:
+        findings.append(sip_finding("sip.nodata", "info", "Not enough history for a rating yet",
+                                    "None of the legs has enough pings on this network to be worth grading.",
+                                    "Leave TNT running here for a while - even an hour gives it something to "
+                                    "stand on."))
+    if sip_host is None:
+        findings.append(sip_finding(
+            "sip.notarget", "info", "No SIP host has been named",
+            "This rating grades the path to a general internet host. The path the calls actually take - to the "
+            "PBX, SBC or registrar - may be a different route entirely.",
+            "Name the SIP host and TNT will monitor it like any other target."))
+    if bufferbloat in ("D", "F"):
+        findings.append(sip_finding(
+            "sip.bufferbloat", "bad", f"The line buffers badly under load (grade {bufferbloat})",
+            "Latency climbs sharply while the line is busy. Calls hold up until somebody starts a download.",
+            "This is the line's queueing, not its speed. Smart queue management on the router fixes it."))
+    lead = [f for f in findings if f["id"] == "sip.ready"]
+    rest = sorted((f for f in findings if f["id"] != "sip.ready"), key=lambda f: SIP_LEVELS.index(f["level"]))
+    note = (f"{left_out} more monitored target(s) were not graded: the first {SIP_MAX_LEGS_PER_KIND} of each kind "
+            "are, in the order the targets are listed on the Ping page.") if left_out else None
+    return {"ts": ts, "window_h": window_h, "network_id": network_id, "site": None, "sip_host": sip_host,
+            "verdict": verdict, "grade": verdict, "legs": legs, "headline": head,
+            "findings": lead + rest, "speedtest_ts": speedtest_ts, "note": note}
+
+
+# -- the ALG check (tnt.sipalg) ------------------------------------------------------------------
+def sip_probe(port: int, answered: bool, changes: List[Dict[str, Any]], rport: Optional[int] = None,
+              error: Optional[str] = None) -> Dict[str, Any]:
+    return {"port": rport or port or 51840, "bound": bool(port), "requested_port": port, "answered": answered,
+            "status": 200 if answered else None, "reason": "OK" if answered else None,
+            "elapsed_ms": 42 if answered else None, "received": PUBLIC_IP if answered else None,
+            "rport": rport, "changes": changes, "error": error}
+
+
+def sip_alg_result(host: str, port: int, state: str) -> Dict[str, Any]:
+    """The ALG check in whichever state the fake network is in: a router rewriting SIP, a clean path, or silence."""
+    if state == "alg":
+        changes = [{"header": "Via sent-by", "sent": f"{SIP_PHONE_IP}:5060", "seen": f"{PUBLIC_IP}:5060"},
+                   {"header": "Via branch", "sent": "z9hG4bK7a1c9f2e", "seen": "z9hG4bK7a1c9f2e-alg"},
+                   {"header": "Contact", "sent": f"sip:tnt@{SIP_PHONE_IP}:5060",
+                    "seen": f"sip:tnt@{PUBLIC_IP}:5060"}]
+        probes = [sip_probe(5060, True, changes), sip_probe(0, True, [])]
+        findings = [sip_finding("alg.rewritten", "bad", "A SIP ALG is rewriting your SIP",
+                                "The PBX echoed back headers this PC never sent. Something in the path between "
+                                "this PC and the phone system is editing SIP as it goes by.",
+                                "Turn SIP ALG off on the router or firewall. It is usually called SIP ALG, SIP "
+                                "Transformations or SIP Helper."),
+                    sip_finding("alg.port", "info", "Only port 5060 is touched",
+                                "The probe from an ordinary source port came back untouched; the one from 5060 did "
+                                "not. That is how most of these boxes behave.",
+                                "Moving the phone system off 5060 dodges it, but turning the ALG off is the fix.")]
+        verdict = "alg"
+    elif state == "inconclusive":
+        probes = [sip_probe(5060, False, [], error="no answer in 3.0 s"),
+                  sip_probe(0, False, [], error="no answer in 3.0 s")]
+        findings = [sip_finding("alg.silent", "info", "The PBX did not answer",
+                                "Nothing came back from either probe, so there is nothing to compare. This says "
+                                "the server is unreachable from here, not that the path is clean.",
+                                "Check the address and that this PC can reach the phone system at all.")]
+        verdict = "inconclusive"
+    else:
+        probes = [sip_probe(5060, True, []), sip_probe(0, True, [])]
+        findings = [sip_finding("alg.clean", "good", "Nothing rewrote the SIP TNT sent",
+                                "Every header the PBX echoed came back exactly as it was sent, from port 5060 and "
+                                "from an ordinary port.",
+                                "This is as much as a probe can show. A capture from both sides is the only "
+                                "conclusive test.")]
+        verdict = "clean"
+    # a SIP domain resolves through SRV the way a phone does (tnt.sipalg.srv_targets); the fake host is a plain
+    # name, so nothing was followed
+    return {"ts": time.time(), "host": host, "port": port, "transport": "udp", "verdict": verdict,
+            "probes": probes, "changes": probes[0]["changes"], "public": PUBLIC_IP, "via_srv": None,
+            "findings": findings, "note": None}
+
+
+# -- STUN (tnt.sipnat) ---------------------------------------------------------------------------
+def sip_stun_result(servers: List[Tuple[str, int]], state: str) -> Dict[str, Any]:
+    """Both servers asked from one socket; two different external ports is the one-way-audio NAT."""
+    local = 51840
+    rows = []
+    for index, (host, port) in enumerate(servers):
+        mapped_port = local if state == "none" else (49152 if state == "endpoint-independent" else 49152 + index * 7)
+        mapped_ip = SIP_PHONE_IP if state == "none" else PUBLIC_IP
+        rows.append({"host": host, "port": port, "answered": True, "mapped_ip": mapped_ip,
+                     "mapped_port": mapped_port, "elapsed_ms": 28 + index * 6, "error": None})
+    if state == "address-dependent":
+        findings = [sip_finding("nat.symmetric", "bad", "This NAT gives every destination a different port",
+                                "The two STUN servers were asked from one socket and saw two different external "
+                                "ports. A phone system told about one of them sends its audio to the other.",
+                                "This is the classic one-way audio NAT. Turn the router's SIP-aware mangling off, "
+                                "or put the phone system behind an SBC that keeps a single mapping.")]
+    elif state == "none":
+        findings = [sip_finding("nat.none", "good", "This PC is not behind NAT",
+                                "Both servers saw the address and port this PC actually used.",
+                                None)]
+    else:
+        findings = [sip_finding("nat.endpoint", "good", "One mapping for every destination",
+                                "Both STUN servers saw the same external address and port, which is what voice "
+                                "wants.", None)]
+    return {"ts": time.time(), "servers": rows, "local_port": local, "requested_port": 0, "bound": True,
+            "mapping": state, "public": rows[0]["mapped_ip"] if rows else None,
+            "port_preserved": state == "none", "findings": findings, "note": None}
+
+
+def sip_lifetime_result(host: str, port: int, state: str) -> Dict[str, Any]:
+    """How long a mapping survives with nothing using it; short is what breaks inbound calls between registrations."""
+    short = state == "address-dependent"
+    steps, survived, lost = [], None, None
+    for idle in (15, 30, 60, 120, 240):
+        kept = not (short and idle >= 30)
+        steps.append({"idle_s": idle, "mapped_port": 49152 if kept else 49871, "kept": kept, "error": None})
+        if kept:
+            survived = idle
+        else:
+            lost = idle
+            break
+    if lost is not None:
+        findings = [sip_finding("nat.shortlife", "bad", f"The mapping was gone after {lost} s idle",
+                                f"It survived {survived} s but not {lost} s. Between one registration and the next "
+                                "there is a window where an inbound call has nowhere to arrive.",
+                                "Set the phone's registration interval, or its keep-alive, shorter than this.")]
+        verdict = "short"
+    else:
+        findings = [sip_finding("nat.longlife", "good", f"The mapping survived {survived} s idle",
+                                "Long enough that an ordinary registration interval keeps it open.", None)]
+        verdict = "long"
+    return {"ts": time.time(), "server": {"host": host, "port": port}, "local_port": 51840, "steps": steps,
+            "survived_s": survived, "lost_at_s": lost, "verdict": verdict, "findings": findings}
+
+
+# -- the call flows (tnt.sipflow) ----------------------------------------------------------------
+SIP_LADDER_SCRIPT = (
+    (0.00, "a", "phone", "pbx", "INVITE", "request", "INVITE", None, None, True),
+    (0.04, "b", "phone", "pbx", "INVITE", "request", "INVITE", None, None, True),
+    (0.31, "b", "pbx", "phone", "100 Trying", "response", None, 100, "Trying", False),
+    (0.35, "b", "pbx", "phone", "180 Ringing", "response", None, 180, "Ringing", False),
+    (0.39, "a", "pbx", "phone", "180 Ringing", "response", None, 180, "Ringing", False),
+    (2.60, "b", "pbx", "phone", "200 OK", "response", None, 200, "OK", True),
+    (2.64, "a", "pbx", "phone", "200 OK", "response", None, 200, "OK", True),
+    (2.68, "a", "phone", "pbx", "ACK", "request", "ACK", None, None, False),
+    (2.72, "b", "phone", "pbx", "ACK", "request", "ACK", None, None, False),
+    (13.60, "a", "phone", "pbx", "BYE", "request", "BYE", None, None, False),
+    (13.64, "b", "phone", "pbx", "BYE", "request", "BYE", None, None, False),
+    (13.70, "b", "pbx", "phone", "200 OK", "response", None, 200, "OK", False),
+    (13.74, "a", "pbx", "phone", "200 OK", "response", None, 200, "OK", False),
+)
+
+
+def sip_ladder(slots: List[str], start: float) -> List[Dict[str, Any]]:
+    """The call flow a tech reads top to bottom: setup, ringing, answer, audio, teardown."""
+    rows = []
+    index = 0
+    for rel, side, src, dst, label, kind, method, status, reason, sdp in SIP_LADDER_SCRIPT:
+        if side not in slots:
+            continue
+        who = {"phone": SIP_PHONE_IP, "pbx": SIP_PBX_IP}
+        rows.append({"index": index, "ts": start + rel, "rel": round(rel, 2), "side": side,
+                     "src": who[src], "dst": who[dst], "label": label, "kind": kind, "method": method,
+                     "status": status, "reason": reason, "cseq": 1 if label != "BYE" else 2,
+                     "cseq_method": method or ("INVITE" if status else None), "has_sdp": sdp,
+                     "contact": f"<sip:2001@{SIP_PHONE_IP}:5060>", "user_agent": "TEC-Phone/3.4.1",
+                     "where": 1200 + index * 7, "note": None})
+        index += 1
+    return rows
+
+
+def sip_streams(slots: List[str], start: float) -> List[Dict[str, Any]]:
+    rows = []
+    for side in slots:
+        for which, (src, dst, sport, dport) in enumerate(((SIP_PHONE_IP, SIP_PBX_IP, 16402, 20002),
+                                                          (SIP_PBX_IP, SIP_PHONE_IP, 20002, 16402))):
+            rows.append({"id": f"{side}-{sport}-{dport}", "side": side, "src": src, "sport": sport, "dst": dst,
+                         "dport": dport, "ssrc": 0x5A17C0DE + which, "payload_type": 0, "codec": "PCMU/8000",
+                         "packets": 546 if (side == "a" or which == 0) else 0, "lost": 0 if which == 0 else 3,
+                         "first_ts": start + 2.7, "last_ts": start + 13.5, "duration_s": 10.8,
+                         "bytes": 546 * 172, "jitter_ms": 1.8 if which == 0 else 6.4,
+                         "decodable": True})
+    return rows
+
+
+def sip_flow(slots: List[str]) -> Dict[str, Any]:
+    """GET /api/sip/flow: the loaded captures, the calls in them, and the clock skew between the two."""
+    now = time.time()
+    start = now - 900.0
+    sources = []
+    for row in (SIP_CAPTURE_A, SIP_CAPTURE_B):
+        if row["slot"] not in slots:
+            continue
+        sources.append({"slot": row["slot"], "name": row["name"], "path": row["path"], "size": row["size"],
+                        "packets": 5860 if row["slot"] == "a" else 6142, "sip_messages": 7, "rtp_packets": 1092,
+                        "calls": 1, "first_ts": start - 2.0, "last_ts": start + 20.0, "error": None})
+    if not sources:
+        return {"ts": now, "sources": [], "calls": [], "skew": {"seconds": None, "samples": 0, "matched_calls": 0,
+                                                                "confident": False},
+                "findings": [], "counts": {"calls": 0, "sip_messages": 0, "rtp_packets": 0}}
+    both = len(sources) > 1
+    ladder = sip_ladder(slots, start)
+    streams = sip_streams(slots, start)
+    findings = []
+    if both:
+        findings.append(sip_finding(
+            "flow.rewritten", "bad", "The two captures do not agree on the Contact address",
+            "The same call carries one Contact on the client side and another on the server side. Something "
+            "between them rewrote it in flight.",
+            "This is a SIP ALG, and unlike a probe it is conclusive: the message went in one way and came out "
+            "another.", {"header": "contact"}))
+        findings.append(sip_finding("flow.skew", "info", f"The captures' clocks differ by {SIP_SKEW_S:.1f} s",
+                                    "Measured from the messages that appear in both, not assumed. The ladder is "
+                                    "shown on one timeline.", None,
+                                    {"seconds": SIP_SKEW_S}))
+    findings.append(sip_finding("flow.jitter", "warn", "Audio from the phone system is jittery",
+                                "6.4 ms of interarrival jitter on the inbound stream against 1.8 ms outbound.",
+                                "Jitter one way only points at the path that direction, not at the phones.",
+                                {"jitter_ms": 6.4}))
+    if not both:
+        # what one capture can see of the ALG (tnt.sipalg.passive_tells, wired into tnt.sipflow). Only offered
+        # with one capture loaded: two sides prove the rewrite outright and an inference beside proof is noise.
+        findings.append(sip_finding(
+            "alg.contact", "warn", "A SIP ALG may be rewriting this call",
+            f"{SIP_NATTED_PHONE} is behind NAT but its Contact says {PUBLIC_IP}, which is not. A phone writes its "
+            "own Contact and does not know the address on the other side of the NAT unless something put it there.",
+            "This is one capture's inference, not proof. The SIP ALG check on this page probes your own server and "
+            "says outright whether something rewrote what TNT sent; a capture from both sides of the network "
+            "settles it beyond doubt.",
+            {"src": SIP_NATTED_PHONE, "contact": f"sip:2001@{PUBLIC_IP}:5060"}))
+    call = {"id": "flow-1", "call_ids": ["7a1c9f2e3b@192.0.2.60"], "from_uri": f"sip:2001@{SIP_PBX_HOST}",
+            "to_uri": f"sip:2002@{SIP_PBX_HOST}", "state": "ended", "status": 200, "start_ts": start,
+            "answer_ts": start + 2.6, "end_ts": start + 13.74, "duration_s": 11.14,
+            "sides": sorted(slots), "matched_by": "call-id" if both else "single",
+            "ladder": ladder, "streams": streams, "findings": findings, "note": None}
+    return {"ts": now, "sources": sources, "calls": [call],
+            "skew": {"seconds": SIP_SKEW_S if both else None, "samples": 7 if both else 0,
+                     "matched_calls": 1 if both else 0, "confident": both},
+            "findings": findings,
+            "counts": {"calls": 1, "sip_messages": len(ladder), "rtp_packets": 1092 * len(sources)}}
+
+
+def sip_header_view(call: Dict[str, Any], row: Dict[str, Any]) -> Dict[str, Any]:
+    """Every header of one SIP message, in the order it was sent, repeats and all (tnt.sipcalls.sip_headers)."""
+    line = (f"{row['method']} sip:2002@{SIP_PBX_HOST} SIP/2.0" if row["kind"] == "request"
+            else f"SIP/2.0 {row['status']} {row['reason']}")
+    headers = [("Via", f"SIP/2.0/UDP {SIP_PHONE_IP}:5060;branch=z9hG4bK{row['index']:08x};rport"),
+               ("Max-Forwards", "70"),
+               ("From", f"\"Reception\" <sip:2001@{SIP_PBX_HOST}>;tag=8f2c1a"),
+               ("To", f"<sip:2002@{SIP_PBX_HOST}>" + (";tag=99b31d" if row["status"] else "")),
+               ("Call-ID", call["call_ids"][0]),
+               ("CSeq", f"{row['cseq']} {row['cseq_method'] or 'INVITE'}"),
+               ("Contact", row["contact"]),
+               ("User-Agent", row["user_agent"]),
+               ("Allow", "INVITE, ACK, CANCEL, BYE, OPTIONS, REFER, NOTIFY"),
+               ("Content-Type", "application/sdp") if row["has_sdp"] else ("Content-Length", "0")]
+    body = ("v=0\r\no=- 1 1 IN IP4 " + SIP_PHONE_IP + "\r\ns=-\r\nc=IN IP4 " + SIP_PHONE_IP +
+            "\r\nt=0 0\r\nm=audio 16402 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=sendrecv\r\n"
+            ) if row["has_sdp"] else ""
+    return {"start": line, "kind": row["kind"], "method": row["method"], "status": row["status"],
+            "reason": row["reason"], "uri": f"sip:2002@{SIP_PBX_HOST}" if row["kind"] == "request" else None,
+            "headers": [{"name": name, "value": value} for name, value in headers],
+            "body": body, "is_sdp": bool(row["has_sdp"]), "length_ok": True}
+
+
 class ToolRefused(RuntimeError):
     """A network tool's refusal with the service's status, code and text (tnt.api.routes.TYPED_ERRORS, the admin check):
     ``extra`` joins the error body (a TFTP port conflict's ``owners``), ``headers`` the response (a 429's ``Retry-After``)."""
@@ -980,65 +1552,585 @@ def tiny_pcapng(ts: float) -> bytes:
     return shb + idb + epb
 
 
-def _whole(value: Any) -> Optional[int]:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float) and value.is_integer():
-        return int(value)
-    return None
-
-
 def capture_start_values(body: Dict[str, Any], adapters: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """The start body of POST /api/tools/capture checked in tnt.capture.CaptureManager.start's order (a key left out takes its
-    default, a null that is sent is checked): ValueError with the service's text, else the values with ``adapter`` the row of
-    *adapters* and ``filters`` normalised (canonical address, lower-case protocol)."""
-    def get(key: str, default: Any) -> Any:
-        return body[key] if key in body else default
-
-    lo, hi = CAPTURE_SECONDS_RANGE
-    seconds = _whole(get("seconds", 60))
-    if seconds is None or not lo <= seconds <= hi:
-        raise ValueError(CAPTURE_SECONDS_TEXT.format(lo=lo, hi=hi))
-    size_mb = _whole(get("size_mb", 128))
-    if size_mb not in CAPTURE_SIZES_MB:
-        raise ValueError(CAPTURE_SIZE_TEXT)
-    host = get("host", None)
-    if host is not None:
-        if not isinstance(host, str):
-            raise ValueError(CAPTURE_HOST_TEXT)
-        text = host.strip()
-        if "%" in text or "/" in text:
-            raise ValueError(CAPTURE_HOST_TEXT)
-        try:
-            host = str(ipaddress.ip_address(text)) if text else None
-        except ValueError:
-            raise ValueError(CAPTURE_HOST_TEXT) from None
-    port = get("port", None)
-    if port is not None:
-        port = _whole(port)
-        if port is None or not 1 <= port <= 65535:
-            raise ValueError(CAPTURE_PORT_TEXT)
-    protocol = get("protocol", None)
-    if protocol is not None:
-        if not isinstance(protocol, str):
-            raise ValueError(CAPTURE_PROTOCOL_TEXT)
-        protocol = protocol.strip().lower() or None
-        if protocol is not None and protocol not in CAPTURE_PROTOCOLS:
-            raise ValueError(CAPTURE_PROTOCOL_TEXT)
-    if port is not None and protocol == "icmp":
-        raise ValueError(CAPTURE_PORT_ICMP_TEXT)
+    """The body of POST /api/capture/start checked in tnt.capture.CaptureManager.start's order (a key left out takes its
+    default): ValueError with the service's text, else the adapter row of *adapters* and the two limits."""
     adapter = body.get("adapter")
     name = (adapter if isinstance(adapter, str) else ("" if adapter is None else str(adapter))).strip()
     row = next((a for a in adapters if a["name"] == name), None) if name else None
     if row is None:
         raise ValueError(CAPTURE_ADAPTER_TEXT.format(name=name[:40]))
-    full_packets = get("full_packets", True)
-    if not isinstance(full_packets, bool):
-        raise ValueError(CAPTURE_FULL_PACKETS_TEXT)
-    return {"adapter": dict(row), "filters": {"host": host, "port": port, "protocol": protocol}, "full_packets": full_packets,
-            "seconds": seconds, "size_mb": size_mb}
+    seconds = body["max_seconds"] if "max_seconds" in body else CAPTURE_DEFAULT_SECONDS
+    if seconds not in CAPTURE_SECONDS:
+        raise ValueError(CAPTURE_SECONDS_TEXT)
+    size_mb = body["max_mb"] if "max_mb" in body else CAPTURE_DEFAULT_MB
+    if size_mb not in CAPTURE_SIZES_MB:
+        raise ValueError(CAPTURE_SIZE_TEXT)
+    return {"adapter": dict(row), "max_seconds": int(seconds), "max_mb": int(size_mb)}
+
+
+# -- packet capture: reading the list (tnt.capture.CaptureManager.packets, tnt.dissect's matchers) -----------------
+def capture_norm_mac(text: Any) -> str:
+    """A MAC filter as twelve lower-case hex digits, or "" when it is not one (any separator, or none)."""
+    raw = "".join(c for c in str(text or "").lower() if c in "0123456789abcdef")
+    return raw if len(raw) == 12 else ""
+
+
+def capture_norm_ip(text: Any) -> str:
+    """An IP filter as its canonical text, or "" when it is not an address."""
+    value = str(text or "").strip()
+    if not value or "/" in value or "%" in value:
+        return ""
+    try:
+        return str(ipaddress.ip_address(value))
+    except ValueError:
+        return ""
+
+
+def capture_whole(value: Any, default: int, lo: int, hi: int) -> int:
+    """A whole number inside [lo, hi]; *default* for anything else (list paging never fails a request)."""
+    if isinstance(value, bool) or value is None:
+        return default
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, number))
+
+
+def capture_proto_keys(protos: Any) -> Tuple[str, ...]:
+    """The protocol filter keys of a request, the ones CAPTURE_PROTO_FILTERS knows, sorted and without repeats."""
+    if not protos:
+        return ()
+    wanted = protos if isinstance(protos, (list, tuple, set)) else str(protos).split(",")
+    return tuple(sorted({str(p).strip().lower() for p in wanted if str(p).strip().lower() in CAPTURE_PROTO_FILTERS}))
+
+
+def capture_matches(row: Dict[str, Any], layers: Tuple[str, ...], ip: str, mac: str, protos: Tuple[str, ...]) -> bool:
+    """CaptureManager._matches: the IP matches source or destination, the MAC either MAC in any spelling, and the
+    protocol keys are ORed among themselves; all three are ANDed."""
+    if ip and ip != row["src"] and ip != row["dst"]:
+        return False
+    if mac and mac != capture_norm_mac(row["src_mac"]) and mac != capture_norm_mac(row["dst_mac"]):
+        return False
+    if protos:
+        for key in protos:
+            names = CAPTURE_PROTO_FILTERS.get(key) or ()
+            if row["proto"] in names or any(name in layers for name in names):
+                return True
+        return False
+    return True
+
+
+# -- packet capture: the traffic the fake live capture invents (tnt.dissect's rows, tnt.sipcalls' calls) -----------
+def capture_parts(**fields: Any) -> Dict[str, Any]:
+    """One invented packet: the ROW fields but ``no``, ``ts`` and ``rel``, the protocol ``layers`` the filters match
+    on, the application ``fields`` the detail tree shows, the ``payload`` bytes behind it and the little the header
+    builders need (TCP ``flags``, the ICMP ``type, id, seq``)."""
+    packet = {"src": "", "dst": "", "src_mac": "", "dst_mac": "", "proto": "UNKNOWN", "sport": None, "dport": None,
+              "length": 60, "info": "", "layers": ("ETH",), "fields": (), "payload": b"", "flags": 0x18,
+              "icmp": (8, 1, 1), "sip": None}
+    packet.update(fields)
+    return packet
+
+
+def capture_mac_for(ip: str) -> str:
+    """The MAC an address is behind on the wire: its own on this LAN, else the gateway's, as a real capture sees it."""
+    for host in CAPTURE_LAN:
+        if ip in (host["ip"], host["ip6"]):
+            return host["mac"]
+    return CAPTURE_GATEWAY["mac"]
+
+
+def _capture_pick(rng: random.Random, table: Tuple[Tuple[str, int], ...]) -> str:
+    draw = rng.randrange(sum(weight for _kind, weight in table))
+    for kind, weight in table:
+        draw -= weight
+        if draw < 0:
+            return kind
+    return table[-1][0]
+
+
+def capture_invent(rng: random.Random) -> Dict[str, Any]:  # noqa: C901 - one branch per protocol, flat on purpose
+    """One packet of the background mix (CAPTURE_MIX), as capture_parts describes it."""
+    kind = _capture_pick(rng, CAPTURE_MIX)
+    pc, gw = CAPTURE_PC, CAPTURE_GATEWAY
+    if kind == "arp":
+        who = rng.choice((CAPTURE_PHONE, CAPTURE_CAMERA, CAPTURE_NVR, CAPTURE_PBX))
+        if rng.random() < 0.55:
+            return capture_parts(src=gw["ip"], dst=who["ip"], src_mac=gw["mac"], dst_mac=CAPTURE_BROADCAST_MAC,
+                                 proto="ARP", length=60, layers=("ETH", "ARP"),
+                                 info=f"Who has {who['ip']}? Tell {gw['ip']}",
+                                 fields=(("Opcode", "request (1)"), ("Sender MAC address", gw["mac"]),
+                                         ("Sender IP address", gw["ip"]), ("Target IP address", who["ip"])))
+        return capture_parts(src=who["ip"], dst=gw["ip"], src_mac=who["mac"], dst_mac=gw["mac"], proto="ARP",
+                             length=60, layers=("ETH", "ARP"), info=f"{who['ip']} is at {who['mac']}",
+                             fields=(("Opcode", "reply (2)"), ("Sender MAC address", who["mac"]),
+                                     ("Sender IP address", who["ip"]), ("Target IP address", gw["ip"])))
+    if kind == "icmp":
+        server = rng.choice(CAPTURE_SERVERS)
+        ident, seq = 0x0001, rng.randrange(1, 4000)
+        body = b"abcdefghijklmnopqrstuvwabcdefghi"
+        out = rng.random() < 0.5
+        src, dst = (pc["ip"], server["ip"]) if out else (server["ip"], pc["ip"])
+        what = "request" if out else "reply"
+        return capture_parts(src=src, dst=dst, src_mac=capture_mac_for(src), dst_mac=capture_mac_for(dst),
+                             proto="ICMP", length=74, layers=("ETH", "IPv4", "ICMP"), payload=body,
+                             icmp=(8 if out else 0, ident, seq),
+                             info=f"Echo (ping) {what} id=0x{ident:04x} seq={seq}",
+                             fields=(("Type", f"{8 if out else 0} (Echo (ping) {what})"), ("Code", "0"),
+                                     ("Identifier", f"0x{ident:04x}"), ("Sequence number", str(seq))))
+    if kind == "dns":
+        server = rng.choice(CAPTURE_SERVERS)
+        resolver = rng.choice(CAPTURE_RESOLVERS)
+        txid = rng.randrange(0x1000, 0xFFFF)
+        rtype = "AAAA" if server["ip6"] and rng.random() < 0.3 else "A"
+        answer = server["ip6"] if rtype == "AAAA" else server["ip"]
+        name = server["name"]
+        if rng.random() < 0.5:
+            return capture_parts(src=pc["ip"], dst=resolver, src_mac=pc["mac"], dst_mac=capture_mac_for(resolver),
+                                 proto="DNS", sport=rng.randrange(49152, 65535), dport=53, length=rng.randrange(72, 96),
+                                 layers=("ETH", "IPv4", "UDP", "DNS"), payload=name.encode("ascii"),
+                                 info=f"Standard query 0x{txid:04x} {rtype} {name}",
+                                 fields=(("Transaction ID", f"0x{txid:04x}"), ("Flags", "0x0100 Standard query"),
+                                         ("Questions", "1"), ("Answer RRs", "0"), ("Name", name), ("Type", rtype)))
+        return capture_parts(src=resolver, dst=pc["ip"], src_mac=capture_mac_for(resolver), dst_mac=pc["mac"],
+                             proto="DNS", sport=53, dport=rng.randrange(49152, 65535), length=rng.randrange(100, 170),
+                             layers=("ETH", "IPv4", "UDP", "DNS"), payload=name.encode("ascii"),
+                             info=f"Standard query response 0x{txid:04x} {rtype} {name} {rtype} {answer}",
+                             fields=(("Transaction ID", f"0x{txid:04x}"), ("Flags", "0x8180 Standard query response"),
+                                     ("Questions", "1"), ("Answer RRs", "1"), ("Name", name), ("Type", rtype),
+                                     ("Address", answer)))
+    if kind == "dhcp":
+        xid = rng.randrange(0x10000000, 0x7FFFFFFF)
+        if rng.random() < 0.5:
+            return capture_parts(src="0.0.0.0", dst="255.255.255.255", src_mac=CAPTURE_PHONE["mac"],
+                                 dst_mac=CAPTURE_BROADCAST_MAC, proto="DHCP", sport=68, dport=67, length=342,
+                                 layers=("ETH", "IPv4", "UDP", "DHCP"),
+                                 info=f"DHCP Request - Transaction ID 0x{xid:08x}",
+                                 fields=(("Message type", "Boot Request (1)"), ("Transaction ID", f"0x{xid:08x}"),
+                                         ("Client MAC address", CAPTURE_PHONE["mac"]),
+                                         ("Option 53", "DHCP Message Type (Request)"),
+                                         ("Option 50", f"Requested IP Address ({CAPTURE_PHONE['ip']})")))
+        return capture_parts(src=gw["ip"], dst=CAPTURE_PHONE["ip"], src_mac=gw["mac"], dst_mac=CAPTURE_PHONE["mac"],
+                             proto="DHCP", sport=67, dport=68, length=342, layers=("ETH", "IPv4", "UDP", "DHCP"),
+                             info=f"DHCP ACK - Transaction ID 0x{xid:08x}",
+                             fields=(("Message type", "Boot Reply (2)"), ("Transaction ID", f"0x{xid:08x}"),
+                                     ("Your (client) IP address", CAPTURE_PHONE["ip"]),
+                                     ("Option 53", "DHCP Message Type (ACK)"),
+                                     ("Option 51", "IP Address Lease Time (3600 s)")))
+    if kind == "rtsp":
+        cam = CAPTURE_CAMERA
+        seq = rng.randrange(2, 40)
+        if rng.random() < 0.5:
+            verb = rng.choice(("DESCRIBE", "SETUP", "PLAY", "OPTIONS"))
+            text = (f"{verb} rtsp://{cam['ip']}/stream1 RTSP/1.0\r\nCSeq: {seq}\r\n"
+                    f"User-Agent: TNT mock\r\n\r\n").encode("ascii")
+            return capture_parts(src=CAPTURE_NVR["ip"], dst=cam["ip"], src_mac=CAPTURE_NVR["mac"], dst_mac=cam["mac"],
+                                 proto="RTSP", sport=rng.randrange(49152, 65535), dport=554, length=len(text) + 54,
+                                 layers=("ETH", "IPv4", "TCP", "RTSP"), payload=text,
+                                 info=f"{verb} rtsp://{cam['ip']}/stream1 RTSP/1.0",
+                                 fields=(("Method", verb), ("URL", f"rtsp://{cam['ip']}/stream1"), ("CSeq", str(seq))))
+        text = f"RTSP/1.0 200 OK\r\nCSeq: {seq}\r\nSession: 12345678\r\n\r\n".encode("ascii")
+        return capture_parts(src=cam["ip"], dst=CAPTURE_NVR["ip"], src_mac=cam["mac"], dst_mac=CAPTURE_NVR["mac"],
+                             proto="RTSP", sport=554, dport=rng.randrange(49152, 65535), length=len(text) + 54,
+                             layers=("ETH", "IPv4", "TCP", "RTSP"), payload=text, info="RTSP/1.0 200 OK",
+                             fields=(("Status", "200"), ("Reason", "OK"), ("CSeq", str(seq)), ("Session", "12345678")))
+    if kind == "http":
+        server = rng.choice(CAPTURE_SERVERS)
+        port = rng.randrange(49152, 65535)
+        if rng.random() < 0.5:
+            path = rng.choice(("/", "/index.html", "/api/v1/status", "/images/logo.png"))
+            text = (f"GET {path} HTTP/1.1\r\nHost: {server['name']}\r\nUser-Agent: Mozilla/5.0\r\n"
+                    f"Accept: */*\r\nConnection: keep-alive\r\n\r\n").encode("ascii")
+            return capture_parts(src=pc["ip"], dst=server["ip"], src_mac=pc["mac"], dst_mac=gw["mac"], proto="HTTP",
+                                 sport=port, dport=80, length=len(text) + 54, layers=("ETH", "IPv4", "TCP", "HTTP"),
+                                 payload=text, info=f"GET {path} HTTP/1.1",
+                                 fields=(("Request method", "GET"), ("Request URI", path),
+                                         ("Request version", "HTTP/1.1"), ("Host", server["name"])))
+        text = (b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: 1274\r\n"
+                b"Server: ExampleHTTP/1.4\r\n\r\n")
+        return capture_parts(src=server["ip"], dst=pc["ip"], src_mac=gw["mac"], dst_mac=pc["mac"], proto="HTTP",
+                             sport=80, dport=port, length=len(text) + 54, layers=("ETH", "IPv4", "TCP", "HTTP"),
+                             payload=text, info="HTTP/1.1 200 OK (text/html)",
+                             fields=(("Response version", "HTTP/1.1"), ("Status code", "200"),
+                                     ("Reason phrase", "OK"), ("Content-Type", "text/html; charset=utf-8"),
+                                     ("Content-Length", "1274")))
+    if kind == "tcp":
+        server = rng.choice(CAPTURE_SERVERS)
+        port = rng.choice((22, 3389, 8000, 9100, 445))
+        mine = rng.randrange(49152, 65535)
+        flag, bits, extra = rng.choice((("[SYN]", 0x02, "Seq=0 Win=64240 Len=0"),
+                                        ("[SYN, ACK]", 0x12, "Seq=0 Ack=1 Win=65535 Len=0"),
+                                        ("[ACK]", 0x10, "Seq=1 Ack=1 Win=502 Len=0"),
+                                        ("[PSH, ACK]", 0x18, f"Seq=1 Ack=1 Win=502 Len={rng.randrange(24, 700)}"),
+                                        ("[FIN, ACK]", 0x11, "Seq=734 Ack=1 Win=502 Len=0")))
+        out = flag != "[SYN, ACK]"
+        src, dst = (pc["ip"], server["ip"]) if out else (server["ip"], pc["ip"])
+        sport, dport = (mine, port) if out else (port, mine)
+        return capture_parts(src=src, dst=dst, src_mac=capture_mac_for(src), dst_mac=capture_mac_for(dst),
+                             proto="TCP", sport=sport, dport=dport, length=rng.randrange(60, 120), flags=bits,
+                             layers=("ETH", "IPv4", "TCP"), info=f"{sport} > {dport} {flag} {extra}",
+                             fields=(("Source port", str(sport)), ("Destination port", str(dport)),
+                                     ("Flags", flag), ("Window", "64240")))
+    if kind == "udp":
+        mine, port = rng.randrange(49152, 65535), rng.choice((3478, 5353, 1900, 123))
+        length = rng.randrange(70, 220)
+        return capture_parts(src=pc["ip"], dst="203.0.113.90", src_mac=pc["mac"], dst_mac=gw["mac"], proto="UDP",
+                             sport=mine, dport=port, length=length, layers=("ETH", "IPv4", "UDP"),
+                             info=f"{mine} > {port} Len={length - 42}",
+                             fields=(("Source port", str(mine)), ("Destination port", str(port)),
+                                     ("Length", str(length - 34))))
+    # https: TLS over TCP, every so often over IPv6 so the list is not all v4
+    server = rng.choice(CAPTURE_SERVERS)
+    six = bool(server["ip6"]) and rng.random() < 0.2
+    mine = rng.randrange(49152, 65535)
+    out = rng.random() < 0.55
+    theirs = server["ip6"] if six else server["ip"]
+    mine_ip = pc["ip6"] if six else pc["ip"]
+    src, dst = (mine_ip, theirs) if out else (theirs, mine_ip)
+    sport, dport = (mine, 443) if out else (443, mine)
+    record = rng.choice(("data", "data", "data", "client_hello", "server_hello"))
+    if record == "client_hello":
+        info = f"Client Hello (SNI={server['name']})"
+        fields = (("Content Type", "Handshake (22)"), ("Version", "TLS 1.2 (0x0303)"),
+                  ("Handshake Type", "Client Hello (1)"), ("Server Name", server["name"]))
+        head, length = b"\x16\x03\x01", rng.randrange(280, 560)
+    elif record == "server_hello":
+        info = "Server Hello, Certificate, Server Hello Done"
+        fields = (("Content Type", "Handshake (22)"), ("Version", "TLS 1.2 (0x0303)"),
+                  ("Handshake Type", "Server Hello (2)"), ("Cipher Suite", "TLS_AES_128_GCM_SHA256 (0x1301)"))
+        head, length = b"\x16\x03\x03", rng.randrange(900, 1480)
+    else:
+        info = "Application Data"
+        length = rng.randrange(120, 1480)
+        fields = (("Content Type", "Application Data (23)"), ("Version", "TLS 1.2 (0x0303)"),
+                  ("Length", str(max(1, length - (74 if six else 54)))))
+        head = b"\x17\x03\x03"
+    return capture_parts(src=src, dst=dst, src_mac=capture_mac_for(src), dst_mac=capture_mac_for(dst), proto="TLS",
+                         sport=sport, dport=dport, length=length, payload=head, info=info, fields=fields,
+                         layers=("ETH", "IPv6" if six else "IPv4", "TCP", "TLS"))
+
+
+def capture_sip_call(rng: random.Random) -> Dict[str, Any]:
+    """The scripted call as tnt.sipcalls.CallTracker would answer it (SIP_CALL_KEYS), before any of it has happened."""
+    tag = f"{rng.getrandbits(32):08x}{rng.getrandbits(16):04x}"
+    call_id = f"{tag}@{CAPTURE_PHONE['ip']}"
+    return {"id": f"{tag}-192-0-2-60-{tag[:8]}", "call_id": call_id, "from_uri": CAPTURE_SIP_FROM,
+            "to_uri": CAPTURE_SIP_TO, "state": "calling", "start_ts": 0.0, "answer_ts": None, "end_ts": None,
+            "duration_s": 0.0, "status": None, "messages": [], "streams": [], "note": None}
+
+
+def _sip_message(call: Dict[str, Any], line: str, body: str = "") -> bytes:
+    """One SIP datagram of the scripted call, the headers a phone really sends (RFC 3261) over an optional SDP body."""
+    head = (f"{line}\r\n"
+            f"Via: SIP/2.0/UDP {CAPTURE_PHONE['ip']}:5060;branch=z9hG4bK{call['id'][:16]}\r\n"
+            f"From: \"Reception\" <{CAPTURE_SIP_FROM}>;tag={call['id'][:8]}\r\n"
+            f"To: <{CAPTURE_SIP_TO}>\r\n"
+            f"Call-ID: {call['call_id']}\r\n"
+            f"CSeq: 1 INVITE\r\n"
+            f"Contact: <sip:2001@{CAPTURE_PHONE['ip']}:5060>\r\n"
+            f"User-Agent: ExamplePhone/2.4.1\r\n")
+    if body:
+        head += f"Content-Type: application/sdp\r\nContent-Length: {len(body)}\r\n\r\n{body}"
+    else:
+        head += "Content-Length: 0\r\n\r\n"
+    return head.encode("ascii", "replace")
+
+
+def _sip_sdp(ip: str, port: int) -> str:
+    return (f"v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n"
+            f"m=audio {port} RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=sendrecv\r\n")
+
+
+def _sip_packet(call: Dict[str, Any], from_phone: bool, line: str, info: str, body: str = "") -> Dict[str, Any]:
+    src, dst = (CAPTURE_PHONE, CAPTURE_PBX) if from_phone else (CAPTURE_PBX, CAPTURE_PHONE)
+    payload = _sip_message(call, line, body)
+    head = line.split()
+    request = not line.startswith("SIP/2.0")
+    return capture_parts(src=src["ip"], dst=dst["ip"], src_mac=src["mac"], dst_mac=dst["mac"], proto="SIP",
+                         sport=5060, dport=5060, length=len(payload) + 42, layers=("ETH", "IPv4", "UDP", "SIP"),
+                         payload=payload, info=info,
+                         fields=(("Start line", line), ("Call-ID", call["call_id"]), ("From", CAPTURE_SIP_FROM),
+                                 ("To", CAPTURE_SIP_TO), ("CSeq", "1 INVITE")),
+                         # the MESSAGE row this packet adds to the call (tnt.sipcalls.MESSAGE_KEYS)
+                         sip={"kind": "request" if request else "response",
+                              "method": head[0] if request else None,
+                              "status": None if request else int(head[1]),
+                              "reason": None if request else " ".join(head[2:])})
+
+
+def _rtp_packet(call: Dict[str, Any], from_phone: bool, seq: int, stamp: int, ssrc: int) -> Dict[str, Any]:
+    src, dst = (CAPTURE_PHONE, CAPTURE_PBX) if from_phone else (CAPTURE_PBX, CAPTURE_PHONE)
+    sport, dport = CAPTURE_SIP_RTP_PORTS if from_phone else CAPTURE_SIP_RTP_PORTS[::-1]
+    header = struct.pack("!BBHII", 0x80, 0, seq & 0xFFFF, stamp & 0xFFFFFFFF, ssrc)
+    return capture_parts(src=src["ip"], dst=dst["ip"], src_mac=src["mac"], dst_mac=dst["mac"], proto="RTP",
+                         sport=sport, dport=dport, length=214, layers=("ETH", "IPv4", "UDP", "RTP"), payload=header,
+                         info=f"PT=ITU-T G.711 PCMU, SSRC=0x{ssrc:08x}, Seq={seq}, Time={stamp}",
+                         fields=(("Version", "2"), ("Payload type", "ITU-T G.711 PCMU (0)"), ("Sequence number", str(seq)),
+                                 ("Timestamp", str(stamp)), ("Synchronization Source identifier", f"0x{ssrc:08x}")))
+
+
+def capture_sip_plan(rng: random.Random, call: Dict[str, Any]) -> List[Tuple[float, Dict[str, Any], Optional[str]]]:
+    """Every packet of the scripted call as ``(seconds after the capture began, the packet, the mark it moves the call
+    to)``, oldest first: INVITE, 180 Ringing, 200 OK, ACK, RTP both ways, BYE and its 200 OK."""
+    at = CAPTURE_SIP_AT
+    ssrcs = (rng.getrandbits(32), rng.getrandbits(32))
+    plan: List[Tuple[float, Dict[str, Any], Optional[str]]] = [
+        (at["invite"], _sip_packet(call, True, f"INVITE {CAPTURE_SIP_TO} SIP/2.0", f"Request: INVITE {CAPTURE_SIP_TO}",
+                                   _sip_sdp(CAPTURE_PHONE["ip"], CAPTURE_SIP_RTP_PORTS[0])), "invite"),
+        (at["ringing"], _sip_packet(call, False, "SIP/2.0 180 Ringing", "Status: 180 Ringing"), "ringing"),
+        (at["answer"], _sip_packet(call, False, "SIP/2.0 200 OK", "Status: 200 OK (INVITE)",
+                                   _sip_sdp(CAPTURE_PBX["ip"], CAPTURE_SIP_RTP_PORTS[1])), "answer"),
+        (at["ack"], _sip_packet(call, True, f"ACK {CAPTURE_SIP_TO} SIP/2.0", f"Request: ACK {CAPTURE_SIP_TO}"), None),
+        (at["bye"], _sip_packet(call, True, f"BYE {CAPTURE_SIP_TO} SIP/2.0", f"Request: BYE {CAPTURE_SIP_TO}"), "bye"),
+        (at["byeok"], _sip_packet(call, False, "SIP/2.0 200 OK", "Status: 200 OK (BYE)"), None),
+    ]
+    step = 1.0 / CAPTURE_SIP_RTP_HZ
+    when, seq, stamp = at["ack"] + step, rng.randrange(1000, 40000), rng.randrange(0, 100000)
+    while when < at["bye"]:
+        for which in (True, False):
+            plan.append((when, _rtp_packet(call, which, seq, stamp, ssrcs[0 if which else 1]), "rtp"))
+        seq, stamp, when = seq + 1, stamp + int(8000 * step), when + step
+    plan.sort(key=lambda entry: entry[0])
+    return plan
+
+
+def capture_sip_mark(call: Dict[str, Any], parts: Dict[str, Any], mark: Optional[str], ts: float,
+                     no: Optional[int] = None) -> None:
+    """Move the scripted call on as its next packet is emitted (tnt.sipcalls.CallTracker's state machine): the SIP
+    message is recorded, the RTP is counted into the two streams and the state follows the mark."""
+    sip = parts.get("sip")
+    if sip:
+        call["messages"].append({"ts": ts, "kind": sip["kind"], "method": sip["method"], "status": sip["status"],
+                                 "reason": sip["reason"], "src": parts["src"], "dst": parts["dst"],
+                                 "cseq": 1, "cseq_method": "INVITE", "via_branch": f"z9hG4bK-{no or 0}",
+                                 "contact": CAPTURE_SIP_CONTACT if sip["kind"] == "request" else None,
+                                 "user_agent": CAPTURE_SIP_UA, "has_sdp": bool(sip.get("sdp")),
+                                 "sdp_c": CAPTURE_PHONE["ip"] if sip.get("sdp") else None,
+                                 # the locator a ladder row clicks through on: the packet's own number in this capture
+                                 "where": no, "side": None})
+    if mark == "invite":
+        call["start_ts"] = ts
+    elif mark == "ringing":
+        call["state"] = "ringing"
+    elif mark == "answer":
+        call.update(state="answered", answer_ts=ts, status=200)
+        for index, from_phone in enumerate((True, False)):
+            src, dst = (CAPTURE_PHONE, CAPTURE_PBX) if from_phone else (CAPTURE_PBX, CAPTURE_PHONE)
+            sport, dport = CAPTURE_SIP_RTP_PORTS if from_phone else CAPTURE_SIP_RTP_PORTS[::-1]
+            call["streams"].append({"id": f"{call['id']}-{index}", "src": src["ip"], "sport": sport, "dst": dst["ip"],
+                                    "dport": dport, "ssrc": 0x1A2B3C4D + index, "payload_type": 0,
+                                    "codec": CAPTURE_SIP_CODEC, "packets": 0, "lost": 0, "out_of_order": 0,
+                                    "first_ts": ts, "last_ts": ts, "duration_s": 0.0, "bytes": 0,
+                                    "jitter_ms": 0.0, "decodable": True})
+    elif mark == "rtp":
+        for stream in call["streams"]:
+            stream["packets"] += 1
+            stream["bytes"] += 172
+            stream["last_ts"] = ts
+            stream["duration_s"] = round(max(0.0, ts - stream["first_ts"]), 3)
+    elif mark == "bye":
+        call.update(state="ended", end_ts=ts)
+    start = call["answer_ts"] if call["answer_ts"] is not None else call["start_ts"]
+    call["duration_s"] = round(max(0.0, ts - float(start or ts)), 3)
+
+
+def capture_make_rows(count: int, first_ts: float,
+                      seed: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """*count* invented packets from *first_ts* on, as ``(rows, meta, calls)``: the background mix at its usual rate
+    with the scripted SIP call among it, so a capture read back from a file looks like one taken here."""
+    rng = random.Random(seed)
+    call = capture_sip_call(rng)
+    plan = capture_sip_plan(rng, call)
+    rows: List[Dict[str, Any]] = []
+    meta: List[Dict[str, Any]] = []
+    wanted = max(0, int(count))
+    at, rel, last = 0, 0.0, 0.0
+
+    def add(when: float, parts: Dict[str, Any]) -> float:
+        moment = max(when, last + 0.0002)                 # the list is always in arrival order
+        rows.append({"no": len(rows) + 1, "ts": first_ts + moment, "rel": round(moment, 6), "src": parts["src"],
+                     "dst": parts["dst"], "src_mac": parts["src_mac"], "dst_mac": parts["dst_mac"],
+                     "proto": parts["proto"], "sport": parts["sport"], "dport": parts["dport"],
+                     "length": int(parts["length"]), "info": parts["info"]})
+        meta.append({"layers": tuple(parts["layers"]), "fields": tuple(parts["fields"]), "payload": parts["payload"],
+                     "flags": parts["flags"], "icmp": parts["icmp"]})
+        return moment
+
+    while len(rows) < wanted:
+        rel += 1.0 / rng.uniform(*CAPTURE_RATE_RANGE)
+        while at < len(plan) and plan[at][0] <= rel and len(rows) < wanted:
+            when, parts, mark = plan[at]
+            at += 1
+            last = add(when, parts)
+            capture_sip_mark(call, parts, mark, first_ts + last, len(rows))
+        if len(rows) >= wanted:
+            break
+        last = add(rel, capture_invent(rng))
+    return rows, meta, ([call] if call["start_ts"] else [])
+
+
+# -- packet capture: the bytes behind a row, its detail tree and its hex dump (tnt.dissect) ------------------------
+def _mac_bytes(text: str) -> bytes:
+    raw = bytes.fromhex("".join(c for c in str(text or "") if c in "0123456789abcdefABCDEF")[:12].rjust(12, "0"))
+    return (raw + b"\x00" * 6)[:6]
+
+
+def _ip_bytes(text: str, size: int) -> bytes:
+    try:
+        packed = ipaddress.ip_address(str(text)).packed
+    except ValueError:
+        packed = b"\x00" * size
+    return (packed + b"\x00" * size)[:size]
+
+
+def capture_frame(row: Dict[str, Any], layers: Tuple[str, ...], payload: bytes, flags: int,
+                  icmp: Tuple[int, int, int]) -> bytes:
+    """The bytes behind an invented row: a real Ethernet / IP / transport header stack over *payload*, filled out to
+    the row's length so the hex dump the detail window shows matches what the list says."""
+    dst_mac, src_mac = _mac_bytes(row["dst_mac"]), _mac_bytes(row["src_mac"])
+    want = max(60, min(int(row["length"] or 60), 1514))
+    if "ARP" in layers:
+        op = 1 if str(row["info"]).startswith("Who has") else 2
+        arp = (struct.pack("!HHBBH", 1, 0x0800, 6, 4, op) + src_mac + _ip_bytes(row["src"], 4)
+               + (b"\x00" * 6 if op == 1 else dst_mac) + _ip_bytes(row["dst"], 4))
+        return _capture_fill(dst_mac + src_mac + b"\x08\x06" + arp, want)
+    body = payload
+    if "TCP" in layers:
+        upper = struct.pack("!HHIIBBHHH", int(row["sport"] or 0), int(row["dport"] or 0), 0x0BADC0DE, 0x0BADBEEF,
+                            0x50, flags & 0xFF, 64240, 0, 0)
+        protocol = 6
+    elif "UDP" in layers:
+        upper = struct.pack("!HHHH", int(row["sport"] or 0), int(row["dport"] or 0), 8 + len(body), 0)
+        protocol = 17
+    elif "ICMP" in layers:
+        kind, ident, seq = icmp
+        head = struct.pack("!BBHHH", kind, 0, 0, ident, seq) + body
+        upper, body, protocol = head[:2] + struct.pack("!H", _inet_checksum(head)) + head[4:], b"", 1
+    else:
+        upper, protocol = b"", 59
+    if "IPv6" in layers:
+        head = (struct.pack("!IHBB", 0x60000000, len(upper) + len(body), protocol, 64)
+                + _ip_bytes(row["src"], 16) + _ip_bytes(row["dst"], 16))
+        return _capture_fill(dst_mac + src_mac + b"\x86\xdd" + head + upper + body, want)
+    total = 20 + len(upper) + len(body)
+    head = struct.pack("!BBHHHBBH4s4s", 0x45, 0, total, int(row["no"]) & 0xFFFF, 0x4000, 64, protocol, 0,
+                       _ip_bytes(row["src"], 4), _ip_bytes(row["dst"], 4))
+    head = head[:10] + struct.pack("!H", _inet_checksum(head)) + head[12:]
+    return _capture_fill(dst_mac + src_mac + b"\x08\x00" + head + upper + body, want)
+
+
+def _capture_fill(frame: bytes, want: int) -> bytes:
+    """*frame* padded out to *want* bytes with filler a real payload could hold, or cut to it."""
+    if len(frame) >= want:
+        return frame[:want]
+    filler = bytes((0x30 + ((i * 7 + len(frame)) % 74)) & 0xFF for i in range(want - len(frame)))
+    return frame + filler
+
+
+def capture_time_text(ts: Optional[float]) -> str:
+    """A packet's arrival time as tnt.dissect writes it: "2026-01-01 12:00:00.123456 UTC", else "not recorded"."""
+    if ts is None:
+        return "not recorded"
+    whole = int(ts)
+    micros = min(999_999, int((float(ts) - whole) * 1_000_000))
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(whole)) + f".{micros:06d} UTC"
+
+
+def _layer(name: str, summary: str, start: int, length: int,
+           fields: Tuple[Tuple[str, str], ...]) -> Dict[str, Any]:
+    return {"name": name, "summary": summary, "start": start, "length": length,
+            "fields": [{"name": n, "value": v, "start": start, "length": 0} for n, v in fields]}
+
+
+def capture_detail(row: Dict[str, Any], layers: Tuple[str, ...], fields: Tuple[Tuple[str, str], ...],
+                   frame: bytes) -> List[Dict[str, Any]]:
+    """The detail tree of one invented row (tnt.dissect.detail): outermost first, the Frame pseudo-layer, the link
+    layer, the network layer, the transport layer and the application layer the row's protocol names."""
+    size = len(frame)
+    kind = "ARP (0x0806)" if "ARP" in layers else ("IPv6 (0x86dd)" if "IPv6" in layers else "IPv4 (0x0800)")
+    out = [{"name": "Frame", "summary": f"Frame: {row['length']} bytes on the wire, {size} bytes captured",
+            "start": 0, "length": size,
+            "fields": [{"name": "Arrival time", "value": capture_time_text(row["ts"]), "start": 0, "length": 0},
+                       {"name": "Epoch time", "value": f"{row['ts']}", "start": 0, "length": 0},
+                       {"name": "Captured length", "value": f"{size} bytes", "start": 0, "length": 0},
+                       {"name": "Frame length", "value": f"{row['length']} bytes", "start": 0, "length": 0},
+                       {"name": "Link type", "value": "Ethernet (1)", "start": 0, "length": 0}]},
+           {"name": "ETH", "summary": f"Ethernet II, {row['src_mac']} > {row['dst_mac']}, type {kind}",
+            "start": 0, "length": 14,
+            "fields": [{"name": "Destination", "value": row["dst_mac"], "start": 0, "length": 6},
+                       {"name": "Source", "value": row["src_mac"], "start": 6, "length": 6},
+                       {"name": "Type", "value": kind, "start": 12, "length": 2}]}]
+    at = 14
+    if "ARP" in layers:
+        out.append(_layer("ARP", row["info"], at, 28, fields))
+        return out
+    if "IPv6" in layers:
+        out.append(_layer("IPv6", f"Internet Protocol Version 6, Src: {row['src']}, Dst: {row['dst']}", at, 40,
+                          (("Version", "6"), ("Payload length", str(max(0, size - at - 40))), ("Hop limit", "64"),
+                           ("Source", row["src"]), ("Destination", row["dst"]))))
+        at += 40
+    else:
+        out.append(_layer("IPv4", f"Internet Protocol Version 4, Src: {row['src']}, Dst: {row['dst']}", at, 20,
+                          (("Version", "4"), ("Header length", "20 bytes (5)"),
+                           ("Total length", str(max(0, size - at))), ("Identification", f"0x{row['no'] & 0xFFFF:04x}"),
+                           ("Time to live", "64"), ("Source", row["src"]), ("Destination", row["dst"]))))
+        at += 20
+    app = layers[-1] if layers and layers[-1] not in ("ETH", "IPv4", "IPv6", "TCP", "UDP", "ICMP", "ICMPv6") else ""
+    if "TCP" in layers:
+        out.append(_layer("TCP", f"Transmission Control Protocol, Src Port: {row['sport']}, Dst Port: {row['dport']}",
+                          at, 20, fields if not app else (("Source port", str(row["sport"])),
+                                                          ("Destination port", str(row["dport"])),
+                                                          ("Header length", "20 bytes (5)"), ("Window", "64240"))))
+        at += 20
+    elif "UDP" in layers:
+        out.append(_layer("UDP", f"User Datagram Protocol, Src Port: {row['sport']}, Dst Port: {row['dport']}", at, 8,
+                          fields if not app else (("Source port", str(row["sport"])),
+                                                  ("Destination port", str(row["dport"])),
+                                                  ("Length", str(max(0, size - at))))))
+        at += 8
+    elif "ICMP" in layers:
+        out.append(_layer("ICMP", row["info"], at, 8, fields))
+        return out
+    if app:
+        out.append(_layer(app, row["info"], at, max(0, size - at), fields))
+    return out
+
+
+def capture_hex(data: bytes, width: int = 16) -> List[str]:
+    """Classic offset / hex / ASCII lines, exactly as tnt.dissect.hex_dump writes them."""
+    lines = []
+    for offset in range(0, len(data), width):
+        chunk = data[offset:offset + width]
+        hexed = " ".join(f"{byte:02x}" for byte in chunk).ljust(width * 3 - 1)
+        text = "".join(chr(byte) if 0x20 <= byte <= 0x7E else "." for byte in chunk)
+        lines.append(f"{offset:04x}  {hexed}   {text}")
+    return lines
+
+
+_CAPTURE_WAV: Optional[bytes] = None
+
+
+def capture_call_wav() -> bytes:
+    """A call rebuilt as audio (tnt.sipcalls.build_wav's shape): a quiet two-tone warble, 8 kHz 16-bit mono, built
+    here with struct so the page's player visibly works. Built once and kept."""
+    global _CAPTURE_WAV
+    if _CAPTURE_WAV is not None:
+        return _CAPTURE_WAV
+    rate, low, high = CAPTURE_WAV_RATE, *CAPTURE_WAV_TONES
+    count = int(rate * CAPTURE_WAV_SECONDS)
+    samples = bytearray()
+    for index in range(count):
+        moment = index / rate
+        fade = min(1.0, moment / 0.05, max(0.0, (CAPTURE_WAV_SECONDS - moment) / 0.05))
+        warble = math.sin(2 * math.pi * low * moment) * 0.22 + math.sin(2 * math.pi * high * moment) * 0.14
+        swell = 0.75 + 0.25 * math.sin(2 * math.pi * 1.7 * moment)
+        samples += struct.pack("<h", int(max(-1.0, min(1.0, warble * swell * fade)) * 32767))
+    header = (b"RIFF" + struct.pack("<I", 36 + len(samples)) + b"WAVEfmt "
+              + struct.pack("<IHHIIHH", 16, 1, 1, rate, rate * 2, 2, 16) + b"data" + struct.pack("<I", len(samples)))
+    _CAPTURE_WAV = header + bytes(samples)
+    return _CAPTURE_WAV
 
 
 def _quality_num(value: float) -> str:
@@ -2356,6 +3448,368 @@ def synthetic_report(site: str, created_ts: float, profile: str, network_id: Opt
             "tnt_version": VERSION, "network_id": network_id, "summary": report_summary(data), "data": data}
 
 
+
+# ---------------------------------------------------------------------------
+# Pro AV (tnt.proav / tnt.ptp / tnt.mdns): a synthetic broadcast-audio network
+#
+# One invented room, built so every path the page can draw has something in it: a Dante system whose grandmaster is
+# a GPS-locked Audinate clock one boundary clock away (a UniFi AV switch), a transparent clock writing a correction,
+# six devices heard over mDNS, four of them following the clock, three announced AES67 streams - one of which still
+# names the grandmaster it was set up against, which is the "bad" finding - and a Layer 2 listen that found a
+# querier. The shapes below are tnt.proav's key tuples in order; the mock stays stdlib-only and never imports tnt,
+# so this is written out rather than generated, exactly as the rest of this file is.
+PROAV_SECONDS = (10, 20, 30, 60, 120, 300)
+PROAV_DEFAULT_SECONDS = 30
+#: How long the mock pretends to listen for, whatever was asked (a real 30 s wait would make the page tedious to work on).
+PROAV_FAKE_LISTEN_S = 4.0
+
+PROAV_GM_ID = "00:1D:C1:FF:FE:2A:41:08"
+PROAV_GM_MAC = "00:1D:C1:2A:41:08"
+PROAV_BC_ID = "74:AC:B9:FF:FE:31:0C:6E"
+PROAV_BC_MAC = "74:AC:B9:31:0C:6E"
+PROAV_STALE_GM = "AA:BB:CC:FF:FE:10:20:30"
+
+
+def proav_adapters() -> List[Dict[str, Any]]:
+    """The adapters a scan could listen on (tnt.proav.SCAN_ADAPTER_KEYS)."""
+    return [
+        {"name": "Ethernet", "index": 12, "mac": "9C:6B:00:11:22:33", "ip": "10.113.0.20",
+         "type_name": "Ethernet", "speed_mbps": 1000, "wifi": False, "is_internet": True},
+        {"name": "Wi-Fi", "index": 15, "mac": "9C:6B:00:44:55:66", "ip": "10.113.9.44",
+         "type_name": "Wireless", "speed_mbps": 866, "wifi": True, "is_internet": False},
+    ]
+
+
+def proav_listeners(packets: bool = True) -> List[Dict[str, Any]]:
+    """The four joined groups (tnt.proav.LISTENER_KEYS)."""
+    rows = [("mdns", "Service discovery (mDNS)", "224.0.0.251", 5353, 214),
+            ("sap", "Stream announcements (SAP)", "239.255.255.255", 9875, 9),
+            ("ptp-event", "Clock, event messages (PTP)", "224.0.1.129", 319, 486),
+            ("ptp-general", "Clock, announcements (PTP)", "224.0.1.129", 320, 173)]
+    return [{"key": k, "label": label, "group": g, "port": p, "ok": True, "reason": None,
+             "packets": n if packets else 0} for k, label, g, p, n in rows]
+
+
+def _proav_master(ts: float) -> Dict[str, Any]:
+    return {"identity": PROAV_GM_ID, "mac": PROAV_GM_MAC, "vendor": "Audinate Pty L", "ip": None,
+            "priority1": 128, "priority2": 128, "clock_class": 6,
+            "clock_class_text": "locked to a primary reference (GPS or equivalent)", "accuracy": 33,
+            "accuracy_text": "100 ns", "variance": 16640, "steps_removed": 1, "time_source": 32,
+            "time_source_text": "GPS", "utc_offset": 37, "leap61": False, "leap59": False,
+            "time_traceable": True, "frequency_traceable": True, "locked": True, "two_step": True,
+            "parent": PROAV_BC_ID, "parent_mac": PROAV_BC_MAC, "parent_vendor": "Ubiquiti Inc",
+            "announce_s": 2.0, "count": 86, "first_ts": ts - 30, "last_ts": ts}
+
+
+def _proav_follower(identity: str, mac: str, vendor: str, ip: str, asking: bool, ts: float) -> Dict[str, Any]:
+    return {"identity": identity, "mac": mac, "vendor": vendor, "ip": ip, "asking": asking,
+            "count": 58 if asking else 12, "first_ts": ts - 29, "last_ts": ts}
+
+
+def proav_clock(ts: float) -> Dict[str, Any]:
+    """The clock view (tnt.ptp.CLOCK_KEYS / DOMAIN_KEYS): one PTPv2 domain, one grandmaster, a boundary clock."""
+    master = _proav_master(ts)
+    followers = [
+        _proav_follower("00:1D:C1:FF:FE:2A:41:5C", "00:1D:C1:2A:41:5C", "Audinate Pty L", "10.113.0.31", True, ts),
+        _proav_follower("00:1D:C1:FF:FE:2A:42:11", "00:1D:C1:2A:42:11", "Audinate Pty L", "10.113.0.32", True, ts),
+        _proav_follower("00:0F:D4:FF:FE:08:1A:90", "00:0F:D4:08:1A:90", "Soundcraft", "10.113.0.35", True, ts),
+        _proav_follower("00:50:C2:FF:FE:AB:03:71", "00:50:C2:AB:03:71", "Attero Tech", "10.113.0.37", False, ts),
+    ]
+    domain = {
+        "version": 2, "domain": 0, "label": "domain 0", "master": master, "masters": [master],
+        "senders": [{"identity": PROAV_BC_ID, "mac": PROAV_BC_MAC, "vendor": "Ubiquiti Inc", "ip": "10.113.0.2",
+                     "role": "boundary", "count": 259, "first_ts": ts - 30, "last_ts": ts}],
+        "followers": followers, "messages": 659, "announce_s": 2.0, "sync_s": 0.125,
+        "sync_jitter_ms": 0.41, "correction_ns": 738.2, "transparent": True, "changes": 0,
+        "first_ts": ts - 30, "last_ts": ts,
+    }
+    return {"heard": True, "messages": 659, "dropped": 0, "versions": [2], "domains": [domain], "best": domain,
+            "transparent": True, "first_ts": ts - 30, "last_ts": ts}
+
+
+def _proav_stream(name: str, group: str, port: int, origin: str, channels: int, refclk: str, ts: float,
+                  info: Optional[str] = None, ptime: float = 1.0, deleted: bool = False) -> Dict[str, Any]:
+    packet_bytes = int(48000 * (ptime / 1000.0)) * channels * 3
+    bitrate = round((1000.0 / ptime) * (packet_bytes + 78) * 8 / 1_000_000.0, 3)
+    return {"id": f"{group}:{port}", "name": name, "info": info, "group": group, "port": port,
+            "source": origin, "origin": origin, "family": "aes67", "codec": "L24", "rate": 48000,
+            "channels": channels, "depth": 24, "ptime_ms": ptime, "packet_bytes": packet_bytes,
+            "bitrate_mbps": bitrate, "refclk": refclk, "refclk_domain": 0, "refclk_kind": "IEEE1588-2008",
+            "mediaclk": "direct=0", "direction": "sendonly", "scope": 32, "count": 3,
+            "first_ts": ts - 28, "last_ts": ts, "deleted": deleted}
+
+
+def proav_streams(ts: float) -> List[Dict[str, Any]]:
+    return [
+        _proav_stream("FOH Mix : Main LR", "239.69.4.12", 5004, "10.113.0.31", 2, PROAV_GM_ID, ts,
+                      info="Front of house, main bus"),
+        _proav_stream("Stage Box A : Inputs 1-16", "239.69.4.20", 5004, "10.113.0.35", 16, PROAV_GM_ID, ts),
+        _proav_stream("Broadcast Feed 1-8", "239.69.4.31", 5004, "10.113.0.37", 8, PROAV_STALE_GM, ts,
+                      info="Set up against a grandmaster that is no longer here"),
+    ]
+
+
+def _proav_service(service_type: str, label: str, instance: str, host: str, port: int,
+                   txt: Dict[str, str]) -> Dict[str, Any]:
+    return {"type": service_type, "label": label, "instance": instance, "host": host, "port": port, "txt": txt}
+
+
+def _proav_device(ident: str, name: str, ip: Optional[str], mac: Optional[str], vendor: Optional[str],
+                  kind: Optional[str], family: str, family_text: str, ts: float, *, model: Optional[str] = None,
+                  firmware: Optional[str] = None, hostname: Optional[str] = None,
+                  services: Optional[List[Dict[str, Any]]] = None, roles: Optional[List[str]] = None,
+                  clock_role: Optional[str] = None, clock_identity: Optional[str] = None,
+                  streams_out: int = 0, sources: Optional[List[str]] = None) -> Dict[str, Any]:
+    return {"id": ident, "name": name, "ip": ip, "ips": [ip] if ip else [], "mac": mac, "vendor": vendor,
+            "vendor_kind": kind, "family": family, "family_text": family_text, "model": model,
+            "firmware": firmware, "hostname": hostname, "services": services or [], "roles": roles or [],
+            "clock_role": clock_role, "clock_identity": clock_identity, "streams_out": streams_out,
+            "sources": sources or ["mdns"], "first_ts": ts - 29, "last_ts": ts}
+
+
+def proav_devices(ts: float) -> List[Dict[str, Any]]:
+    dante = lambda n: _proav_service("_netaudio-arc._udp.local", "Dante control", n, n.lower().replace(" ", "-") + ".local", 8000,
+                                     {"mf": "Audinate", "arcp_vers": "2.9.0"})
+    return [
+        _proav_device("mac:00:1D:C1:2A:41:08", "Clock Master", None, PROAV_GM_MAC, "Audinate Pty L", "av",
+                      "dante", "Dante", ts, model="PTP-GM", roles=["PTP grandmaster"], clock_role="grandmaster",
+                      clock_identity=PROAV_GM_ID, sources=["ptp"]),
+        _proav_device("mac:00:1D:C1:2A:41:5C", "FOH Console", "10.113.0.31", "00:1D:C1:2A:41:5C",
+                      "Audinate Pty L", "av", "dante", "Dante", ts, model="DEV-64", firmware="4.2.1.3",
+                      hostname="foh-console.local", services=[dante("FOH Console")],
+                      roles=["Dante control", "PTP follower", "Stream source"], clock_role="follower",
+                      clock_identity="00:1D:C1:FF:FE:2A:41:5C", streams_out=1, sources=["mdns", "ptp", "sap"]),
+        _proav_device("mac:00:1D:C1:2A:42:11", "Amp Rack 1", "10.113.0.32", "00:1D:C1:2A:42:11",
+                      "Audinate Pty L", "av", "dante", "Dante", ts, model="DEV-8", firmware="4.2.1.3",
+                      hostname="amp-rack-1.local", services=[dante("Amp Rack 1")],
+                      roles=["Dante control", "PTP follower"], clock_role="follower",
+                      clock_identity="00:1D:C1:FF:FE:2A:42:11", sources=["mdns", "ptp"]),
+        _proav_device("mac:00:0F:D4:08:1A:90", "Stage Box A", "10.113.0.35", "00:0F:D4:08:1A:90", "Soundcraft",
+                      "av", "dante", "Dante", ts, model="SB-16", firmware="2.7.0", hostname="stage-box-a.local",
+                      services=[dante("Stage Box A")], roles=["Dante control", "PTP follower", "Stream source"],
+                      clock_role="follower", clock_identity="00:0F:D4:FF:FE:08:1A:90", streams_out=1,
+                      sources=["mdns", "ptp", "sap"]),
+        _proav_device("mac:00:50:C2:AB:03:71", "Broadcast Bridge", "10.113.0.37", "00:50:C2:AB:03:71",
+                      "Attero Tech", "av", "aes67", "AES67", ts, model="unD6IO-BT", firmware="1.9.4",
+                      hostname="bcast-bridge.local",
+                      services=[_proav_service("_ravenna._tcp.local", "Ravenna", "Broadcast Bridge",
+                                               "bcast-bridge.local", 9090, {"model": "unD6IO-BT"})],
+                      roles=["Ravenna", "PTP follower", "Stream source"], clock_role="follower",
+                      clock_identity="00:50:C2:FF:FE:AB:03:71", streams_out=1, sources=["mdns", "ptp", "sap"]),
+        _proav_device("mac:74:AC:B9:31:0C:6E", "Ubiquiti Inc 31:0C:6E", "10.113.0.2", PROAV_BC_MAC,
+                      "Ubiquiti Inc", "network", "other", "Other", ts, roles=["PTP boundary clock"],
+                      clock_role="boundary", clock_identity=PROAV_BC_ID, sources=["ptp"]),
+        _proav_device("mac:B0:7D:64:19:E2:04", "Show Control PC", "10.113.0.50", "B0:7D:64:19:E2:04",
+                      "Intel Corporate", None, "other", "Other", ts, hostname="show-pc.local",
+                      services=[_proav_service("_workstation._tcp.local", "Workstation", "Show Control PC",
+                                               "show-pc.local", 9, {})]),
+    ]
+
+
+def _proav_finding(ident: str, level: str, title: str, detail: Optional[str], advice: Optional[str],
+                   evidence: Any = None) -> Dict[str, Any]:
+    return {"id": ident, "level": level, "title": title, "detail": detail, "advice": advice, "evidence": evidence}
+
+
+def proav_findings() -> List[Dict[str, Any]]:
+    """Worst first, as tnt.proav.build_findings sorts them."""
+    return [
+        _proav_finding(
+            "stream.refclk", "bad", "1 stream(s) expect a grandmaster that is not the one on this network",
+            "Each of these names a reference clock in its SDP that no announcement here matches. A receiver that "
+            "trusts the SDP will not lock, or will lock to the wrong tree.",
+            "Re-announce the streams from a device that is on the current grandmaster, or find out why the "
+            "grandmaster changed after the streams were set up.",
+            [{"name": "Broadcast Feed 1-8", "group": "239.69.4.31", "refclk": PROAV_STALE_GM,
+              "expected": [PROAV_GM_ID, PROAV_GM_MAC]}]),
+        _proav_finding(
+            "clock.jitter", "warn", "Sync messages arrive unevenly",
+            "Sync arrives every 0.125 s on average, varying by up to 0.41 ms.",
+            "Worth watching. If it grows, look at QoS on the path: clock packets should be in the highest "
+            "priority queue."),
+        _proav_finding(
+            "net.flood", "warn", "2 multicast group(s) are reaching this port unasked",
+            "Traffic arrived for groups this PC never joined, 18.42 Mb/s in total, including 1 carrying media "
+            "rates. Either IGMP snooping is off on this switch, or this port is being treated as a multicast "
+            "router port.",
+            "On an AV network this wastes the port's bandwidth and can swamp a slow device. Turn snooping on for "
+            "this VLAN.",
+            [{"group": "239.69.4.20", "port": 5004, "source": "10.113.0.35", "packets": 4013, "bytes": 4941999,
+              "mbps": 18.31},
+             {"group": "239.192.0.11", "port": 5004, "source": "10.113.0.37", "packets": 41, "bytes": 30012,
+              "mbps": 0.11}]),
+        _proav_finding(
+            "clock.boundary", "info", "1 boundary clock(s) sit between this PC and the grandmaster",
+            "The announcement arrived with stepsRemoved 1, re-served by Ubiquiti Inc. A switch acting as a PTP "
+            "boundary clock terminates the domain and serves it again, which is what an AV switch's PTP support "
+            "does.",
+            "Nothing to do: this is what a boundary clock looks like from a follower. It is worth knowing because "
+            "it means the switch, not the grandmaster, is what this PC is timing against."),
+        _proav_finding(
+            "clock.transparent", "info", "A transparent clock is in the path",
+            "Sync messages arrive with a correction field of up to 738.2 ns, which only a switch that timestamps "
+            "packets in transit can write.",
+            "Nothing to do: this is a switch correcting for its own delay, which is what you want on an AV "
+            "network. It is proof the switch's PTP support is doing something."),
+        _proav_finding(
+            "clock.followers", "info", "4 device(s) are following this clock",
+            "3 of them are having their delay requests answered by the grandmaster, which is what a device that is "
+            "really in the clock tree looks like. The other 1 were heard asking but no reply to them was seen.",
+            None,
+            [{"identity": "00:1D:C1:FF:FE:2A:41:5C", "vendor": "Audinate Pty L", "ip": "10.113.0.31", "asking": True},
+             {"identity": "00:50:C2:FF:FE:AB:03:71", "vendor": "Attero Tech", "ip": "10.113.0.37", "asking": False}]),
+        _proav_finding(
+            "device.mixed", "info", "2 AV ecosystems share this network",
+            "Dante (4), AES67 (1). That is common and usually fine, but they only pass audio to each other through "
+            "a gateway or through AES67.", None),
+        _proav_finding(
+            "net.switch", "info", "This PC is on core-av-sw-01",
+            "UniFi Enterprise Audio/Video XG 24 PoE, port Port 14, untagged VLAN 120, 1000BASE-T full, 7.4 W of "
+            "PoE allocated", None,
+            {"switch_name": "core-av-sw-01", "port_id": "Port 14", "vlan": 120}),
+        _proav_finding(
+            "device.found", "good", "6 AV device(s) found",
+            "Dante x4, AES67 x1. 7 device(s) answered in total.", None),
+        _proav_finding(
+            "clock.locked", "good", "The grandmaster is locked to GPS",
+            "Audinate Pty L (00:1D:C1:2A:41:08) - clock class 6 (locked to a primary reference (GPS or "
+            "equivalent)), accuracy 100 ns.", None),
+        _proav_finding(
+            "stream.found", "good", "3 stream(s) are being announced",
+            "Together they are 31.82 Mb/s on the wire, 3.2 % of this 1000 Mb/s link. Channel counts, sample rates "
+            "and packet times are in the table.", None,
+            [{"name": "FOH Mix : Main LR", "group": "239.69.4.12", "port": 5004, "bitrate_mbps": 2.928},
+             {"name": "Stage Box A : Inputs 1-16", "group": "239.69.4.20", "port": 5004, "bitrate_mbps": 19.056}]),
+        _proav_finding(
+            "net.querier", "good", "An IGMP querier is on this VLAN",
+            "General queries arrive from 10.113.0.1 every 125.0 s. That is what keeps IGMP snooping tables alive, "
+            "and what multicast audio needs.", None),
+        _proav_finding(
+            "net.dscp", "good", "AV traffic arrives correctly marked",
+            "Clock packets arrive with DSCP 56, audio with DSCP 46.", None),
+    ]
+
+
+def _proav_node(ident: str, kind: str, label: str, sub: Optional[str] = None, family: Optional[str] = None,
+                level: Optional[str] = None, detail: Optional[str] = None) -> Dict[str, Any]:
+    return {"id": ident, "kind": kind, "label": label, "sub": sub, "family": family, "level": level,
+            "detail": detail}
+
+
+def _proav_edge(source: str, target: str, kind: str, label: Optional[str] = None) -> Dict[str, Any]:
+    return {"source": source, "target": target, "kind": kind, "label": label}
+
+
+def proav_graph() -> Dict[str, Any]:
+    """The two graphs the page draws (tnt.proav.build_graph): the clock tree, and the stream flow map."""
+    clock_nodes = [
+        _proav_node("d0:gm", "grandmaster", "Clock Master", "Grandmaster - GPS", "dante", "good",
+                    "PTPv2 domain 0, clock class 6, priority1 128"),
+        _proav_node("d0:bc", "boundary", "Ubiquiti Inc 31:0C:6E", "10.113.0.2", None, None,
+                    "This switch terminated the domain and served it again; it is what this PC times against."),
+        _proav_node("d0:tc", "transparent", "Transparent clock", "correction up to 738.2 ns", None, None,
+                    "A switch timestamped these packets in transit."),
+        _proav_node("d0:f:1", "follower", "FOH Console", "10.113.0.31", "dante", None,
+                    "Its delay requests are being answered"),
+        _proav_node("d0:f:2", "follower", "Amp Rack 1", "10.113.0.32", "dante", None,
+                    "Its delay requests are being answered"),
+        _proav_node("d0:f:3", "follower", "Stage Box A", "10.113.0.35", "dante", None,
+                    "Its delay requests are being answered"),
+        _proav_node("d0:f:4", "follower", "Broadcast Bridge", "10.113.0.37", "aes67", "warn",
+                    "Heard asking, but no reply to it was seen"),
+        _proav_node("d0:self", "self", "Ethernet", "Listening here"),
+    ]
+    clock_edges = [_proav_edge("d0:gm", "d0:bc", "clock", "1 step(s)"), _proav_edge("d0:bc", "d0:tc", "clock")]
+    clock_edges += [_proav_edge("d0:tc", n, "clock") for n in ("d0:f:1", "d0:f:2", "d0:f:3", "d0:f:4", "d0:self")]
+    flow_nodes = [
+        _proav_node("t:10.113.0.31", "talker", "FOH Console", "10.113.0.31", "dante", None, "Audinate Pty L"),
+        _proav_node("s:239.69.4.12:5004", "stream", "FOH Mix : Main LR", "239.69.4.12:5004", "aes67", None,
+                    "L24, 48 kHz, 2 ch, 1.0 ms, 2.928 Mb/s"),
+        _proav_node("t:10.113.0.35", "talker", "Stage Box A", "10.113.0.35", "dante", None, "Soundcraft"),
+        _proav_node("s:239.69.4.20:5004", "stream", "Stage Box A : Inputs 1-16", "239.69.4.20:5004", "aes67", None,
+                    "L24, 48 kHz, 16 ch, 1.0 ms, 19.056 Mb/s"),
+        _proav_node("t:10.113.0.37", "talker", "Broadcast Bridge", "10.113.0.37", "aes67", None, "Attero Tech"),
+        _proav_node("s:239.69.4.31:5004", "stream", "Broadcast Feed 1-8", "239.69.4.31:5004", "aes67", None,
+                    "L24, 48 kHz, 8 ch, 1.0 ms, 9.84 Mb/s"),
+        _proav_node("l:10.113.0.32", "listener", "Amp Rack 1", "10.113.0.32", "dante", None,
+                    "Heard joining this group"),
+        _proav_node("l:10.113.0.37", "listener", "Broadcast Bridge", "10.113.0.37", "aes67", None,
+                    "Heard joining this group"),
+    ]
+    flow_edges = [
+        _proav_edge("t:10.113.0.31", "s:239.69.4.12:5004", "flow", "2.93 Mb/s"),
+        _proav_edge("t:10.113.0.35", "s:239.69.4.20:5004", "flow", "19.06 Mb/s"),
+        _proav_edge("t:10.113.0.37", "s:239.69.4.31:5004", "flow", "9.84 Mb/s"),
+        _proav_edge("s:239.69.4.12:5004", "l:10.113.0.32", "flow"),
+        _proav_edge("s:239.69.4.12:5004", "l:10.113.0.37", "flow"),
+        _proav_edge("s:239.69.4.20:5004", "l:10.113.0.32", "flow"),
+    ]
+    return {
+        "clock": {"nodes": clock_nodes, "edges": clock_edges,
+                  "note": "The clock tree is measured, not guessed: every line is something this PC heard. A switch "
+                          "appears only when it announced itself as a boundary clock."},
+        "flow": {"nodes": flow_nodes, "edges": flow_edges,
+                 "note": "Talkers and streams come from the SAP announcements. Which devices are listening cannot "
+                         "be seen from one port without reading the switch's IGMP snooping table, so receivers are "
+                         "only shown where one was heard joining the group."},
+    }
+
+
+def proav_l2(ts: float) -> Dict[str, Any]:
+    """The Layer 2 listen's result (tnt.proav.L2_KEYS)."""
+    return {
+        "ok": True, "reason": None, "frames": 48213, "lost": 0, "igmp_seen": 37,
+        "querier": {"ip": "10.113.0.1", "interval_s": 125.0, "queries": 2},
+        "memberships": [{"ip": "10.113.0.32", "group": "239.69.4.12", "reports": 2, "last_ts": ts},
+                        {"ip": "10.113.0.32", "group": "239.69.4.20", "reports": 2, "last_ts": ts},
+                        {"ip": "10.113.0.37", "group": "239.69.4.12", "reports": 1, "last_ts": ts}],
+        "flooded": [{"group": "239.69.4.20", "port": 5004, "source": "10.113.0.35", "packets": 4013,
+                     "bytes": 4941999, "mbps": 18.31, "first_ts": ts - 28, "last_ts": ts},
+                    {"group": "239.192.0.11", "port": 5004, "source": "10.113.0.37", "packets": 41,
+                     "bytes": 30012, "mbps": 0.11, "first_ts": ts - 27, "last_ts": ts}],
+        "dscp": {"ptp": 56, "audio": 46},
+    }
+
+
+def proav_switch() -> Dict[str, Any]:
+    """The LLDP neighbour of the switch-port lookup (tnt.lldp.NEIGHBOR_KEYS).  A fact about this port, not about
+    the Layer 2 listen, so a scan reports it either way."""
+    return {"protocol": "LLDP", "switch_name": "core-av-sw-01",
+            "switch_description": "UniFi Enterprise Audio/Video XG 24 PoE", "vendor": "Ubiquiti Inc",
+            "chassis_id": PROAV_BC_MAC, "port_id": "Port 14", "port_description": "FOH rack",
+            "vlan": 120, "voice_vlan": None, "management_ips": ["10.113.0.2"],
+            "capabilities": ["bridge", "router"], "poe": {"class": 3, "allocated_w": 7.4},
+            "link": {"autoneg": True, "mau": 30, "text": "1000BASE-T full"}, "ttl_s": 120}
+
+
+def proav_result(ts: float, seconds: int, adapter: Dict[str, Any], deep: bool,
+                 cancelled: bool = False) -> Dict[str, Any]:
+    """A whole scan result (tnt.proav.RESULT_KEYS)."""
+    clock = proav_clock(ts)
+    streams = proav_streams(ts)
+    devices = proav_devices(ts)
+    # only the Layer 2 checks depend on `deep`; the switch note is LLDP and is reported either way
+    l2_only = ("net.querier", "net.flood", "net.dscp", "net.lost")
+    findings = [f for f in proav_findings() if deep or f["id"] not in l2_only]
+    if not deep:
+        findings.append(_proav_finding(
+            "net.l2", "info", "Multicast hygiene was not checked",
+            "The Layer 2 listen was not run, so this scan cannot say whether there is an IGMP querier, whether "
+            "groups are being flooded to this port, or how the traffic is marked.",
+            "Run the scan with the Layer 2 listen turned on (it needs Windows administrator rights) to add those "
+            "three checks."))
+    return {
+        "ts": ts, "seconds": seconds, "adapter": dict(adapter), "link_mbps": adapter.get("speed_mbps"),
+        "counts": {"mdns": 214, "sap": 3, "ptp": 659, "frames": 48213 if deep else 0,
+                   "devices": len(devices), "streams": len(streams)},
+        "listeners": proav_listeners(), "clock": clock, "streams": streams,
+        "services": [dict(s, ips=[d["ip"]] if d["ip"] else [], ts=ts)
+                     for d in devices for s in d["services"]],
+        "devices": devices, "findings": findings, "graph": proav_graph(),
+        "l2": proav_l2(ts) if deep else None, "switch": proav_switch(), "cancelled": cancelled,
+    }
+
+
 # ---------------------------------------------------------------------------
 # state
 # ---------------------------------------------------------------------------
@@ -2480,14 +3934,33 @@ class MockState:
         self.tftp_next_id = 1
         self.tftp_gen = 0                                    # bumps on every start and stop so a stale transfer exits
         self.tftp_fast = False                               # tests: the phone asks within a few ms
-        self.capture_s: Optional[float] = None               # tests: how long a capture runs (None: the seconds it was started with)
-        self.capture_job: Optional[Dict[str, Any]] = None
+        # Pro AV: the running listen and the last result (tnt.proav.ProAvScanner)
+        self.proav_reason: Optional[str] = None              # tests: a text makes Pro AV scanning unavailable here
+        self.proav_job: Dict[str, Any] = self.proav_idle_job()
+        self.proav_result: Optional[Dict[str, Any]] = None
+        self.proav_last_run_ts: Optional[float] = None
+        self.proav_gen = 0                                   # bumps on every start so a stale worker exits
+        self.proav_stop_evt = threading.Event()              # Stop: end the listen and keep what it heard
+        # Packet capture: the open session, its packet list and the SIP calls found in it (tnt.capture.CaptureManager)
+        self.capture_s: Optional[float] = None               # tests: how long a capture runs (None: its max_seconds)
+        self.capture_reason: Optional[str] = None            # tests: a text makes capturing unavailable here
+        self.capture_session: Optional[Dict[str, Any]] = None
         self.capture_next_id = 1
-        self.capture_gen = 0
-        self.capture_stop_evt = threading.Event()             # stop and keep the running capture
+        self.capture_gen = 0                                 # bumps on every start, open and discard so a stale worker exits
+        self.capture_stop_evt = threading.Event()            # stop the running capture and keep what it caught
+        self.capture_rows: List[Dict[str, Any]] = []         # the packet list (ROW dicts), at most CAPTURE_MAX_ROWS
+        self.capture_meta: List[Dict[str, Any]] = []         # each row's layers, detail fields and payload, in lockstep
+        self.capture_first_no = 1                            # the "no" of capture_rows[0]
+        self.capture_total = 0                               # every packet of this capture, held or not
+        self.capture_truncated = False
+        self.capture_dropped = 0
+        self.capture_bytes = 0
+        self.capture_first_ts: Optional[float] = None
+        self.capture_started_mono = 0.0
+        self.capture_calls_found: List[Dict[str, Any]] = []   # the SIP calls of the open capture, newest first
         seed_ts = time.mktime((2026, 1, 1, 12, 0, 0, 0, 0, -1))
-        self.capture_files: List[Dict[str, Any]] = [{"name": CAPTURE_SEED_FILE, "size": len(tiny_pcapng(seed_ts)), "created_ts": seed_ts,
-                                                     "packets": 1}]
+        self.capture_files: List[Dict[str, Any]] = [{"name": CAPTURE_SEED_FILE, "size": CAPTURE_SEED_BYTES,
+                                                     "created_ts": seed_ts, "packets": CAPTURE_SEED_PACKETS}]
         # IP location (tnt.geoip): the fake manager's state (POST /mock/geoip), the text it shows in "error" and its data month
         self.geoip_state = "ready"
         self.geoip_error = "HTTP 503 from download.db-ip.com"
@@ -2496,8 +3969,18 @@ class MockState:
         self.update_state = "available"
         self.update_error = "HTTP 403 from api.github.com: the rate limit may be reached"
         self.public_ip_ts = time.time() - 4 * 60
+        # SIP (tnt.sipqual, tnt.sipalg, tnt.sipnat, tnt.sipflow): what the fake network does to SIP and to a NAT
+        # mapping (POST /mock/sip picks another), the last result of each check and the capture slots that are loaded
+        self.sip_alg_state = "alg"
+        self.sip_nat_state = "address-dependent"
+        self.sip_alg_last: Optional[Dict[str, Any]] = None
+        self.sip_stun_last: Optional[Dict[str, Any]] = None
+        self.sip_flow_slots: set = set()
         # the network this fake PC is on (NET_PROFILE_NAMES) and the change counter status.net reports
         self.net_profile = "a"
+        # realtime throughput (Network info): cumulative counters per adapter index, and the samples
+        self.tp_totals: Dict[int, Dict[str, int]] = {}
+        self.tp_samples: Dict[int, List[List[int]]] = {}
         self.net_generation = 0
         self.net_changed_ts: Optional[float] = None
         self.net_public_before: Optional[Dict[str, Any]] = None   # the WAN answer shown until the lookup after a change lands
@@ -2599,7 +4082,7 @@ class MockState:
     def _add_target(self, host: str, label: Optional[str], kind: str, ip: Optional[str], base: float) -> Dict[str, Any]:
         tid = self.next_id
         self.next_id += 1
-        t = {"id": tid, "host": host, "label": label, "kind": kind, "ip": ip, "enabled": True,
+        t = {"id": tid, "host": host, "label": label, "name": None, "kind": kind, "ip": ip, "enabled": True,
              "resolved": ip is not None, "resolve_error": None if ip else "getaddrinfo failed",
              "in_outage": False, "since_ts": time.time(), "base": base, "consecutive_missed": 0,
              "consecutive_ok": 0}
@@ -2766,7 +4249,7 @@ class MockState:
                "loss_pct": round(100.0 * lost / sent, 2) if sent else 0.0,
                "avg_ms": round(t["base"] * 1.03, 2), "min_ms": round(t["base"] * 0.7, 2),
                "max_ms": round(t["base"] * 9.1 + 40, 2)}
-        return {"id": t["id"], "host": t["host"], "label": t["label"], "kind": t["kind"], "ip": t["ip"],
+        return {"id": t["id"], "host": t["host"], "label": t["label"], "name": t.get("name"), "kind": t["kind"], "ip": t["ip"],
                 "enabled": t["enabled"], "resolved": t["resolved"], "resolve_error": t["resolve_error"],
                 "light": self._light(t), "in_outage": t["in_outage"],
                 "last": {"ts": last[0], "ok": last[1], "rtt_ms": last[2]} if last else None,
@@ -2792,6 +4275,19 @@ class MockState:
             else:
                 ip = host if is_ip else "%d.%d.%d.%d" % tuple(self.rng.randint(1, 250) for _ in range(4))
                 t = self._add_target(host, label, kind, ip, 1.0 if kind == "local" else 25.0 + self.rng.random() * 40)
+            view = self.target_view(t)
+            all_views = [self.target_view(x) for x in self.targets]
+        self.hub.publish("ping.targets", {"targets": all_views})
+        return view
+
+    def set_target_name(self, tid: int, name: Optional[str]) -> Optional[Dict[str, Any]]:
+        """PATCH /api/targets/{id}: set or clear a target's custom name; None when it does not exist."""
+        clean = (str(name).strip()[:80] if name is not None else "") or None
+        with self.lock:
+            t = next((x for x in self.targets if x["id"] == tid), None)
+            if t is None:
+                return None
+            t["name"] = clean
             view = self.target_view(t)
             all_views = [self.target_view(x) for x in self.targets]
         self.hub.publish("ping.targets", {"targets": all_views})
@@ -4021,11 +5517,10 @@ class MockState:
                 for a in prof["adapters"] if a["if_type"] == 6 and a["is_physical"] and a["status"] == "up"]
 
     def _pktmon_holder(self) -> Optional[str]:
-        """Who holds Packet Monitor (tnt.pktmon.LOCK): "switchport" while a search listens, "capture" while a capture runs."""
+        """Who holds Packet Monitor (tnt.pktmon.LOCK): "switchport" while a search listens. A packet capture runs its
+        own ETW session and never takes it, so the two can run together."""
         if self.switch_job is not None and self.switch_job["state"] == "listening":
             return "switchport"
-        if self.capture_job is not None and self.capture_job["state"] in CAPTURE_RUNNING_STATES:
-            return "capture"
         return None
 
     def _switch_job_locked(self) -> Dict[str, Any]:
@@ -4373,9 +5868,9 @@ class MockState:
         except Exception:  # noqa: BLE001
             log.exception("tftp worker failed")
 
-    # -- Tools: packet capture (tnt.capture) -----------------------------
+    # -- Packet capture (tnt.capture): the live analyser of the Packet capture page ----------
     def capture_adapters(self) -> List[Dict[str, Any]]:
-        """The adapters a capture can run on (CaptureManager.adapters): up and physical."""
+        """The adapters a capture can run on (CaptureManager.adapters): up, not loopback, physical."""
         with self.lock:
             prof = net_profile(self.net_profile)
         return [{"name": a["name"], "index": a["index"], "mac": a["mac"], "type_name": a["type_name"], "wifi": a["if_type"] == 71}
@@ -4384,92 +5879,511 @@ class MockState:
     def _capture_files_locked(self) -> List[Dict[str, Any]]:
         return sorted(copy.deepcopy(self.capture_files), key=lambda f: (f["created_ts"], f["name"]), reverse=True)
 
+    @staticmethod
+    def capture_limits() -> Dict[str, Any]:
+        """The choices the page's Start controls offer (CaptureManager.limits)."""
+        return {"max_rows": CAPTURE_MAX_ROWS, "max_packets": CAPTURE_MAX_PACKETS, "seconds": list(CAPTURE_SECONDS),
+                "sizes_mb": list(CAPTURE_SIZES_MB), "default_seconds": CAPTURE_DEFAULT_SECONDS,
+                "default_mb": CAPTURE_DEFAULT_MB}
+
+    def _capture_session_locked(self) -> Optional[Dict[str, Any]]:
+        """The open SESSION as a copy, None when nothing is open; the counts are read off the list as they are asked
+        for, and a running capture's time and size keep moving (CaptureManager.session)."""
+        if self.capture_session is None:
+            return None
+        out = copy.deepcopy(self.capture_session)
+        out["packets"] = self.capture_total
+        out["shown"] = len(self.capture_rows)
+        out["truncated"] = self.capture_truncated
+        out["dropped"] = self.capture_dropped
+        out["calls"] = len(self.capture_calls_found)
+        if out["state"] == "capturing":
+            out["elapsed_s"] = round(max(0.0, time.monotonic() - self.capture_started_mono), 1)
+            out["bytes"] = self.capture_bytes
+        return out
+
+    # -- Pro AV (tnt.proav.ProAvScanner) ------------------------------------------------------------
+    def proav_job_locked(self) -> Dict[str, Any]:
+        return copy.deepcopy(self.proav_job)
+
+    def proav_idle_job(self) -> Dict[str, Any]:
+        return {"state": "idle", "adapter": None, "seconds": PROAV_DEFAULT_SECONDS, "deep": True,
+                "started_ts": None, "elapsed_s": 0.0, "phase": None, "pct": 0.0,
+                "counts": {"mdns": 0, "sap": 0, "ptp": 0, "frames": 0, "devices": 0, "streams": 0},
+                "listeners": [], "error": None, "reason": None, "generation": 0, "ts": time.time()}
+
+    def proav_status(self) -> Dict[str, Any]:
+        with self.lock:
+            return {"available": self.proav_reason is None, "reason": self.proav_reason,
+                    "adapters": [] if self.proav_reason else proav_adapters(),
+                    "job": self.proav_job_locked(), "last_run_ts": self.proav_last_run_ts,
+                    "limits": {"seconds": list(PROAV_SECONDS), "default_seconds": PROAV_DEFAULT_SECONDS,
+                               "min_seconds": 5, "max_seconds": 600}}
+
+    def proav_tile(self) -> Dict[str, Any]:
+        """The block /api/status carries for the Pro AV tile (ProAvScanner.tile): counts and the worst finding."""
+        with self.lock:
+            job = self.proav_job
+            result = self.proav_result or {}
+            findings = result.get("findings") or []
+            worst = next((lvl for lvl in ("bad", "warn", "info", "good")
+                          if any(f.get("level") == lvl for f in findings)), None)
+            master = ((result.get("clock") or {}).get("best") or {}).get("master") or {}
+            return {"available": self.proav_reason is None, "reason": self.proav_reason,
+                    "running": job.get("state") == "scanning", "pct": job.get("pct") or 0.0,
+                    "devices": len(result.get("devices") or []), "streams": len(result.get("streams") or []),
+                    "clock": master.get("vendor") or master.get("mac"), "worst": worst,
+                    "last_run_ts": self.proav_last_run_ts}
+
+    def proav_start(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        seconds = body.get("seconds", PROAV_DEFAULT_SECONDS)
+        if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or int(seconds) != seconds:
+            raise ValueError("seconds must be a whole number from 5 to 600")
+        seconds = int(seconds)
+        if not 5 <= seconds <= 600:
+            raise ValueError("seconds must be a whole number from 5 to 600")
+        adapters = proav_adapters()
+        wanted = body.get("adapter")
+        adapter = adapters[0]
+        if wanted not in (None, ""):
+            match = next((a for a in adapters if a["name"] == str(wanted) or str(a["index"]) == str(wanted)), None)
+            if match is None:
+                raise ValueError("that adapter is not available for a scan")
+            adapter = match
+        deep = body.get("deep", True)
+        with self.lock:
+            if self.proav_reason:
+                raise LookupError(self.proav_reason)
+            if self.proav_job.get("state") == "scanning":
+                raise RuntimeError("a Pro AV scan is already running")
+            self.proav_gen += 1
+            generation = self.proav_gen
+            self.proav_stop_evt = threading.Event()
+            stop = self.proav_stop_evt
+            self.proav_result = None
+            self.proav_job = {"state": "scanning", "adapter": dict(adapter), "seconds": seconds, "deep": bool(deep),
+                              "started_ts": time.time(), "elapsed_s": 0.0, "phase": "starting", "pct": 0.0,
+                              "counts": {"mdns": 0, "sap": 0, "ptp": 0, "frames": 0, "devices": 0, "streams": 0},
+                              "listeners": proav_listeners(packets=False), "error": None, "reason": None,
+                              "generation": generation, "ts": time.time()}
+            job = self.proav_job_locked()
+        threading.Thread(target=self._proav_worker, args=(generation, seconds, dict(adapter), bool(deep), stop),
+                         daemon=True, name="mock-proav").start()
+        self.hub.publish("proav.state", {"job": job})
+        return job
+
+    def proav_cancel(self) -> bool:
+        with self.lock:
+            if self.proav_job.get("state") != "scanning":
+                return False
+            stop = self.proav_stop_evt
+        stop.set()
+        return True
+
+    def _proav_worker(self, generation: int, seconds: int, adapter: Dict[str, Any], deep: bool,
+                      stop: threading.Event) -> None:
+        """Pretend to listen: the progress the page draws, over PROAV_FAKE_LISTEN_S rather than the whole window."""
+        steps = 12
+        cancelled = False
+        for step in range(1, steps + 1):
+            if stop.wait(PROAV_FAKE_LISTEN_S / steps):
+                cancelled = True
+                break
+            share = step / steps
+            with self.lock:
+                if self.proav_gen != generation:
+                    return
+                self.proav_job.update({
+                    "phase": "listening", "pct": round(0.02 + 0.88 * share, 4),
+                    "elapsed_s": round(seconds * share, 2),
+                    "counts": {"mdns": int(214 * share), "sap": int(3 * share), "ptp": int(659 * share),
+                               "frames": int(48213 * share) if deep else 0, "devices": int(7 * share),
+                               "streams": int(3 * share)},
+                    "listeners": [dict(l, packets=int(l["packets"] * share)) for l in proav_listeners()],
+                    "ts": time.time()})
+                job = self.proav_job_locked()
+            self.hub.publish("proav.progress", {"job": job})
+        now = time.time()
+        result = proav_result(now, seconds, adapter, deep, cancelled=cancelled)
+        with self.lock:
+            if self.proav_gen != generation:
+                return
+            self.proav_result = result
+            self.proav_last_run_ts = now
+            self.proav_job.update({"state": "cancelled" if cancelled else "done", "phase": "done", "pct": 1.0,
+                                   "counts": dict(result["counts"]), "listeners": list(result["listeners"]),
+                                   "ts": now})
+            job = self.proav_job_locked()
+        self.hub.publish("proav.state", {"job": job})
+
+    def proav_last(self) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            return copy.deepcopy(self.proav_result)
+
     def capture_status(self) -> Dict[str, Any]:
-        """GET /api/tools/capture (CAPTURE_STATUS): the saved files newest first."""
+        """GET /api/capture (CAPTURE_STATUS_KEYS): what can capture, the open session, the saved files and the limits."""
         adapters = self.capture_adapters()
         with self.lock:
-            return {"available": self.pktmon_reason is None, "reason": self.pktmon_reason, "adapters": adapters,
-                    "capture": copy.deepcopy(self.capture_job), "files": self._capture_files_locked()}
+            return {"available": self.capture_reason is None, "reason": self.capture_reason, "adapters": adapters,
+                    "session": self._capture_session_locked(), "files": self._capture_files_locked(),
+                    "limits": self.capture_limits()}
+
+    def capture_tile(self) -> Dict[str, Any]:
+        """The block /api/status carries for the Packet capture tile (CaptureManager.tile): counts and the adapter's
+        name, never any packet contents."""
+        with self.lock:
+            session = self._capture_session_locked() or {}
+            adapter = session.get("adapter") or {}
+            return {"available": self.capture_reason is None, "reason": self.capture_reason,
+                    "running": session.get("state") == "capturing", "adapter": adapter.get("name"),
+                    "packets": int(session.get("packets") or 0), "calls": int(session.get("calls") or 0),
+                    "files": len(self.capture_files)}
+
+    def _capture_clear_locked(self) -> None:
+        """Forget the open capture's packet list, its calls and its counts (a start, an open or a discard)."""
+        self.capture_rows = []
+        self.capture_meta = []
+        self.capture_calls_found = []
+        self.capture_first_no = 1
+        self.capture_total = 0
+        self.capture_truncated = False
+        self.capture_dropped = 0
+        self.capture_bytes = 0
+        self.capture_first_ts = None
+
+    def _capture_add_locked(self, row: Dict[str, Any], parts: Dict[str, Any]) -> None:
+        """One row onto the list; past CAPTURE_MAX_ROWS the oldest falls off the front and the session is truncated."""
+        self.capture_rows.append(row)
+        self.capture_meta.append({"layers": tuple(parts["layers"]), "fields": tuple(parts["fields"]),
+                                  "payload": parts["payload"], "flags": parts["flags"], "icmp": parts["icmp"]})
+        self.capture_total += 1
+        over = len(self.capture_rows) - CAPTURE_MAX_ROWS
+        if over > 0:
+            del self.capture_rows[:over]
+            del self.capture_meta[:over]
+            self.capture_first_no += over
+            self.capture_truncated = True
 
     def capture_start(self, body: Dict[str, Any]) -> Dict[str, Any]:
-        """POST /api/tools/capture: the body checked like the service (400), then Packet Monitor (409 unavailable) and its lock
-        (409 conflict while a capture runs or a switch port search listens). Answers the capturing job; it runs capture_s seconds."""
+        """POST /api/capture/start: the body checked like the service (400), then whether capturing is possible here
+        (409 unavailable) and whether one already runs (409 conflict). Answers the capturing SESSION; the traffic
+        itself is invented on a background thread until capture_s (None: the max_seconds it was started with)."""
         values = capture_start_values(body, self.capture_adapters())
         with self.lock:
-            if self.pktmon_reason:
-                raise ToolRefused(409, "unavailable", self.pktmon_reason)
-            holder = self._pktmon_holder()
-            if holder:
-                raise ToolRefused(409, "conflict", PKTMON_LOCK_TEXTS[holder])
+            if self.capture_reason:
+                raise ToolRefused(409, "unavailable", self.capture_reason)
+            if self.capture_session is not None and self.capture_session["state"] == "capturing":
+                raise ToolRefused(409, "conflict", CAPTURE_BUSY_TEXT)
             now = time.time()
-            job = {"id": self.capture_next_id, "state": "capturing", "adapter": values["adapter"], "filters": values["filters"],
-                   "full_packets": values["full_packets"], "seconds": values["seconds"], "size_mb": values["size_mb"], "started_ts": now,
-                   "elapsed_s": 0.0, "bytes": 0, "file": None, "error": None, "note": None, "ts": now}
+            self._capture_clear_locked()
+            self.capture_session = {
+                "id": self.capture_next_id, "state": "capturing", "source": "live", "adapter": values["adapter"],
+                "file": None, "saved": False, "started_ts": now, "first_ts": None, "elapsed_s": 0.0, "packets": 0,
+                "shown": 0, "bytes": 0, "dropped": 0, "truncated": False, "calls": 0, "stop_reason": None,
+                "error": None, "ts": now}
             self.capture_next_id += 1
-            self.capture_job = job
             self.capture_gen += 1
             self.capture_stop_evt.clear()
-            gen = self.capture_gen
-            run_s = float(self.capture_s) if self.capture_s is not None else float(values["seconds"])
-            snap = copy.deepcopy(job)
-        self.hub.publish("capture.state", {"capture": snap})
-        threading.Thread(target=self._capture_worker, args=(gen, job, run_s), name="mock-capture", daemon=True).start()
+            self.capture_started_mono = time.monotonic()
+            gen, seed = self.capture_gen, int(now * 1000) & 0x7FFFFFFF
+            run_s = float(self.capture_s) if self.capture_s is not None else float(values["max_seconds"])
+            budget = int(values["max_mb"]) * 1024 * 1024
+            snap = self._capture_session_locked()
+        self.hub.publish("capture.state", {"session": snap})
+        threading.Thread(target=self._capture_worker, args=(gen, run_s, budget, seed), name="mock-capture",
+                         daemon=True).start()
         return snap
 
-    def _capture_worker(self, gen: int, job: Dict[str, Any], run_s: float) -> None:
-        """Capturing (capture.state with the time and the ETL size every half second) until run_s or a stop, then converting,
-        then done with its new file listed."""
-        t0 = time.time()
-        rate = CAPTURE_RATE_BPS[bool(job["full_packets"])]
-        stopped = False
-        while not stopped and time.time() - t0 < run_s:
-            with self.lock:
-                if self.capture_gen != gen:
-                    return
-                elapsed = time.time() - t0
-                job.update(elapsed_s=round(elapsed, 1), bytes=int(elapsed * rate), ts=time.time())
-                snap = copy.deepcopy(job)
-            self.hub.publish("capture.state", {"capture": snap})
-            stopped = self.capture_stop_evt.wait(max(0.02, min(0.5, run_s - elapsed)))
+    def _capture_worker(self, gen: int, run_s: float, budget: int, seed: int) -> None:
+        """The fake live capture: 8-25 invented packets a second onto the list, the scripted SIP call at its own times,
+        capture.state about once a second, and the stop the first limit reached asks for."""
+        try:
+            rng = random.Random(seed)
+            call = capture_sip_call(rng)
+            plan = capture_sip_plan(rng, call)
+            started = time.monotonic()
+            next_tick, at, announced, reason = CAPTURE_TICK_S, 0, False, None
+            while True:
+                elapsed = time.monotonic() - started
+                while at < len(plan) and plan[at][0] <= elapsed:
+                    _when, parts, mark = plan[at]
+                    at += 1
+                    if not self._capture_row(gen, parts, call, mark):
+                        return
+                    if mark == "invite" and not announced:
+                        announced = True
+                        with self.lock:
+                            found = copy.deepcopy(call)
+                        self.hub.publish("capture.sip", {"call": found})
+                burst = rng.randint(1, 3)
+                for _ in range(burst):
+                    if rng.random() < CAPTURE_DROP_CHANCE:
+                        with self.lock:
+                            self.capture_dropped += 1
+                        continue
+                    if not self._capture_row(gen, capture_invent(rng), None, None):
+                        return
+                reason = self._capture_limit(gen, elapsed, run_s, budget)
+                if reason is not None:
+                    break
+                if elapsed >= next_tick:
+                    next_tick = elapsed + CAPTURE_TICK_S
+                    with self.lock:
+                        if self.capture_gen != gen:
+                            return
+                        snap = self._capture_session_locked()
+                    self.hub.publish("capture.state", {"session": snap})
+                if self.capture_stop_evt.wait(burst / rng.uniform(*CAPTURE_RATE_RANGE)):
+                    reason = "user"
+                    break
+            self._capture_finish(gen, reason)
+        except Exception:  # noqa: BLE001
+            log.exception("mock capture worker failed")
+
+    def _capture_row(self, gen: int, parts: Dict[str, Any], call: Optional[Dict[str, Any]], mark: Optional[str]) -> bool:
+        """One invented packet onto the list (and on into the scripted call); False when this worker is stale."""
+        ts = time.time()
+        with self.lock:
+            if self.capture_gen != gen or self.capture_session is None:
+                return False
+            if self.capture_first_ts is None:
+                self.capture_first_ts = ts
+                self.capture_session["first_ts"] = ts
+            row = {"no": self.capture_total + 1, "ts": ts, "rel": round(max(0.0, ts - self.capture_first_ts), 6),
+                   "src": parts["src"], "dst": parts["dst"], "src_mac": parts["src_mac"], "dst_mac": parts["dst_mac"],
+                   "proto": parts["proto"], "sport": parts["sport"], "dport": parts["dport"],
+                   "length": int(parts["length"]), "info": parts["info"]}
+            self._capture_add_locked(row, parts)
+            self.capture_bytes += row["length"] + CAPTURE_BLOCK_BYTES
+            if call is not None:
+                capture_sip_mark(call, parts, mark, ts, row["no"])
+                if call not in self.capture_calls_found:
+                    self.capture_calls_found.append(call)
+        return True
+
+    def _capture_limit(self, gen: int, elapsed: float, run_s: float, budget: int) -> Optional[str]:
+        """Why the capture must end now, else None (CaptureManager._limit_reached: seconds, then size, then packets)."""
         with self.lock:
             if self.capture_gen != gen:
-                return
-            elapsed = time.time() - t0
-            job.update(state="converting", elapsed_s=round(elapsed, 1), bytes=int(elapsed * rate), ts=time.time())
-            snap = copy.deepcopy(job)
-        self.hub.publish("capture.state", {"capture": snap})
-        time.sleep(min(0.3, max(0.02, run_s / 10)))
+                return "service"
+            if elapsed >= run_s:
+                return "seconds"
+            if self.capture_bytes >= budget:
+                return "size"
+            if self.capture_total >= CAPTURE_MAX_PACKETS:
+                return "packets"
+        return None
+
+    def _capture_finish(self, gen: int, reason: Optional[str]) -> None:
+        """End a running capture and keep what it caught: state "stopped" with its stop_reason, then capture.state."""
         with self.lock:
-            if self.capture_gen != gen:
+            if self.capture_gen != gen or self.capture_session is None:
                 return
-            taken, stamp = {f["name"] for f in self.capture_files}, job["started_ts"]
-            name = time.strftime("TNT-capture-%Y%m%d-%H%M%S.pcapng", time.localtime(stamp))
-            while name in taken:                             # like the service: a clash moves the name on by a second
-                stamp += 1
-                name = time.strftime("TNT-capture-%Y%m%d-%H%M%S.pcapng", time.localtime(stamp))
-            now = time.time()
-            size = len(tiny_pcapng(now))
-            self.capture_files.append({"name": name, "size": size, "created_ts": now, "packets": 1})
-            job.update(state="done", file=name, bytes=size, ts=now)
-            snap = copy.deepcopy(job)
-        self.hub.publish("capture.state", {"capture": snap})
+            if self.capture_session["state"] != "capturing":
+                return
+            self.capture_session.update(state="stopped", stop_reason=reason or "user",
+                                        elapsed_s=round(max(0.0, time.monotonic() - self.capture_started_mono), 1),
+                                        bytes=self.capture_bytes, ts=time.time())
+            snap = self._capture_session_locked()
+        self.hub.publish("capture.state", {"session": snap})
 
     def capture_stop(self) -> Optional[Dict[str, Any]]:
-        """DELETE /api/tools/capture: end the capture early and keep it (it converts, then lists its file); waits up to 1 s for it
-        to leave capturing. The job, None before the first capture."""
+        """POST /api/capture/stop: end the capture now and keep it; at once when nothing runs. Waits up to a second
+        for the worker to leave "capturing". The SESSION, None when none is open."""
         with self.lock:
-            job = self.capture_job
-            if job is None or job["state"] != "capturing":
-                return copy.deepcopy(job)
+            session = self.capture_session
+            running = session is not None and session["state"] == "capturing"
+            if running:
+                self.capture_stop_evt.set()
+        if running:
+            deadline = time.time() + 1.0
+            while time.time() < deadline:
+                with self.lock:
+                    if self.capture_session is None or self.capture_session["state"] != "capturing":
+                        break
+                time.sleep(0.02)
+        with self.lock:
+            return self._capture_session_locked()
+
+    def _capture_free_name_locked(self, when: float) -> str:
+        """A TNT-capture-... name nothing has taken yet; like the service, a clash moves it on by a second."""
+        taken = {f["name"] for f in self.capture_files}
+        stamp = when
+        for _step in range(60):
+            name = time.strftime("TNT-capture-%Y%m%d-%H%M%S.pcapng", time.localtime(stamp))
+            if name not in taken:
+                return name
+            stamp += 1
+        return time.strftime("TNT-capture-%Y%m%d-%H%M%S.pcapng", time.localtime(stamp))
+
+    def capture_save(self) -> Dict[str, Any]:
+        """POST /api/capture/save: keep the open capture under a listed name -> {"session", "files"}. A capture that
+        still runs is stopped first; one that was already saved, or read from a file, answers without doing anything."""
+        with self.lock:
+            if self.capture_session is None:
+                raise ToolRefused(404, "not_found", CAPTURE_NOTHING_TEXT)
+        self.capture_stop()
+        with self.lock:
+            session = self.capture_session
+            if session is None:
+                raise ToolRefused(404, "not_found", CAPTURE_NOTHING_TEXT)
+            if session["source"] == "file" or session["saved"]:
+                return {"session": self._capture_session_locked(), "files": self._capture_files_locked()}
+            now = time.time()
+            name = self._capture_free_name_locked(now)
+            self.capture_files.append({"name": name, "size": max(len(tiny_pcapng(now)), self.capture_bytes),
+                                       "created_ts": now, "packets": self.capture_total})
+            session.update(saved=True, file=name, ts=now)
+            snap = self._capture_session_locked()
+            files = self._capture_files_locked()
+        self.hub.publish("capture.state", {"session": snap})
+        return {"session": snap, "files": files}
+
+    def capture_discard(self) -> None:
+        """POST /api/capture/discard: throw the open capture away, packets and all."""
+        with self.lock:
             self.capture_stop_evt.set()
-        deadline = time.time() + 1.0
-        while time.time() < deadline:
-            with self.lock:
-                if job["state"] != "capturing":
-                    break
-            time.sleep(0.02)
+            self.capture_gen += 1
+            self.capture_session = None
+            self._capture_clear_locked()
+        self.hub.publish("capture.state", {"session": None})
+
+    def capture_open(self, name: Any) -> Dict[str, Any]:
+        """POST /api/capture/open: read a saved capture into the packet list -> the SESSION (source "file"). A capture
+        that still runs is refused (409 conflict); the rows are invented here, as many as the file says it holds."""
+        text = str(name or "")
         with self.lock:
-            return copy.deepcopy(self.capture_job)
+            if self.capture_session is not None and self.capture_session["state"] == "capturing":
+                raise ToolRefused(409, "conflict", CAPTURE_BUSY_TEXT)
+            row = self._capture_file_locked(text)
+            created, packets = float(row["created_ts"]), int(row["packets"] or 0)
+            size = int(row["size"] or 0)
+        rows, metas, calls = capture_make_rows(min(packets, CAPTURE_MAX_ROWS), created, hash(text) & 0x7FFFFFFF)
+        now = time.time()
+        with self.lock:
+            self.capture_stop_evt.set()
+            self.capture_gen += 1
+            self._capture_clear_locked()
+            self.capture_rows, self.capture_meta, self.capture_calls_found = rows, metas, calls
+            # the rows are the FIRST len(rows) packets of the file and are numbered from 1, as the service numbers
+            # them; `truncated` is how the page learns the file holds more than the list does
+            self.capture_total = len(rows)
+            self.capture_first_no = 1
+            self.capture_truncated = packets > len(rows)
+            self.capture_bytes = size
+            self.capture_first_ts = rows[0]["ts"] if rows else created
+            self.capture_session = {
+                "id": self.capture_next_id, "state": "loaded", "source": "file", "adapter": None, "file": text,
+                "saved": True, "started_ts": created, "first_ts": self.capture_first_ts, "elapsed_s": 0.0,
+                "packets": len(rows), "shown": len(rows), "bytes": size, "dropped": 0,
+                "truncated": self.capture_truncated, "calls": len(calls), "stop_reason": None, "error": None,
+                "ts": now}
+            self.capture_next_id += 1
+            snap = self._capture_session_locked()
+        self.hub.publish("capture.state", {"session": snap})
+        return snap
+
+    def capture_open_path(self, path: Any) -> Dict[str, Any]:
+        """POST /api/capture/open with ``{"path"}``: any capture file on this PC (tnt.capture.open_path).
+
+        The mock checks the path the way the service does and then invents a capture named after the file, so the page
+        can be driven without a real pcapng lying about; a path that does exist lends its real size."""
+        text = (path if isinstance(path, str) else "" if path is None else str(path)).strip().strip('"')
+        if (not text or "\x00" in text or len(text) > CAPTURE_MAX_PATH_LEN or not os.path.isabs(text)
+                or text.startswith("\\\\")):
+            raise ToolRefused(400, "bad_request", CAPTURE_PATH_TEXT)
+        with self.lock:
+            if self.capture_session is not None and self.capture_session["state"] == "capturing":
+                raise ToolRefused(409, "conflict", CAPTURE_BUSY_TEXT)
+        name = os.path.basename(text) or text
+        try:
+            size = os.path.getsize(text)
+        except OSError:
+            size = 512 * 1024
+        if size > CAPTURE_MAX_OPEN_BYTES:
+            raise ToolRefused(400, "bad_request", CAPTURE_PATH_BIG_TEXT.format(mb=CAPTURE_MAX_OPEN_BYTES // (1024 ** 2)))
+        created = time.time() - 3600.0
+        packets = max(1, min(CAPTURE_MAX_ROWS, size // 700))
+        rows, metas, calls = capture_make_rows(int(packets), created, hash(text) & 0x7FFFFFFF)
+        now = time.time()
+        with self.lock:
+            self.capture_stop_evt.set()
+            self.capture_gen += 1
+            self._capture_clear_locked()
+            self.capture_rows, self.capture_meta, self.capture_calls_found = rows, metas, calls
+            self.capture_total = len(rows)
+            self.capture_first_no = 1
+            self.capture_truncated = False
+            self.capture_bytes = size
+            self.capture_first_ts = rows[0]["ts"] if rows else created
+            self.capture_session = {
+                "id": self.capture_next_id, "state": "loaded", "source": "file", "adapter": None, "file": name,
+                "saved": True, "started_ts": created, "first_ts": self.capture_first_ts, "elapsed_s": 0.0,
+                "packets": len(rows), "shown": len(rows), "bytes": size, "dropped": 0,
+                "truncated": False, "calls": len(calls), "stop_reason": None, "error": None, "ts": now}
+            self.capture_next_id += 1
+            snap = self._capture_session_locked()
+        self.hub.publish("capture.state", {"session": snap})
+        return snap
+
+    def capture_packets(self, *, since: Any = None, limit: Any = None, ip: Any = None, mac: Any = None,
+                        protos: Any = None) -> Dict[str, Any]:
+        """GET /api/capture/packets (CAPTURE_PACKETS_KEYS), exactly as CaptureManager.packets answers it: without
+        ``since`` the newest ``limit`` matching rows, with it the matching rows numbered after it, oldest first. A
+        filter it cannot read is ignored, never refused."""
+        count = capture_whole(limit, CAPTURE_ROW_LIMIT, 1, CAPTURE_MAX_ROW_LIMIT)
+        want_ip, want_mac, keys = capture_norm_ip(ip), capture_norm_mac(mac), capture_proto_keys(protos)
+        empty = not (want_ip or want_mac or keys)
+        with self.lock:
+            dropped_before = False
+            if since is None:
+                start = 0
+            else:
+                after = capture_whole(since, 0, 0, 1 << 62)
+                dropped_before = after + 1 < self.capture_first_no and self.capture_total > 0
+                start = max(0, after + 1 - self.capture_first_no)
+            picked = []
+            for index in range(start, len(self.capture_rows)):
+                if empty or capture_matches(self.capture_rows[index], self.capture_meta[index]["layers"], want_ip,
+                                            want_mac, keys):
+                    picked.append(self.capture_rows[index])
+            matched = len(picked)
+            if since is None and len(picked) > count:
+                picked = picked[-count:]
+            elif len(picked) > count:
+                picked = picked[:count]
+            rows = [dict(r) for r in picked]
+            last = rows[-1]["no"] if rows else (self.capture_first_no + len(self.capture_rows) - 1
+                                                if self.capture_rows else 0)
+            return {"rows": rows, "total": self.capture_total, "shown": len(self.capture_rows), "matched": matched,
+                    "last": last, "dropped_before": dropped_before, "session": self._capture_session_locked()}
+
+    def capture_packet(self, no: Any) -> Dict[str, Any]:
+        """GET /api/capture/packets/{no} (CAPTURE_DETAIL_KEYS): the row, its detail tree, its hex dump and the bytes
+        behind it; 404 when the list has already rolled past that number."""
+        number = capture_whole(no, 0, 0, 1 << 62)
+        with self.lock:
+            index = number - self.capture_first_no
+            if not 0 <= index < len(self.capture_rows):
+                raise ToolRefused(404, "not_found", CAPTURE_PACKET_GONE_TEXT)
+            row, meta = dict(self.capture_rows[index]), self.capture_meta[index]
+        frame = capture_frame(row, meta["layers"], meta["payload"], meta["flags"], meta["icmp"])
+        return {"row": row, "layers": capture_detail(row, meta["layers"], meta["fields"], frame),
+                "hex": capture_hex(frame), "bytes": len(frame)}
+
+    def capture_calls(self) -> List[Dict[str, Any]]:
+        """GET /api/capture/calls: the SIP calls found in the open capture, newest first."""
+        with self.lock:
+            return list(reversed(copy.deepcopy(self.capture_calls_found)))
+
+    def capture_call_audio(self, call_id: Any) -> bytes:
+        """GET /api/capture/calls/{id}/audio: the call's RTP rebuilt as a WAV; 404 for a call that has none."""
+        wanted = str(call_id or "")
+        with self.lock:
+            call = next((c for c in self.capture_calls_found if c["id"] == wanted), None)
+        if call is None or not any(s["decodable"] for s in call["streams"]):
+            raise ToolRefused(404, "not_found", CAPTURE_NO_AUDIO_TEXT)
+        return capture_call_wav()
 
     def _capture_file_locked(self, name: str) -> Dict[str, Any]:
         row = next((f for f in self.capture_files if f["name"] == name), None) if _CAPTURE_FILE.fullmatch(name or "") else None
@@ -4478,15 +6392,211 @@ class MockState:
         return row
 
     def capture_download(self, name: str) -> bytes:
-        """GET /api/tools/capture/files/{name}: the saved capture (a tiny pcapng); 404 for a name that is not one."""
+        """GET /api/capture/files/{name}: the saved capture (a tiny pcapng); 404 for a name that is not one."""
         with self.lock:
             return tiny_pcapng(self._capture_file_locked(name)["created_ts"])
 
     def capture_delete(self, name: str) -> List[Dict[str, Any]]:
-        """DELETE /api/tools/capture/files/{name}: the files left; 404 for a name that is not one."""
+        """DELETE /api/capture/files/{name}: the files left; 404 for a name that is not one. The capture that is open
+        is thrown away with its file, as the service does."""
         with self.lock:
-            self.capture_files.remove(self._capture_file_locked(name))
-            return self._capture_files_locked()
+            row = self._capture_file_locked(name)
+            open_now = self.capture_session is not None and self.capture_session.get("file") == row["name"]
+            self.capture_files.remove(row)
+            files = self._capture_files_locked()
+        if open_now:
+            self.capture_discard()
+        return files
+
+    # -- SIP (tnt.sipqual, tnt.sipalg, tnt.sipnat, tnt.sipflow) -----------------------------------
+    def _sip_leg(self, kind: str, label: str, target: str, avg: float, jitter: float, loss: float,
+                 samples: int, window_h: float) -> Dict[str, Any]:
+        grade = sip_grade(avg, jitter, loss)
+        r, mos = sip_call_quality(avg, jitter, loss)
+        return {"kind": kind, "label": label, "target": target, "grade": grade, "mos": mos, "r": r,
+                "call_label": sip_call_label(r), "avg_ms": round(avg, 1), "jitter_ms": round(jitter, 1),
+                "loss_pct": round(loss, 2), "p95_ms": round(avg * 1.8, 1), "samples": samples,
+                "window_h": window_h, "reason": None}
+
+    def sip_qualifier(self, window_h: float = 24.0, host: Optional[str] = None) -> Dict[str, Any]:
+        """GET /api/sip/qualifier: the rating built out of this fake site's ping history and last speed test."""
+        with self.lock:
+            speed = self.speedtests[-1] if self.speedtests else None
+            network_id = self.net_id
+            profile = self.net_profile
+        bad = profile in ("hotel", "hotspot")                # the awkward networks a tech is sent to
+        # built from the ping targets this fake site really has, capped like the service caps them
+        # (tnt.sipqual.pick_targets): a site with twenty targets must not get twenty leg cards
+        legs, left_out, counts = [], 0, {"lan": 0, "wan": 0}
+        for target in self.targets_view():
+            if not target.get("enabled"):
+                continue
+            name = str(target.get("host") or "")
+            if host and name.lower() == str(host).strip().lower():
+                continue                     # the named SIP host is added below, whatever the cap
+            kind = "lan" if target.get("kind") == "local" or name in GATEWAY_HOSTS else "wan"
+            if counts[kind] >= SIP_MAX_LEGS_PER_KIND:
+                left_out += 1
+                continue
+            counts[kind] += 1
+            label = (f"The LAN leg ({name})" if kind == "lan" else f"The internet leg ({name})")
+            lan = kind == "lan"
+            legs.append(self._sip_leg(
+                kind, label, name,
+                (3.4 if lan else 21.0) if not bad else (26.0 if lan else 148.0),
+                (0.6 if lan else 3.1) if not bad else (9.0 if lan else 44.0),
+                (0.0 if lan else 0.05) if not bad else (0.4 if lan else 3.6),
+                1380 if lan else 1376, window_h))
+        if host:
+            legs.append(self._sip_leg("sip", f"The path to {host}", host, 28.0 if not bad else 190.0,
+                                      4.4 if not bad else 61.0, 0.1 if not bad else 5.2, 640, window_h))
+        legs.sort(key=lambda leg: ("lan", "wan", "sip").index(leg["kind"]))
+        bloat = (((speed or {}).get("quality") or {}).get("bufferbloat") or {}).get("grade")
+        return sip_build_qualifier(legs, window_h=window_h, sip_host=host, network_id=network_id,
+                                   speedtest_ts=(speed or {}).get("ts"), bufferbloat=bloat, ts=time.time(),
+                                   left_out=left_out)
+
+    def sip_tile(self) -> Dict[str, Any]:
+        """status.sip: the qualifier's verdict and each leg's grade, plus whatever the two checks last kept."""
+        with self.lock:
+            host = (self.settings.get("sip") or {}).get("host") or None
+            alg = (self.sip_alg_last or {}).get("verdict")
+            nat = (self.sip_stun_last or {}).get("mapping")
+        rating = self.sip_qualifier(float((self.settings.get("sip") or {}).get("window_h") or 24), host)
+        grades = {leg["kind"]: leg["grade"] for leg in rating["legs"]}
+        head = rating["headline"]
+        return {"available": True, "reason": None, "verdict": rating["verdict"], "lan": grades.get("lan"),
+                "wan": grades.get("wan"), "sip": grades.get("sip"), "mos": head["mos"], "avg_ms": head["avg_ms"],
+                "jitter_ms": head["jitter_ms"], "sip_host": host, "ts": rating["ts"], "alg": alg, "nat": nat}
+
+    def sip_alg_view(self) -> Dict[str, Any]:
+        with self.lock:
+            return {"result": copy.deepcopy(self.sip_alg_last), "running": False}
+
+    def sip_alg_run(self, host: Any, port: Any) -> Dict[str, Any]:
+        """POST /api/sip/alg: the ALG check against the site's own PBX, in whichever state the fake network is in."""
+        text = str(host or "").strip()
+        if not text:
+            raise ToolRefused(400, "bad_request", "give the address of your PBX, SBC or registrar")
+        number = 5060
+        if port not in (None, "", 0):
+            try:
+                number = int(port)
+            except (TypeError, ValueError):
+                raise ToolRefused(400, "bad_request", "a SIP port is a number between 1 and 65535") from None
+            if not 1 <= number <= 65535:
+                raise ToolRefused(400, "bad_request", "a SIP port is a number between 1 and 65535")
+        with self.lock:
+            state = self.sip_alg_state
+        result = sip_alg_result(text, number, state)
+        with self.lock:
+            self.sip_alg_last = copy.deepcopy(result)
+        return result
+
+    def sip_stun_view(self) -> Dict[str, Any]:
+        with self.lock:
+            return {"result": copy.deepcopy(self.sip_stun_last), "running": False}
+
+    def sip_stun_run(self, servers: Any = None) -> Dict[str, Any]:
+        """POST /api/sip/stun: both servers asked from one socket, and what the difference says."""
+        wanted = []
+        for entry in (servers or SIP_STUN_SERVERS):
+            pair = entry if isinstance(entry, (list, tuple)) else (entry, None)
+            name = str(pair[0] or "").strip()
+            if not name:
+                raise ToolRefused(400, "bad_request", "give a STUN server's address")
+            wanted.append((name, int(pair[1]) if len(pair) > 1 and pair[1] else 3478))
+        with self.lock:
+            state = self.sip_nat_state
+        result = sip_stun_result(wanted, state)
+        with self.lock:
+            self.sip_stun_last = copy.deepcopy(result)
+        return result
+
+    def sip_stun_lifetime(self, server: Any = None) -> Dict[str, Any]:
+        """POST /api/sip/stun/lifetime: the slow one, which is why the page keeps it behind its own button."""
+        pair = server if isinstance(server, (list, tuple)) else (server or SIP_STUN_SERVERS[0][0],
+                                                                 SIP_STUN_SERVERS[0][1])
+        with self.lock:
+            state = self.sip_nat_state
+        return sip_lifetime_result(str(pair[0]), int(pair[1] or 3478), state)
+
+    def sip_flow_view(self) -> Dict[str, Any]:
+        with self.lock:
+            slots = sorted(self.sip_flow_slots)
+        return sip_flow(slots)
+
+    def sip_flow_open(self, path: Any, slot: Any) -> Dict[str, Any]:
+        """POST /api/sip/flow: read a capture into slot a or b.  Any path is accepted here - the point of the mock
+        is the merged view, not the file system."""
+        text = str(path or "").strip()
+        which = str(slot or "a")
+        if which not in ("a", "b"):
+            raise ToolRefused(400, "bad_request", f"a capture goes in slot a or b, not {which!r}")
+        if not text:
+            raise ToolRefused(400, "bad_request", "give the full path of a capture file")
+        if not (text[1:3] == ":\\" or text.startswith("\\\\") or text.startswith("/")):
+            raise ToolRefused(400, "bad_request", "give the full path of a capture file, not a relative one")
+        if not text.lower().endswith((".pcap", ".pcapng", ".cap")):
+            raise ToolRefused(400, "bad_request", "that capture could not be opened (not a capture file)")
+        with self.lock:
+            self.sip_flow_slots.add(which)
+        return self.sip_flow_view()
+
+    def sip_flow_close(self, slot: Any = None) -> Dict[str, Any]:
+        with self.lock:
+            if slot:
+                self.sip_flow_slots.discard(str(slot))
+            else:
+                self.sip_flow_slots.clear()
+        return self.sip_flow_view()
+
+    def sip_flow_call(self, call_id: Any) -> Dict[str, Any]:
+        wanted = str(call_id or "")
+        for call in self.sip_flow_view()["calls"]:
+            if call["id"] == wanted or wanted in (call["call_ids"] or []):
+                return call
+        raise ToolRefused(404, "not_found", "that call is not in the captures that are loaded")
+
+    def sip_flow_headers(self, side: Any, number: Any) -> Dict[str, Any]:
+        """GET /api/sip/flow/packets/{side}/{no}: every header of the packet a ladder row points at."""
+        try:
+            no = int(number)
+        except (TypeError, ValueError):
+            raise ToolRefused(400, "bad_request", "a packet number is a whole number") from None
+        which = str(side or "a")
+        for call in self.sip_flow_view()["calls"]:
+            for row in call["ladder"]:
+                if row["side"] == which and row["where"] == no:
+                    return sip_header_view(call, row)
+        raise ToolRefused(404, "not_found", "that packet is not in the captures that are loaded")
+
+    def sip_flow_audio(self, call_id: Any, side: Any = None, stream: Any = None) -> bytes:
+        call = self.sip_flow_call(call_id) if not stream else None
+        if stream:
+            for row in self.sip_flow_view()["calls"]:
+                if any(s["id"] == str(stream) for s in row["streams"]):
+                    call = row
+                    break
+        if call is None or not any(s["decodable"] for s in call["streams"]):
+            raise ToolRefused(404, "not_found", "there is no audio in that call TNT can decode")
+        return capture_call_wav()
+
+    def sip_set_state(self, alg: Any = None, nat: Any = None) -> Dict[str, Any]:
+        """POST /mock/sip: move the fake network between the states the page has to show well."""
+        with self.lock:
+            if alg is not None:
+                if str(alg) not in SIP_ALG_STATES:
+                    raise ToolRefused(400, "bad_request", f"alg is one of {', '.join(SIP_ALG_STATES)}")
+                self.sip_alg_state = str(alg)
+                self.sip_alg_last = None
+            if nat is not None:
+                if str(nat) not in SIP_NAT_STATES:
+                    raise ToolRefused(400, "bad_request", f"nat is one of {', '.join(SIP_NAT_STATES)}")
+                self.sip_nat_state = str(nat)
+                self.sip_stun_last = None
+            return {"alg": self.sip_alg_state, "nat": self.sip_nat_state,
+                    "alg_states": list(SIP_ALG_STATES), "nat_states": list(SIP_NAT_STATES)}
 
     # -- networks (tnt.networks) ------------------------------------------
     def _seed_networks(self, now: float) -> None:
@@ -5164,6 +7274,98 @@ class MockState:
             self.hub.publish("geoip.state", self.geoip_status())
         return {"settings": snap, "changed": changed}
 
+    # -- realtime throughput (Network info) ------------------------------
+    def _tp_adapters(self) -> List[Dict[str, Any]]:
+        """The up, non-loopback adapters of the network the fake PC is on - what tnt.throughput's
+        eligibility test leaves once the filter interfaces and loopback are dropped."""
+        prof = net_profile(self.net_profile)
+        return [a for a in prof["adapters"] if a.get("status") == "up" and not a.get("is_loopback")]
+
+    def _tp_row(self, a: Dict[str, Any], idx: int, primary: Any, tot: Dict[str, int],
+                buf: List[List[int]]) -> Dict[str, Any]:
+        """One NIC row of the event: everything except the series and the window figures."""
+        last = buf[-1] if buf else [0, 0, 0, 0, 0]
+        return {"id": str(1689399632855040 + idx * 65536), "index": idx, "name": a.get("name") or "",
+                "description": a.get("description") or "", "type": a.get("type_name") or "Other",
+                "primary": idx == primary, "link_bps": a.get("speed_bps"),
+                "rx_bps": last[1], "tx_bps": last[2], "rx_pps": last[3], "tx_pps": last[4],
+                "rx_bytes": tot["rx_bytes"], "tx_bytes": tot["tx_bytes"],
+                "rx_packets": tot["rx_packets"], "tx_packets": tot["tx_packets"]}
+
+    def throughput_tick(self, ts: float) -> Dict[str, Any]:
+        """Advance every adapter's counters by a second and publish the throughput.sample event."""
+        rows = []
+        with self.lock:
+            prof = net_profile(self.net_profile)
+            primary = prof["internet_nic_index"]
+            live = set()
+            for a in self._tp_adapters():
+                idx = int(a["index"])
+                live.add(idx)
+                rx_bps, tx_bps = tp_rate(str(a.get("name") or ""), ts)
+                rx_pps = rx_bps // (8 * TP_RX_FRAME)
+                tx_pps = tx_bps // (8 * TP_TX_FRAME)
+                tot = self.tp_totals.get(idx)
+                if tot is None:
+                    # a machine that has been up a while, so the Control Panel figures are not all zeros
+                    tot = {"rx_bytes": 1_000_000 * (idx * 37 + 11), "tx_bytes": 250_000 * (idx * 29 + 7),
+                           "rx_packets": 900 * (idx * 37 + 11), "tx_packets": 780 * (idx * 29 + 7)}
+                    self.tp_totals[idx] = tot
+                tot["rx_bytes"] += rx_bps // 8
+                tot["tx_bytes"] += tx_bps // 8
+                tot["rx_packets"] += rx_pps
+                tot["tx_packets"] += tx_pps
+                buf = self.tp_samples.setdefault(idx, [])
+                buf.append([int(ts), rx_bps, tx_bps, rx_pps, tx_pps])
+                if len(buf) > TP_HISTORY_S:
+                    del buf[: len(buf) - TP_HISTORY_S]
+                rows.append(self._tp_row(a, idx, primary, tot, buf))
+            for idx in [i for i in self.tp_samples if i not in live]:
+                # the adapter went away with a network change: its history goes with it
+                self.tp_samples.pop(idx, None)
+                self.tp_totals.pop(idx, None)
+        rows.sort(key=_tp_order)
+        event = {"ts": ts, "nics": rows}
+        self.hub.publish("throughput.sample", event)
+        return event
+
+    def throughput(self, window_s: Any = TP_DEFAULT_WINDOW_S) -> Dict[str, Any]:
+        """GET /api/throughput: the backlog for one window (tnt.throughput.ThroughputMonitor.view)."""
+        try:
+            want = int(float(window_s))
+        except (TypeError, ValueError):
+            want = TP_DEFAULT_WINDOW_S
+        window = want if want in TP_WINDOWS else min(TP_WINDOWS, key=lambda w: (abs(w - want), w))
+        step = max(1, int(math.ceil(window / float(TP_MAX_POINTS))))
+        now = time.time()
+        floor = now - window
+        keep: List[Dict[str, Any]] = []
+        every: List[Dict[str, Any]] = []
+        with self.lock:
+            prof = net_profile(self.net_profile)
+            primary = prof["internet_nic_index"]
+            for a in self._tp_adapters():
+                idx = int(a["index"])
+                tot = self.tp_totals.get(idx)
+                if tot is None:
+                    continue                     # nothing sampled yet: the ticker has not reached it
+                buf = self.tp_samples.get(idx) or []
+                window_rows = [s for s in buf if s[0] >= floor]
+                row = self._tp_row(a, idx, primary, tot, buf)
+                row["samples"] = _tp_bucket(window_rows, step)
+                row["avg_rx_bps"] = _tp_mean(window_rows, 1)
+                row["avg_tx_bps"] = _tp_mean(window_rows, 2)
+                row["peak_rx_bps"] = max((s[1] for s in window_rows), default=0)
+                row["peak_tx_bps"] = max((s[2] for s in window_rows), default=0)
+                every.append(row)
+                if row["primary"] or any(s[1] or s[2] for s in window_rows):
+                    keep.append(row)
+        if not keep:
+            keep = every
+        keep.sort(key=_tp_order)
+        return {"ts": now, "window_s": window, "step_s": step, "history_s": TP_HISTORY_S,
+                "windows": list(TP_WINDOWS), "nics": keep, "note": None}
+
     def netinfo(self) -> Dict[str, Any]:
         """GET /api/netinfo for the network the fake PC is on, with the generation of the last change."""
         with self.lock:
@@ -5303,6 +7505,7 @@ class MockState:
             self.switch_network(plan[1])
 
     def status(self) -> Dict[str, Any]:
+        tools = {name: self.settings.get("tools", {}).get(name, True) is not False for name in TOOLS}
         with self.lock:
             targets = [self.target_view(t) for t in self.targets]
             lights = [t["light"] for t in targets]
@@ -5323,7 +7526,7 @@ class MockState:
             return {"version": VERSION, "started_ts": self.started_ts, "uptime_s": round(now - self.started_ts, 1),
                     "mode": "console", "monitoring": not self.paused and bool(self.targets), "paused": self.paused,
                     "overall_light": overall, "targets": targets, "outages": self.outages_status(),
-                    "speed": self.speed_status(),
+                    "speed": self.speed_status() if tools.get("speed", True) else None,
                     "discovery": {"running": self.disc_running, "progress": dict(self.disc_progress),
                                   "last_run": {"id": last_run["id"], "ts": last_run["ts"], "cidr": last_run["cidr"],
                                                "found": last_run["found"], "duration_s": last_run["duration_s"]} if last_run else None},
@@ -5356,6 +7559,13 @@ class MockState:
                     "geoip": self.geoip_status(),
                     "update": self.update_status(),
                     "tftp": self.tftp_summary(),
+                    # the Packet capture tile's numbers (the page itself reads /api/capture)
+                    "capture": self.capture_tile() if tools.get("capture", True) else None,
+                    "proav": self.proav_tile() if tools.get("proav", True) else None,
+                    # the SIP tile: the verdict, each leg and whatever the ALG and STUN checks last kept.
+                    # A tool that is off gets null rather than a block, like the service.
+                    "sip": self.sip_tile() if tools.get("sip", True) else None,
+                    "tools": tools,
                     "settings": {"theme": self.settings["ui"]["theme"], "loaded": self.settings["ping"]["loaded"]}}
 
     def diagnostics(self) -> Dict[str, Any]:
@@ -5580,10 +7790,48 @@ class Handler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(pdf)
 
+    def _need_tool(self, name: str) -> None:
+        """Refuse when a main tool is switched off (tnt.api.routes._need_tool): 409, because the route exists
+        and works again the moment the toggle goes back on."""
+        if STATE.settings.get("tools", {}).get(name, True) is not False:
+            return
+        label = {"speed": "Speed", "discovery": "Discovery", "wifi": "WiFi", "capture": "Packet capture",
+                 "proav": "Pro AV", "sip": "SIP"}.get(name, name)
+        raise ToolRefused(409, "tool_off", f"The {label} tool is switched off in Settings")
+
     def _capture_admin(self) -> None:
         """Every packet capture route, after the origin check: the service's 403 for a standard user (STATE.wifi_admin off)."""
         if not STATE.wifi_admin:
             raise ToolRefused(403, "admin_required", CAPTURE_ADMIN_REQUIRED_MSG)
+
+    def _sip_audio(self, call_id: str, side: Optional[str], stream: Optional[str]) -> None:
+        """One call (or one RTP direction) from the loaded captures, as the service sends its FileResponse."""
+        wav = STATE.sip_flow_audio(call_id, side, stream)
+        safe = "".join(c for c in (stream or call_id) if c.isalnum() or c in "-_")[:64] or "call"
+        self.send_response(200)
+        self.send_header("Content-Type", "audio/wav")
+        self.send_header("Content-Length", str(len(wav)))
+        self.send_header("Content-Disposition", f'attachment; filename="TNT-{safe}.wav"')
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(wav)
+
+    def _capture_audio(self, call_id: str) -> None:
+        """One SIP call rebuilt as a WAV, as the service sends its FileResponse: audio/wav of its length, playable in
+        the page (the call is looked up before any header goes out, so an unknown one is a clean 404)."""
+        wav = STATE.capture_call_audio(call_id)
+        safe = "".join(c for c in call_id if c.isalnum() or c in "-_")[:64] or "call"
+        self.send_response(200)
+        self.send_header("Content-Type", "audio/wav")
+        self.send_header("Content-Length", str(len(wav)))
+        self.send_header("Content-Disposition", f'attachment; filename="TNT-call-{safe}.wav"')
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(wav)
 
     def _capture_file(self, name: str) -> None:
         """A saved capture as the service sends a FileResponse: an attachment of its length, not cached, not sniffed (the name is
@@ -5745,6 +7993,12 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"state": STATE.update_set_state(str(self._body().get("state") or ""))})
                 with STATE.lock:
                     return self._json({"state": STATE.update_state, "states": list(UPDATE_STATES)})
+            if path == "/mock/sip" and method in ("GET", "POST"):
+                # development only: GET what the fake network does to SIP and to a NAT mapping, POST {"alg", "nat"} picks
+                if method == "POST":
+                    body = self._body()
+                    return self._json(STATE.sip_set_state(body.get("alg"), body.get("nat")))
+                return self._json(STATE.sip_set_state())
             if method in ("GET", "HEAD"):
                 self._static(path)
             else:
@@ -5777,6 +8031,11 @@ class Handler(BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 return default
 
+        if method == "PATCH" and len(parts) == 2 and parts[0] == "targets":
+            # set or clear a target's custom name (tnt.api.routes rename_target)
+            view = STATE.set_target_name(int(parts[1]), self._body().get("name"))
+            return self._json(view) if view is not None else self._error(404, "not_found", "no such target")
+
         if method == "GET":
             if p == "/health":
                 return self._json({"ok": True})
@@ -5785,6 +8044,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(STATE.status())
             if p == "/netinfo":
                 return self._json(STATE.netinfo())
+            if p == "/throughput":
+                return self._json(STATE.throughput(qs.get("window_s")))
             if p == "/geoip":
                 return self._json(STATE.geoip_status())
             if p == "/update":
@@ -5865,15 +8126,49 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(STATE.tftp_status())
             if p == "/tftp/files":
                 return self._json({"files": STATE.tftp_files()})
-            if p == "/tools/capture":
+            if p == "/proav":
+                return self._json(STATE.proav_status())
+            if p == "/proav/result":
+                return self._json({"result": STATE.proav_last()})
+            if p == "/capture":
                 self._capture_admin()
                 return self._json(STATE.capture_status())
+            if p == "/capture/packets":
+                # every value of every "proto" parameter, repeated and/or comma separated (qs keeps only the last one)
+                self._capture_admin()
+                protos = [x for raw in parse_qs(url.query).get("proto", []) for x in str(raw).split(",") if x.strip()]
+                return self._json(STATE.capture_packets(since=qs.get("since"), limit=qs.get("limit"), ip=qs.get("ip"),
+                                                        mac=qs.get("mac"), protos=protos))
+            if len(parts) == 3 and parts[0] == "capture" and parts[1] == "packets":
+                self._capture_admin()
+                return self._json(STATE.capture_packet(unquote(parts[2])))
+            if p == "/capture/calls":
+                self._capture_admin()
+                return self._json({"calls": STATE.capture_calls()})
+            if len(parts) == 4 and parts[0] == "capture" and parts[1] == "calls" and parts[3] == "audio":
+                self._capture_admin()
+                return self._capture_audio(unquote(parts[2]))
             if network_tool_route(p) and p.startswith(CAPTURE_FILES_ROUTE):
                 # the download, like the service: a page of another origin is refused first, then anyone but an administrator
                 if cross_origin_browser_request(self.headers, STATE.port):
                     return self._error(403, "forbidden", QUICK_TOOLS_CROSS_ORIGIN_MSG)
                 self._capture_admin()
                 return self._capture_file(unquote(p[len(CAPTURE_FILES_ROUTE):]))
+            if p == "/sip/qualifier":
+                return self._json({"rating": STATE.sip_qualifier(float(qf("hours", 24.0) or 24.0),
+                                                                 (qs.get("host") or "").strip() or None)})
+            if p == "/sip/alg":
+                return self._json(STATE.sip_alg_view())
+            if p == "/sip/stun":
+                return self._json(STATE.sip_stun_view())
+            if p == "/sip/flow":
+                return self._json({"flow": STATE.sip_flow_view()})
+            if len(parts) == 4 and parts[:2] == ["sip", "flow"] and parts[2] == "calls":
+                return self._json({"call": STATE.sip_flow_call(unquote(parts[3]))})
+            if len(parts) == 5 and parts[:2] == ["sip", "flow"] and parts[2] == "calls" and parts[4] == "audio":
+                return self._sip_audio(unquote(parts[3]), qs.get("side"), qs.get("stream"))
+            if len(parts) == 5 and parts[:3] == ["sip", "flow", "packets"]:
+                return self._json({"packet": STATE.sip_flow_headers(unquote(parts[3]), unquote(parts[4]))})
             if p == "/settings":
                 with STATE.lock:
                     return self._json(copy.deepcopy(STATE.settings))
@@ -5888,6 +8183,21 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(404, "not_found", f"no route for GET {path}")
 
         if method == "POST":
+            if p == "/sip/alg":
+                self._need_tool("sip")
+                body = self._body()
+                return self._json({"result": STATE.sip_alg_run(body.get("host"), body.get("port")),
+                                   "running": False})
+            if p == "/sip/stun":
+                self._need_tool("sip")
+                return self._json({"result": STATE.sip_stun_run(self._body().get("servers")), "running": False})
+            if p == "/sip/stun/lifetime":
+                self._need_tool("sip")
+                return self._json({"result": STATE.sip_stun_lifetime(self._body().get("server"))})
+            if p == "/sip/flow":
+                self._need_tool("sip")
+                body = self._body()
+                return self._json({"flow": STATE.sip_flow_open(body.get("path"), body.get("slot"))})
             if p == "/targets":
                 body = self._body()
                 view = STATE.add_target(str(body.get("host", "")), body.get("label"))
@@ -5895,10 +8205,12 @@ class Handler(BaseHTTPRequestHandler):
             if p == "/targets/defaults":
                 return self._json(STATE.load_defaults())
             if p == "/speedtests/run":
+                self._need_tool("speed")
                 if not STATE.speed_run():
                     return self._error(409, "conflict", "a speed test is already running")
                 return self._json({"started": True})
             if p == "/discovery/scan":
+                self._need_tool("discovery")
                 body = self._body()
                 try:
                     return self._json(STATE.disc_start(body.get("range"), body.get("ports")))
@@ -5959,9 +8271,41 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"job": STATE.switch_start(body.get("adapter"), body.get("seconds"))})
             if p == "/netcheck/portforward":
                 return self._json(STATE.portcheck_test(self._body().get("port")))
-            if p == "/tools/capture":
+            if p == "/proav/scan":
+                self._need_tool("proav")
+                try:
+                    return self._json({"job": STATE.proav_start(self._body())})
+                except LookupError as exc:
+                    return self._error(409, "unavailable", str(exc))
+                except ValueError as exc:
+                    return self._error(400, "bad_request", str(exc))
+                except RuntimeError as exc:
+                    return self._error(409, "conflict", str(exc))
+            if p == "/proav/cancel":
+                return self._json({"cancelled": STATE.proav_cancel(), "job": STATE.proav_status()["job"]})
+            if p == "/capture/start":
+                self._need_tool("capture")
                 self._capture_admin()
-                return self._json({"capture": STATE.capture_start(self._body())})
+                return self._json({"session": STATE.capture_start(self._body())})
+            if p == "/capture/stop":
+                self._capture_admin()
+                return self._json({"session": STATE.capture_stop()})
+            if p == "/capture/save":
+                self._capture_admin()
+                return self._json(STATE.capture_save())
+            if p == "/capture/discard":
+                self._capture_admin()
+                STATE.capture_discard()
+                return self._json({"session": None})
+            if p == "/capture/open":
+                self._capture_admin()
+                body = self._body()
+                if body.get("path") is not None:
+                    return self._json({"session": STATE.capture_open_path(body.get("path"))})
+                if body.get("name") is None:
+                    raise ToolRefused(400, "bad_request",
+                                      "give a saved capture's name, or the path of a file on this PC")
+                return self._json({"session": STATE.capture_open(body.get("name"))})
             if p == "/tftp/start":
                 return self._json(STATE.tftp_start(self._body()))
             if p == "/tftp/stop":
@@ -6065,11 +8409,10 @@ class Handler(BaseHTTPRequestHandler):
         if method == "DELETE":
             if network_tool_route(p) and cross_origin_browser_request(self.headers, STATE.port):
                 return self._error(403, "forbidden", QUICK_TOOLS_CROSS_ORIGIN_MSG)
+            if p == "/sip/flow":
+                return self._json({"flow": STATE.sip_flow_close(qs.get("slot"))})
             if p == "/netcheck/switch":
                 return self._json({"job": STATE.switch_stop()})
-            if p == "/tools/capture":
-                self._capture_admin()
-                return self._json({"capture": STATE.capture_stop()})
             if network_tool_route(p) and p.startswith(CAPTURE_FILES_ROUTE):
                 self._capture_admin()
                 return self._json({"files": STATE.capture_delete(unquote(p[len(CAPTURE_FILES_ROUTE):]))})
@@ -6098,6 +8441,7 @@ def ticker(stop: threading.Event) -> None:
                 break
         try:
             STATE.tick(float(nxt))
+            STATE.throughput_tick(float(nxt))
             STATE.speed_tick()
             STATE.lan_tick(float(nxt))
         except Exception:  # noqa: BLE001

@@ -33,20 +33,31 @@ FEATURES
                 width, signal over time with this PC's own link speed, security and
                 vendor, with a spectrum chart per band. Runs in the TNT window and
                 needs Windows location access.
-  Tools         LAN throughput test between TNT PCs, a port-forward test from
+  Tools         Quick Tools at the top of the page: IP Release/Renew (Windows
+                administrators only) and Flush DNS, one click each. Then LAN
+                throughput test between TNT PCs, a port-forward test from
                 the internet, traceroute with a path map and hop locations,
                 DHCP server for gear with no address, TFTP server for firmware
                 and configuration files, DNS lookup (MX, TXT, SRV, all record
-                types at once and more), subnet calculator, packet capture to a
-                pcapng file, and saved Wi-Fi networks (packet capture and
-                showing Wi-Fi passwords need a Windows administrator account).
+                types at once and more), subnet calculator, and saved Wi-Fi
+                networks (showing Wi-Fi passwords needs a Windows administrator
+                account).
   Reports       Full Scan: a speed test, a Discovery scan and a Wi-Fi scan, saved
                 with the last 7 days of pings and outages on that site's network
                 as a report for the site you name (a network scanned before
                 suggests its site). Reports stay on the PC, export as PDF, and
                 compare with any other report, for example a known good network.
-  Top bar       IP Release/Renew (Windows administrators only) and Flush DNS,
-                one click each.
+  Packet capture
+                A small network analyser: pick an adapter, start, and watch the
+                packets arrive. Filter by IP address, MAC address or protocol,
+                click a packet for its protocol tree and hex dump, and save the
+                capture as a pcapng file Wireshark opens. Open reads a capture
+                back into the list: one TNT saved, or any capture file on this
+                PC, by its full path (the TNT window also has a Browse button).
+                A capture that sees a SIP call lists the calls and can play the
+                audio of a G.711 one. It uses a capture session Windows itself
+                provides - no Npcap, no Wireshark, no driver to install - and
+                needs a Windows administrator account.
 
 Also: PDF reports, a diagnostics page, and light and dark themes.
 
@@ -54,7 +65,7 @@ Also: PDF reports, a diagnostics page, and light and dark themes.
 REQUIREMENTS
 
   - 64-bit Windows 10 version 1809 or newer, or Windows 11
-    (the switch port finder and packet capture need version 2004 or newer)
+    (the switch port finder needs version 2004 or newer)
   - .NET Framework 4.7.2 or later (built into those Windows versions)
   - Microsoft Edge WebView2 Runtime 111 or later (setup installs it when online)
   - Administrator rights to install

@@ -61,19 +61,21 @@ def test_ip_location_markup_and_css():
               "'https://creativecommons.org/licenses/by/4.0/'", "'CC BY 4.0'",
               "id: 'settings-geoip'", "role: 'status'", "id: 'settings-geoip-retry'", "'Retry now'",
               "saveSettings({ geoip: { enabled: v } }", "'geoip.state'", "const { ts, ...st } = d",
-              "about 65 MB a month", "about 140 MB on disk", "group('IP location'"):
+              "about 65 MB a month", "about 140 MB on disk", "tileGroup('ipinfo', 'Network info'"):
         assert s in app, s
     assert "TNT.openExternal(url, e)" in app and "api.geoipCheck()" in app
     assert re.search(r"TNT\.ui = \{[^}]*\bgeoAttribution, geoLicence \};", app)
     # the status line follows every status refresh and network change
     assert app.count("renderSettingsGateway();\n    renderSettingsGeoip();") == 2
-    # the group sits right after Appearance and before Speed tests
-    assert app.index("group('Appearance'") < app.index("group('IP location'") < app.index("group('Speed tests'")
+    # IP location belongs to Network info, so it sits in that tile's own section rather than a group of its own:
+    # the page it changes is the page it is named after
+    assert app.index("tileGroup('ipinfo', 'Network info'") < app.index("tileGroup('ping', 'Ping'")
+    assert "group('IP location'" not in app
     assert not re.search(r"""href=["']https?://""", app)
 
     api = _read("js/api.js")
     for s in ("geoip: () => api.get('/geoip')", "geoipLookup: (ip) => api.get('/geoip/lookup?ip=' + encodeURIComponent(ip))",
-              "geoipCheck: () => api.post('/geoip/check')", "'dhcp.state', 'dhcp.lease', 'dhcp.scan', 'map.sample', 'geoip.state',"):
+              "geoipCheck: () => api.post('/geoip/check')", "'dhcp.state', 'dhcp.lease', 'dhcp.scan', 'map.sample', 'throughput.sample', 'geoip.state',"):
         assert s in api, s
 
     css = _read("css/tnt.css")

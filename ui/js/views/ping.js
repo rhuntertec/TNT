@@ -12,6 +12,10 @@
   // live = per-second samples kept in memory (the service ring buffer holds 1 h),
   // minutes = per-minute aggregates from /api/targets/{id}/history, refreshed every 60 s
   const WINDOWS = [[300, '5 min', 'live'], [3600, '1 h', 'live'], [21600, '6 h', 'minutes'], [86400, '24 h', 'minutes']];
+  // the detail modal's time frames: live (per-second, in-memory ring) for <= 1 h, else per-minute aggregates
+  // from the database (they persist across service restarts, so older history shows there)
+  const DETAIL_WINDOWS = [[3600, '1 h', 'live'], [21600, '6 h', 'minutes'], [86400, '24 h', 'minutes'],
+    [604800, '7 d', 'minutes'], [2592000, '30 d', 'minutes']];
   const AGG_REFRESH_S = 60;
   function savedWindow(t) {
     try { const v = parseInt(localStorage.getItem('tnt.ping.win.' + (t.host || t.id)), 10); if (WINDOWS.some((w) => w[0] === v)) return v; } catch (e) { /* ignore */ }
@@ -87,10 +91,18 @@
     const ui = TNT.ui;
     const light = ui.light(t.light, true);
     const host = h('span', { class: 'ptile-host', title: t.host }, TNT.util.targetName(t));
+    // inline name editor (revealed by the pencil), sitting right next to the colour dot
+    const nameInput = h('input', { class: 'input ptile-name-input', type: 'text', maxlength: '80', autocomplete: 'off', spellcheck: 'false', 'aria-label': 'Custom name for ' + t.host });
+    const clearBtn = h('button', { class: 'btn btn-sm ptile-name-clear', type: 'button', title: 'Reset to the original name' }, 'Clear');
+    const editWrap = h('div', { class: 'ptile-name-edit', hidden: true }, nameInput, clearBtn);
     const badge = kindBadge(t);
-    const grip = h('button', { class: 'ptile-grip', type: 'button', title: 'Drag to reorder (arrow keys work too)',
+    // top-right tool cluster: drag handle, expand-to-detail, rename, remove — in that order
+    const grip = h('button', { class: 'ptile-tool ptile-grip', type: 'button', title: 'Drag to reorder (arrow keys work too)',
       'aria-label': 'Reorder ' + t.host }, ui.icon('grip'));
-    const removeBtn = h('button', { class: 'btn btn-round-sm ptile-remove', type: 'button', 'aria-label': 'Remove ' + t.host, title: 'Remove target' }, ui.icon('close'));
+    const expandBtn = h('button', { class: 'ptile-tool ptile-expand', type: 'button', title: 'Show details', 'aria-label': 'Show details for ' + t.host }, ui.icon('expand'));
+    const editBtn = h('button', { class: 'ptile-tool ptile-edit', type: 'button', title: 'Rename', 'aria-label': 'Rename ' + t.host }, ui.icon('edit'));
+    const removeBtn = h('button', { class: 'ptile-tool ptile-remove', type: 'button', 'aria-label': 'Remove ' + t.host, title: 'Remove target' }, ui.icon('close'));
+    const tools = h('div', { class: 'ptile-tools' }, grip, expandBtn, editBtn, removeBtn);
     const sub = h('div', { class: 'ptile-sub' });
     const big = h('span', { class: 'big' }, '—');
     const unit = h('span', { class: 'unit' }, 'ms');
@@ -106,16 +118,133 @@
       h('span', { class: 'r' }, '24 h'), ...['avg', 'min', 'max', 'loss'].map((k) => (cells.d[k] = h('span', { class: 'v' }, '—'))));
     // the kind badge lives on the second row with the IP chips so the name gets the full width
     const el = h('div', { class: 'card ptile', data: { id: String(t.id) }, draggable: 'true' },
-      grip, removeBtn, h('div', { class: 'ptile-head' }, light, host), sub, rtt, wrap, grid);
-    removeBtn.addEventListener('click', () => removeTarget(t));
+      tools, h('div', { class: 'ptile-head' }, light, host, editWrap), sub, rtt, wrap, grid);
+    removeBtn.addEventListener('click', () => removeTarget(rec.t));
     const spark = new TNT.charts.Sparkline(canvas, { windowS: WINDOW_S, label: '' });
     const rec = { id: t.id, t, el, light, host, badge, sub, big, unit, jitter, spark, cells, canvas, winBtn, grip,
+      nameInput, clearBtn, editWrap, editBtn, editing: false,
       lastTs: 0, seeded: false, hostKey: null, winS: WINDOW_S, winSource: 'live', agg: null, aggTs: 0, grabbed: false };
     winBtn.addEventListener('click', () => cycleWindow(rec));
+    expandBtn.addEventListener('click', () => openDetail(rec));
+    editBtn.addEventListener('click', () => { if (rec.editing) saveName(rec, rec.nameInput.value); else enterEdit(rec); });
+    nameInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); saveName(rec, rec.nameInput.value); }
+      else if (e.key === 'Escape') { e.preventDefault(); exitEdit(rec); }
+    });
+    nameInput.addEventListener('blur', () => { if (rec.editing) saveName(rec, rec.nameInput.value); });
+    clearBtn.addEventListener('mousedown', (e) => e.preventDefault());   // keep focus so the blur-save doesn't fire first
+    clearBtn.addEventListener('click', () => { rec.nameInput.value = ''; saveName(rec, ''); });
     wireDrag(rec);
     applyWindow(rec, savedWindow(t), false);
     updateStatic(rec, t);
     return rec;
+  }
+
+  /* --------------------------------------------------- custom name (pencil) */
+  function enterEdit(rec) {
+    if (rec.editing) return;
+    rec.editing = true;
+    rec.host.hidden = true;
+    rec.editWrap.hidden = false;
+    rec.editBtn.classList.add('active');
+    rec.nameInput.value = TNT.util.targetName(rec.t);
+    setTimeout(() => { try { rec.nameInput.focus(); rec.nameInput.select(); } catch (e) { /* ignore */ } }, 0);
+  }
+  function exitEdit(rec) {
+    rec.editing = false;
+    rec.editWrap.hidden = true;
+    rec.host.hidden = false;
+    rec.editBtn.classList.remove('active');
+  }
+  /** Save the typed name (empty, or equal to the original, clears the custom name → back to the original). */
+  async function saveName(rec, value) {
+    const trimmed = (value || '').trim().slice(0, 80);
+    const original = TNT.util.originalTargetName(rec.t);
+    const next = (!trimmed || trimmed === original) ? null : trimmed;
+    exitEdit(rec);
+    if ((next || null) === (rec.t.name || null)) return;    // nothing changed
+    try {
+      await TNT.api.renameTarget(rec.t.id, next);
+      TNT.app.refreshStatus();
+    } catch (err) { TNT.ui.toast('Could not save the name: ' + (err && err.message ? err.message : err), 'error'); }
+  }
+
+  /* --------------------------------------------------- detail modal (expand) */
+  async function openDetail(rec) {
+    const { h } = TNT.util;
+    const t = rec.t;
+    const canvas = h('canvas', { class: 'ptile-detail-canvas', 'aria-label': 'Round-trip times for ' + TNT.util.targetName(t) });
+    const chartWrap = h('div', { class: 'chart-wrap ptile-detail-chart' }, canvas);
+    const sub = h('div', { class: 'ptile-detail-sub' }, kindBadge(t));
+    if (t.ip) sub.appendChild(TNT.util.copyCode(t.ip));
+    if (t.label && t.host !== t.ip) sub.appendChild(TNT.util.copyCode(t.host));
+    const outagesBox = h('div', { class: 'ptile-detail-outages' }, h('div', { class: 'muted small' }, 'Loading recent outages…'));
+    // default 24 h so the database's minute history (which survives restarts) shows, not just live samples
+    let winS = 86400, source = 'minutes', reqId = 0, unsub = null, chart = null, liveBuf = [];
+    const seg = TNT.ui.segmented(DETAIL_WINDOWS.map((w) => ({ value: w[0], label: w[1] })), winS, (v) => setWindow(Number(v)));
+    const chartHead = h('div', { class: 'ptile-detail-chart-head' }, h('div', { class: 'label' }, 'Round-trip time'), seg);
+    const body = h('div', { class: 'ptile-detail' }, sub, chartHead, chartWrap,
+      h('div', { class: 'label', style: { margin: '16px 0 8px' } }, 'Last 5 outages'), outagesBox);
+    const m = TNT.ui.modal({ title: TNT.util.targetName(t), wide: true, body,
+      onClose: () => { if (unsub) { try { unsub(); } catch (e) { /* ignore */ } } if (chart) chart.destroy(); } });
+    chart = new TNT.charts.LineChart(canvas, { unit: 'ms',
+      formatTip: (tt, vals) => {
+        const v = vals && vals[0];
+        const val = v && v.v != null ? TNT.util.fmtMs(v.v) + ' ms' : 'no reply';
+        return '<div class="t">' + TNT.util.fmtDateTime(tt) + '</div>' + val;
+      } });
+
+    // match the ping tile's sparkline: a green fill under an ink line (canvas needs resolved colours, not CSS vars)
+    const C = TNT.charts.colors();
+    function setSeries(pts, now) {
+      const oks = pts.filter((s) => s[1] != null).map((s) => s[1]);
+      const avg = oks.length ? oks.reduce((a, b) => a + b, 0) / oks.length : null;
+      chart.setData({ xMin: now - winS, xMax: now, unit: 'ms',
+        series: [{ name: 'RTT', points: pts, color: C.green, line: C.ink }],
+        hlines: avg != null ? [{ value: avg, color: C.inkSoft, label: 'avg ' + TNT.util.fmtMs(avg) + ' ms' }] : [] });
+    }
+    const paintLive = () => { const now = TNT.util.nowS(); setSeries(liveBuf.filter((s) => s[0] >= now - winS), now); };
+
+    async function setWindow(v) {
+      winS = v;
+      source = (DETAIL_WINDOWS.find((w) => w[0] === v) || [])[2] || 'minutes';
+      if (unsub) { try { unsub(); } catch (e) { /* ignore */ } unsub = null; }
+      const my = ++reqId;
+      const now = TNT.util.nowS();
+      if (source === 'live') {
+        // per-second samples: the service's in-memory ring (seeded from what the tile holds, then followed live)
+        liveBuf = samplesFor(t.id).slice();
+        paintLive();
+        try {
+          const r = await TNT.api.samples(t.id, winS);
+          if (my !== reqId) return;
+          const have = new Set(liveBuf.map((s) => Math.round(s[0] * 10)));
+          for (const s of (r && r.samples) || []) if (Array.isArray(s) && !have.has(Math.round(s[0] * 10))) liveBuf.push([s[0], s[1] == null ? null : s[1]]);
+          liveBuf.sort((a, b) => a[0] - b[0]);
+          paintLive();
+        } catch (e) { /* the seed still shows */ }
+        unsub = TNT.api.events.on('ping.sample', (d) => { if (d && d.target_id === t.id && source === 'live') { liveBuf.push([d.ts, d.ok && d.rtt_ms != null ? d.rtt_ms : null]); paintLive(); } });
+      } else {
+        // per-minute aggregates from the database: these persist across restarts (avg per minute, null when nothing came back)
+        setSeries([], now);
+        try {
+          const r = await TNT.api.history(t.id, Math.floor(now - winS), Math.ceil(now));
+          if (my !== reqId) return;
+          setSeries(((r && r.minutes) || []).map((mm) => [Number(mm.minute_ts) + 30, mm.received ? mm.avg_ms : null]), now);
+        } catch (e) { /* the empty chart stays */ }
+      }
+    }
+    setWindow(winS);
+    try {
+      const now = TNT.util.nowS();
+      const res = await TNT.api.outages(Math.floor(now - 30 * 86400), Math.ceil(now));
+      const rows = ((res && res.outages) || []).filter((o) => o && o.target_id === t.id).sort((a, b) => b.start_ts - a.start_ts).slice(0, 5);
+      outagesBox.innerHTML = '';
+      outagesBox.appendChild(TNT.views.outages.outageTable(rows, 'No outages recorded for this target.'));
+    } catch (err) {
+      outagesBox.innerHTML = '';
+      outagesBox.appendChild(h('div', { class: 'muted small' }, 'Could not load outages: ' + (err && err.message ? err.message : err)));
+    }
   }
 
   /* ------------------------------------------------------------- reordering */

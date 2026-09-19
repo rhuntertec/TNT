@@ -4,7 +4,10 @@
    (100 max) and relights the fuse to full length. When the fuse runs out the pile goes
    up in a cartoon explosion sized by the number of sticks. The number of sticks ever
    detonated on this machine is kept by the service (/api/easter) and shown in very small
-   text under the logo once it is at least 1. */
+   text under the logo once it is at least 1.
+
+   The overlay is appended to <html> rather than <body>: the explosion shakes <body> with a transform, and a
+   transformed ancestor would make the fixed overlay measure from the document instead of the viewport. */
 (function () {
   'use strict';
   const TNT = (window.TNT = window.TNT || {});
@@ -36,7 +39,7 @@
 
   // Once in about 500 throws the stick is a pixel-art TNT block instead (a nod to a certain
   // block game): a 16 x 16 face with a white band and a chunky "TNT" in it.
-  const BLOCK_ODDS = 1 / 500;
+  const BLOCK_ODDS = 1 / 100;
   const BLOCK_ROWS = [
     'rrrdrrrrrdrrrrdr',
     'rdrrrrdrrrrrrrrr',
@@ -111,7 +114,13 @@
     fuseWrap.hidden = true;
     overlay.appendChild(pileEl);
     overlay.appendChild(fuseWrap);
-    document.body.appendChild(overlay);
+    // On <html>, not <body>, and that is load-bearing: the explosion shakes the page by animating a transform on
+    // <body>, and an ancestor with any transform at all -- even the identity one the keyframes start and end on --
+    // becomes the containing block for a position: fixed descendant. Inside <body> the overlay would stop being
+    // measured from the viewport the instant the shake began and snap to the top of the document, taking the whole
+    // explosion with it: the further the page was scrolled, the further off-screen the boom landed. Here it is
+    // outside the shaken subtree, so the page shakes around an explosion that stays where the pile was.
+    document.documentElement.appendChild(overlay);
     fusePath = fuseWrap.querySelector('.egg-fuse-path');
     sparkEl = fuseWrap.querySelector('.egg-spark');
     try { fuseLen = fusePath.getTotalLength(); } catch (e) { fuseLen = 260; }

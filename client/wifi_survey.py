@@ -112,6 +112,7 @@ LEASE_S = 30.0
 LOCATION_RETRY_S = 60.0
 STALE_S = 120.0
 MAX_APS = 1000
+MAX_AP_AGE_S = 24 * 3600.0      # drop (and never list) an access point not heard in the last 24 h, so the list does not accumulate every AP ever seen
 MAX_POINTS = 8640
 COALESCE_S = 5.0
 #: A beacon this much older than the session start still adds a history point (at the start).
@@ -1212,6 +1213,10 @@ class WifiSurvey:
                     at = max(started, min(max(beacon, floor), now))
                     ap.series.add(int(round((at - started) * 10)), rssi, bucket_ds, self.max_points)
             ap.read_seq = seq
+        # drop access points not heard in the last 24 h so the list shows only recently found networks, not every AP ever seen
+        cutoff = now - MAX_AP_AGE_S
+        for bssid in [b for b, a in self._aps.items() if a.last_seen < cutoff and b not in self._connected]:
+            del self._aps[bssid]
         excess = len(self._aps) - self.max_aps
         if excess > 0:
             # the least recently seen go: the oldest last beacon, then the ones missing from this read
@@ -1239,6 +1244,8 @@ class WifiSurvey:
         aps: List[Dict[str, Any]] = []
         windows: Dict[str, Tuple[array, array]] = {}
         for bssid, ap in self._aps.items():
+            if now - ap.last_seen > MAX_AP_AGE_S and bssid not in self._connected:
+                continue                      # only recently found networks (last 24 h) are listed
             row = dict(ap.desc)
             row["spans"] = [list(s) for s in ap.desc.get("spans", [])]
             row["phys"] = list(ap.desc.get("phys", []))

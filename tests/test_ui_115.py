@@ -1,15 +1,17 @@
 from test_ui import mock, browser_page, _req, _serve_probe, _probe_result, _load_mock, _read, _doc, UI, ROOT  # noqa: F401
 
 # The mock API (tools/mock_api.py) for the 1.15.0 network tools, held to the service: every key tuple, text, limit and rule the mock
-# mirrors equals tnt.natcheck / tnt.switchport / tnt.lldp / tnt.pktmon / tnt.portcheck / tnt.tftp / tnt.capture /
-# tnt.speedtest.quality / tnt.nettools / tnt.api.routes (the test_mock_network_tools_follow_the_service pattern), and its routes answer
-# with the service's shapes, status codes and error codes, their timing knobs shortened and put back afterwards. Offline: the mock on
-# 127.0.0.1 and the tnt modules with fakes only.
+# mirrors equals tnt.natcheck / tnt.switchport / tnt.lldp / tnt.pktmon / tnt.portcheck / tnt.tftp / tnt.capture / tnt.dissect /
+# tnt.sipcalls / tnt.speedtest.quality / tnt.nettools / tnt.api.routes (the test_mock_network_tools_follow_the_service pattern), and its
+# routes answer with the service's shapes, status codes and error codes, their timing knobs shortened and put back afterwards. Offline:
+# the mock on 127.0.0.1 and the tnt modules with fakes only.
+# Packet capture is the live analyser of its own page (/api/capture and below, ui/js/views/capture.js), not a Tools card any more.
 import contextlib
 import http.client
 import json
 import queue
 import re
+import struct
 import threading
 import time
 from collections import deque
@@ -138,7 +140,9 @@ def test_mock_switch_port_finder_follows_the_service(offline, monkeypatch, tmp_p
                             "SWITCH_NO_NEIGHBOR_TEXT": "NO_NEIGHBOR_TEXT"})
     assert mod.NEIGHBOR_KEYS == lldp.NEIGHBOR_KEYS and list(mod.MOCK_NEIGHBOR) == list(lldp.NEIGHBOR_KEYS)
     assert mod.PKTMON_REASONS == (pktmon.OLD_WINDOWS_REASON, pktmon.MISSING_REASON, pktmon.TOO_OLD_REASON)
-    assert mod.PKTMON_LOCK_TEXTS == pktmon.LOCK_TEXTS
+    # a packet capture runs its own ETW session now and never takes Packet Monitor: the switch port search is the only holder
+    assert mod.PKTMON_LOCK_TEXTS == {"switchport": pktmon.LOCK_TEXTS["switchport"]}
+    assert "LOCK.acquire" not in (ROOT / "tnt" / "capture.py").read_text(encoding="utf-8"), "the capture takes no Packet Monitor lock"
     no_folder = {"work_dir_fn": lambda: tmp_path, "acl": lambda path, sddl: None}      # never the real captures folder
     default = switchport.SwitchPortFinder(None, **no_folder)
     assert mod.SWITCH_SECONDS_RANGE == (default._min_seconds, default._max_seconds)
@@ -291,32 +295,80 @@ def test_mock_tftp_server_follows_the_service(offline, monkeypatch, tmp_path):
 
 
 def test_mock_packet_capture_follows_the_service(offline, tmp_path):
-    from tnt import capture, pcapng, pktmon
+    """The live analyser (tnt.capture, with tnt.dissect's filters and tnt.sipcalls' calls): every key tuple, state, limit
+    and text the mock mirrors is the service's, its start checks the body exactly as CaptureManager.start does, and the
+    saved capture it hands out is a pcapng the service's own reader accepts."""
+    from tnt import capture, dissect, pcapng, sipcalls
     from tnt.api import routes
     mod, state = offline.mod, offline.state
-    _same(mod, capture, {k: k for k in ("CAPTURE_JOB_KEYS", "CAPTURE_FILE_KEYS", "CAPTURE_STATUS_KEYS", "CAPTURE_ADAPTER_KEYS", "CAPTURE_STATES",
-                                        "CAPTURE_SECONDS", "CAPTURE_SIZES_MB")})
-    _same(mod, capture, {"CAPTURE_FILTER_KEYS": "FILTER_KEYS", "CAPTURE_RUNNING_STATES": "RUNNING_STATES", "CAPTURE_PROTOCOLS": "PROTOCOLS",
-                         "CAPTURE_FILE_RE": "FILE_RE", "CAPTURE_SECONDS_TEXT": "SECONDS_TEXT", "CAPTURE_SIZE_TEXT": "SIZE_TEXT",
-                         "CAPTURE_HOST_TEXT": "HOST_TEXT", "CAPTURE_PORT_TEXT": "PORT_TEXT", "CAPTURE_PROTOCOL_TEXT": "PROTOCOL_TEXT",
-                         "CAPTURE_PORT_ICMP_TEXT": "PORT_ICMP_TEXT", "CAPTURE_ADAPTER_TEXT": "ADAPTER_TEXT",
-                         "CAPTURE_FULL_PACKETS_TEXT": "FULL_PACKETS_TEXT", "CAPTURE_FILE_MISSING_TEXT": "FILE_MISSING_TEXT"})
-    manager = capture.CaptureManager(None, captures_dir_fn=lambda: tmp_path, acl=lambda path, sddl: None)    # never the real folder
-    assert mod.CAPTURE_SECONDS_RANGE == (manager._min_seconds, manager._max_seconds)
+    _same(mod, capture, {k: k for k in ("CAPTURE_STATUS_KEYS", "CAPTURE_FILE_KEYS", "CAPTURE_ADAPTER_KEYS", "CAPTURE_SECONDS",
+                                        "CAPTURE_SIZES_MB")})
+    _same(mod, capture, {"CAPTURE_SESSION_KEYS": "SESSION_KEYS", "CAPTURE_ROW_KEYS": "ROW_KEYS", "CAPTURE_LIMIT_KEYS": "LIMIT_KEYS",
+                         "CAPTURE_PACKETS_KEYS": "PACKETS_KEYS", "CAPTURE_DETAIL_KEYS": "DETAIL_KEYS", "CAPTURE_TILE_KEYS": "TILE_KEYS",
+                         "CAPTURE_SESSION_STATES": "SESSION_STATES", "CAPTURE_STOP_REASONS": "STOP_REASONS",
+                         "CAPTURE_DEFAULT_SECONDS": "DEFAULT_SECONDS", "CAPTURE_DEFAULT_MB": "DEFAULT_MB", "CAPTURE_MAX_ROWS": "MAX_ROWS",
+                         "CAPTURE_MAX_PACKETS": "MAX_PACKETS", "CAPTURE_ROW_LIMIT": "DEFAULT_ROW_LIMIT",
+                         "CAPTURE_MAX_ROW_LIMIT": "MAX_ROW_LIMIT", "CAPTURE_TICK_S": "TICK_S", "CAPTURE_FILE_RE": "FILE_RE",
+                         "CAPTURE_ADAPTER_TEXT": "ADAPTER_TEXT", "CAPTURE_SECONDS_TEXT": "SECONDS_TEXT", "CAPTURE_SIZE_TEXT": "SIZE_TEXT",
+                         "CAPTURE_BUSY_TEXT": "BUSY_TEXT", "CAPTURE_NOTHING_TEXT": "NOTHING_TEXT",
+                         "CAPTURE_FILE_MISSING_TEXT": "FILE_MISSING_TEXT"})
+    # the packet list's own shapes come from tnt.dissect, the calls from tnt.sipcalls
+    assert (mod.CAPTURE_LAYER_KEYS, mod.CAPTURE_FIELD_KEYS) == (dissect.DETAIL_KEYS, dissect.FIELD_KEYS)
+    assert mod.CAPTURE_PROTO_FILTERS == {k: dissect.PROTO_FILTERS[k] for k in mod.CAPTURE_PROTO_FILTERS}
+    page = _read("js/views/capture.js")
+    at = page.index("const PROTO_BUTTONS = [")
+    buttons = set(re.findall(r"\{ key: '(\w+)'", page[at:page.index("];", at)]))
+    assert buttons and buttons <= set(mod.CAPTURE_PROTO_FILTERS), sorted(buttons - set(mod.CAPTURE_PROTO_FILTERS))
+    assert (mod.SIP_CALL_KEYS, mod.SIP_STREAM_KEYS, mod.SIP_MESSAGE_KEYS) == (sipcalls.CALL_KEYS, sipcalls.STREAM_KEYS, sipcalls.MESSAGE_KEYS)
+    source = (ROOT / "tnt" / "capture.py").read_text(encoding="utf-8")
+    for text in (mod.CAPTURE_PACKET_GONE_TEXT, mod.CAPTURE_NO_AUDIO_TEXT):
+        assert f'"{text}"' in source, text                     # the two the service writes inline, not as a constant
     assert (mod.CAPTURE_ADMIN_REQUIRED_MSG, mod.CAPTURE_ADMIN_UNVERIFIED_MSG) == (routes.CAPTURE_ADMIN_REQUIRED_MSG,
                                                                                   routes.CAPTURE_ADMIN_UNVERIFIED_MSG)
-    assert set(routes.CAPTURE_START_KEYS) == {"adapter", "seconds", "size_mb", "full_packets", "host", "port", "protocol"}
-    assert capture._is_capture_name(mod.CAPTURE_SEED_FILE)
+    assert mod.ADMIN_ONLY_EVENTS == routes.ADMIN_ONLY_EVENTS == frozenset({capture.EVENT, capture.SIP_EVENT})
+    assert set(routes.CAPTURE_START_KEYS) == {"adapter", "max_seconds", "max_mb"}
+    assert capture._is_capture_name(mod.CAPTURE_SEED_FILE) and mod.CAPTURE_SEED_PACKETS > 0
+    assert set(routes.TYPED_ERRORS["tnt.capture"].values()) == {(409, "conflict"), (404, "not_found"), (409, "unavailable")}
 
+    # the list's filters and paging: the mock reads a query exactly as the service does
+    mgr = capture.CaptureManager(None, captures_dir_fn=lambda: tmp_path, acl=lambda path, sddl: None)    # never the real folder
+    assert state.capture_limits() == mgr.limits()
+    for value in ("d8:bb:c1:12:34:08", "D8-BB-C1-12-34-08", "d8bbc1123408", "D8:BB:C1:12:34", "", "  ", None, 5, "192.0.2.10"):
+        assert mod.capture_norm_mac(value) == capture._norm_mac(value), value
+    for value in ("192.0.2.10", " 2001:0DB8::1 ", "2001:db8::1%12", "192.0.2.0/24", "example.com", "", None, 5, True):
+        assert mod.capture_norm_ip(value) == capture._norm_ip(value), value
+    for value in (None, "", "5", 5, 5.9, True, False, -3, 10 ** 9, "x", [1]):
+        assert mod.capture_whole(value, mod.CAPTURE_ROW_LIMIT, 1, mod.CAPTURE_MAX_ROW_LIMIT) == capture._whole(
+            value, capture.DEFAULT_ROW_LIMIT, 1, capture.MAX_ROW_LIMIT), value
+    for protos in (None, (), ["sip"], ["SIP", " rtp "], "sip,rtp", "icmp, arp ,nope", ["sip", "sip", "dns"], ("udp", "tcp"), ["nope"], 5):
+        assert mod.capture_proto_keys(protos) == mgr._make_filter(protos=protos).protos, protos
+
+    # a row matches the same filters here as tnt.dissect's matchers give for the same row
+    rows, metas, calls = mod.capture_make_rows(160, 1767268800.0, 4242)
+    assert len(rows) == len(metas) == 160 and len(calls) == 1
+    seen = {row["proto"] for row in rows}
+    assert {"SIP", "RTP"} <= seen and len(seen) >= 6, seen
+    filters = [(None, None, None), ("192.0.2.50", None, None), (mod.CAPTURE_PHONE["ip"], None, ["sip"]),
+               (None, mod.CAPTURE_PBX["mac"].upper(), None), (None, "02-00-5E-00-00-60", ["rtp", "sip"]),
+               (None, None, ["icmp", "arp"]), ("2001:db8::50", None, ["https"]), (None, None, ["tcp"])]
+    for ip, mac, protos in filters:
+        keys = mod.capture_proto_keys(protos)
+        for row, meta in zip(rows, metas):
+            summary = dict(row, layers=list(meta["layers"]))
+            want = ((not ip or dissect.matches_ip(summary, ip)) and (not mac or dissect.matches_mac(summary, mac))
+                    and (not keys or any(dissect.matches_proto(summary, key) for key in keys)))
+            got = mod.capture_matches(row, meta["layers"], mod.capture_norm_ip(ip), mod.capture_norm_mac(mac), keys)
+            assert got == want, (ip, mac, protos, row)
+    # a filter the service cannot read is ignored, never refused
+    assert mod.capture_norm_ip("example.com") == "" and mod.capture_norm_mac("nope") == "" and mod.capture_proto_keys(["nope"]) == ()
+
+    # the start: the body checked in the service's order, the values it would have run with
     bodies = [{"adapter": "Ethernet"}, {}, {"adapter": None}, {"adapter": ""}, {"adapter": 5}, {"adapter": "Wi-Fi"}, {"adapter": "Tailscale"},
-              {"adapter": "  Ethernet 2 "}]
-    for key, values in (("seconds", [4, 5, 1800, 1801, 30.0, 30.5, "60", None, True]), ("size_mb", [64, 100, 128.0, None, "128"]),
-                        ("host", ["192.0.2.10", " 2001:db8::1 ", "", "   ", "fe80::1%12", "192.0.2.0/24", "example.com", 5, None]),
-                        ("port", [0, 1, 65535, 65536, 8000.0, "80", True, None]), ("protocol", ["TCP", " udp ", "icmp", "", "sctp", 7, None]),
-                        ("full_packets", [False, "yes", None, 0])):
+              {"adapter": "  Ethernet 2 "}, {"adapter": "Nope", "max_seconds": 5}]
+    for key, values in (("max_seconds", [60, 300, 900, 1800, 3600, 5, 59, 3601, 900.0, "900", None, True]),
+                        ("max_mb", [64, 128, 256, 512, 1024, 1, 100, 256.0, "256", None, True, False])):
         bodies += [{"adapter": "Ethernet", key: value} for value in values]
-    bodies += [{"adapter": "Ethernet", "port": 80, "protocol": "icmp"}, {"adapter": "Ethernet", "host": "2001:db8::1", "protocol": "ICMP"},
-               {"adapter": "Nope", "seconds": 4}, {"adapter": "Ethernet", "size_mb": 1, "host": "bad"}]
+
     def refuse(path: str, sddl: str) -> None:
         raise OSError("no folder is secured in this test")
 
@@ -324,9 +376,9 @@ def test_mock_packet_capture_follows_the_service(offline, tmp_path):
         for name in mod.NET_PROFILE_NAMES:
             state.net_profile = name
             profile = mod.net_profile(name)
-            # Packet Monitor is there and its lock is free: a start that passed its checks stops at the folder securer
-            mgr = capture.CaptureManager(None, adapters_fn=lambda: profile["adapters"], capability_fn=lambda: {"ok": True, "reason": None},
-                                         captures_dir_fn=lambda: tmp_path, acl=refuse)
+            # this PC can capture and nothing else runs: a start that passed its checks stops at the folder securer
+            mgr = capture.CaptureManager(None, adapters_fn=lambda: profile["adapters"], captures_dir_fn=lambda: tmp_path, acl=refuse,
+                                         etw=SimpleNamespace(available=lambda: {"ok": True, "reason": None}))
             assert state.capture_adapters() == mgr.adapters(), name
 
             def service(body: Dict[str, Any]) -> Tuple[str, Any]:
@@ -336,17 +388,18 @@ def test_mock_packet_capture_follows_the_service(offline, tmp_path):
                     mgr.start(**kwargs)
                 except ValueError as exc:
                     return ("error", str(exc))
-                except pktmon.PktmonUnavailable as exc:
-                    assert str(exc) == pktmon.FOLDER_NOT_SECURED_TEXT, exc
-                    job = mgr.job()                             # the values the capture would have run with
-                    return ("ok", {k: job[k] for k in ("adapter", "filters", "full_packets", "seconds", "size_mb")})
+                except capture.CaptureUnavailable as exc:
+                    assert str(exc) == capture.FOLDER_TEXT, exc
+                    return ("ok", {"adapter": mgr._check_adapter(body.get("adapter")),       # the values it would have run with
+                                   "max_seconds": kwargs.get("max_seconds", capture.DEFAULT_SECONDS),
+                                   "max_mb": kwargs.get("max_mb", capture.DEFAULT_MB)})
                 return ("started", None)
 
             for body in bodies:
                 assert _outcome(lambda: mod.capture_start_values(body, state.capture_adapters())) == service(body), (name, body)
+            assert state.capture_session is None, "no start of this test opened a session"
     finally:
         state.net_profile = "a"
-    assert pktmon.LOCK.holder() is None
 
     # the download: a valid pcapng with one Ethernet packet the service's reader counts, checksums right
     data = mod.tiny_pcapng(1767268800.25)
@@ -358,7 +411,9 @@ def test_mock_packet_capture_follows_the_service(offline, tmp_path):
     assert packet["ts"] == pytest.approx(1767268800.25, abs=1e-6)
     frame = packet["data"]
     assert frame[12:14] == b"\x08\x00" and mod._inet_checksum(frame[14:34]) == 0 and mod._inet_checksum(frame[34:]) == 0
-    assert [f["size"] for f in state.capture_status()["files"]] == [len(data)]
+    seeded = state.capture_status()["files"]
+    assert [list(f) for f in seeded] == [list(capture.CAPTURE_FILE_KEYS)] and seeded[0]["name"] == mod.CAPTURE_SEED_FILE
+    assert state.capture_download(mod.CAPTURE_SEED_FILE) == mod.tiny_pcapng(seeded[0]["created_ts"])
 
 
 def _echoes(start: float, end: float, rtt: Callable[[int], float], lost: Any = (), skipped: Any = (), step: float = 0.1) -> List[Tuple[Any, ...]]:
@@ -461,8 +516,9 @@ def test_mock_guards_every_state_changing_network_tool_route(offline):
     from tnt.api import routes
     mod = offline.mod
     table = routes.build_routes(SimpleNamespace(), SimpleNamespace(port=7130)).patterns()
-    tools = [(pattern, methods) for pattern, methods in table if pattern.startswith(("/api/netcheck/", "/api/tftp/", "/api/tools/capture"))]
-    assert len(tools) >= 10
+    tools = [(pattern, methods) for pattern, methods in table
+             if pattern.startswith(("/api/netcheck/", "/api/tftp/", "/api/capture", "/api/proav", "/api/sip"))]
+    assert len(tools) >= 20 and not [p for p, _m in table if p.startswith("/api/tools/capture")], "packet capture has its own routes now"
     changing = set()
     for pattern, methods in tools:
         path = pattern[len("/api"):]
@@ -475,7 +531,8 @@ def test_mock_guards_every_state_changing_network_tool_route(offline):
     assert changing == set(mod.NETWORK_TOOL_ROUTES)
     assert mod.QUICK_TOOLS_CROSS_ORIGIN_MSG == routes.QUICK_TOOLS_CROSS_ORIGIN_MSG
     assert {code for errors in routes.TYPED_ERRORS.values() for _status, code in errors.values()} == {
-        "conflict", "unavailable", "rate_limited", "no_public_ip", "vpn", "tftp_port_in_use", "not_found"}
+        "conflict", "unavailable", "rate_limited", "no_public_ip", "vpn", "tftp_port_in_use", "not_found",
+        "bad_request"}
 
 
 # ------------------------------------------------------------------------------------------------------------ the mock's routes
@@ -539,6 +596,7 @@ def test_mock_nat_check_routes(mock):
 def test_mock_switch_port_routes(mock):
     mod, state, port = mock.mod, mock.state, mock.port
     q = state.hub.subscribe()
+    kept_capture = (state.capture_session, state.capture_next_id)
     try:
         with _knobs(state, switch_listen_s=0.3, switch_job=None, switch_kept={}):
             st, _, s = _req(port, "GET", "/api/netcheck/switch")
@@ -559,8 +617,14 @@ def test_mock_switch_port_routes(mock):
                 "listening", {"name": "Ethernet", "index": 12, "mac": "D8:BB:C1:12:34:08"}, 65, [], None)
             st, _, busy = _req(port, "POST", "/api/netcheck/switch", {"adapter": "Ethernet 3"})
             assert st == 409 and busy["error"] == {"code": "conflict", "message": "a switch port search is already running"}
-            st, _, locked = _req(port, "POST", "/api/tools/capture", {"adapter": "Ethernet"})
-            assert st == 409 and locked["error"] == {"code": "conflict", "message": "TNT is finding the switch port: try again when it finishes"}
+            # a packet capture runs its own ETW session: it and the switch port search no longer block each other
+            with _knobs(state, capture_s=30.0, capture_reason=None):
+                st, _, together = _req(port, "POST", "/api/capture/start", {"adapter": "Ethernet"})
+                assert st == 200 and together["session"]["state"] == "capturing", together
+                assert _req(port, "GET", "/api/netcheck/switch")[2]["job"]["state"] == "listening", "the search kept listening"
+                assert _req(port, "GET", "/api/capture")[2]["session"]["state"] == "capturing"
+                assert _req(port, "GET", "/api/status")[2]["capture"]["running"] is True
+                state.capture_discard()
             frames = _frames(q, ("netcheck.switch",), lambda kind, data: data["job"]["state"] == "done")
             assert frames and frames[-1][1]["job"]["state"] == "done"
             done = _req(port, "GET", "/api/netcheck/switch")[2]["job"]
@@ -593,6 +657,8 @@ def test_mock_switch_port_routes(mock):
     finally:
         state.hub.unsubscribe(q)
         state.switch_stop()
+        state.capture_discard()
+        state.capture_session, state.capture_next_id = kept_capture
 
 
 def test_mock_port_forward_routes(mock, monkeypatch):
@@ -733,80 +799,329 @@ def test_mock_tftp_server_routes(mock):
             state.tftp_history, state.tftp_counts, state.tftp_next_id = kept[0], dict(kept[1]), kept[2]
 
 
-def test_mock_packet_capture_routes(mock):
+#: every capture route of the service, as (the service's pattern, method, the mock's path, body): the whole surface the
+#: administrator check guards (tnt.api.routes' "-- packet capture (its own page) --" block)
+CAPTURE_ROUTES = (
+    ("/api/capture", "GET", "/api/capture", None),
+    ("/api/capture/start", "POST", "/api/capture/start", {"adapter": "Ethernet"}),
+    ("/api/capture/stop", "POST", "/api/capture/stop", {}),
+    ("/api/capture/save", "POST", "/api/capture/save", {}),
+    ("/api/capture/discard", "POST", "/api/capture/discard", {}),
+    ("/api/capture/open", "POST", "/api/capture/open", {"name": SEED_CAPTURE}),
+    ("/api/capture/packets", "GET", "/api/capture/packets", None),
+    ("/api/capture/packets/{no}", "GET", "/api/capture/packets/1", None),
+    ("/api/capture/calls", "GET", "/api/capture/calls", None),
+    ("/api/capture/calls/{call}/audio", "GET", "/api/capture/calls/a-call/audio", None),
+    ("/api/capture/files/{name}", "GET", f"/api/capture/files/{SEED_CAPTURE}", None),
+    ("/api/capture/files/{name}", "DELETE", f"/api/capture/files/{SEED_CAPTURE}", None),
+)
+
+
+def test_mock_capture_routes_need_a_windows_administrator(mock):
+    """The service refuses every capture route to anyone but a Windows administrator (403 admin_required), the reads and
+    the download included, and nothing it holds changes."""
+    from tnt.api import routes
     mod, state, port = mock.mod, mock.state, mock.port
-    files = f"/api/tools/capture/files/{SEED_CAPTURE}"
+    table = routes.build_routes(SimpleNamespace(), SimpleNamespace(port=7130)).patterns()
+    service = {(pattern, method) for pattern, methods in table if pattern.startswith("/api/capture") for method in methods}
+    assert {(pattern, method) for pattern, method, _path, _body in CAPTURE_ROUTES} == service, "every capture route is tried here"
+
+    def snapshot() -> Any:
+        with state.lock:
+            return json.dumps([state.capture_session, [f["name"] for f in state.capture_files], state.capture_total], sort_keys=True)
+
+    before = snapshot()
+    with _knobs(state, wifi_admin=False):
+        for _pattern, method, path, body in CAPTURE_ROUTES:
+            st, _, err = _req(port, method, path, body)
+            assert st == 403 and err["error"] == {"code": "admin_required", "message": mod.CAPTURE_ADMIN_REQUIRED_MSG}, (method, path)
+    assert snapshot() == before
+
+
+def test_mock_packet_capture_routes(mock):
+    """GET /api/capture and the analyser's own routes: the status and the Packet capture tile, a capture that runs its
+    time and stops by itself (with its capture.state events), save, open, discard and the saved files."""
+    from tnt import capture, etw
+    mod, state, port = mock.mod, mock.state, mock.port
+    seed_path = f"/api/capture/files/{SEED_CAPTURE}"
     seeded = [dict(f) for f in state.capture_files]
-    before = (state.capture_job, state.capture_next_id)
+    before = (state.capture_session, state.capture_next_id)
     try:
-        # a standard user: the service's 403 from every capture route, the download included
-        with _knobs(state, wifi_admin=False):
-            for method, path, body in (("GET", "/api/tools/capture", None), ("POST", "/api/tools/capture", {"adapter": "Ethernet"}),
-                                       ("DELETE", "/api/tools/capture", None), ("GET", files, None), ("DELETE", files, None)):
-                st, _, err = _req(port, method, path, body)
-                assert st == 403 and err["error"] == {"code": "admin_required", "message": "Packet capture needs a Windows administrator account."}, path
-        st, _, s = _req(port, "GET", "/api/tools/capture")
-        assert st == 200 and list(s) == list(mod.CAPTURE_STATUS_KEYS) and (s["available"], s["reason"], s["capture"]) == (True, None, None)
+        st, _, s = _req(port, "GET", "/api/capture")
+        assert st == 200 and list(s) == list(mod.CAPTURE_STATUS_KEYS) and (s["available"], s["reason"], s["session"]) == (True, None, None)
         assert s["adapters"] == [{"name": "Ethernet", "index": 12, "mac": "D8:BB:C1:12:34:08", "type_name": "Ethernet", "wifi": False},
                                  {"name": "Ethernet 2", "index": 18, "mac": "02:5E:10:00:00:18", "type_name": "Ethernet", "wifi": False},
                                  {"name": "Ethernet 3", "index": 19, "mac": "02:5E:10:00:00:19", "type_name": "Ethernet", "wifi": False}]
+        assert list(s["limits"]) == list(mod.CAPTURE_LIMIT_KEYS) and s["limits"] == {
+            "max_rows": 50_000, "max_packets": 5_000_000, "seconds": [60, 300, 900, 1800, 3600],
+            "sizes_mb": [64, 128, 256, 512, 1024], "default_seconds": 900, "default_mb": 256}
         assert [list(f) for f in s["files"]] == [list(mod.CAPTURE_FILE_KEYS)] and s["files"][0]["name"] == SEED_CAPTURE
+        # the block /api/status carries for the Packet capture tile: counts and the adapter's name, never any packet
+        tile = _req(port, "GET", "/api/status")[2]["capture"]
+        assert list(tile) == list(capture.TILE_KEYS)
+        assert tile == {"available": True, "reason": None, "running": False, "adapter": None, "packets": 0, "calls": 0, "files": 1}
         # the download, as a FileResponse: an attachment of its length, not cached, not sniffed; HEAD sends the headers only
-        st, headers, data = _req(port, "GET", files, raw=True)
-        assert st == 200 and data[:4] == b"\x0a\x0d\x0d\x0a" and int(headers["content-length"]) == len(data) == s["files"][0]["size"]
+        st, headers, data = _req(port, "GET", seed_path, raw=True)
+        assert st == 200 and data == mod.tiny_pcapng(s["files"][0]["created_ts"]) and int(headers["content-length"]) == len(data)
         assert (headers["content-type"], headers["content-disposition"], headers["cache-control"], headers["x-content-type-options"]) == (
             "application/octet-stream", f'attachment; filename="{SEED_CAPTURE}"', "no-cache", "nosniff")
-        st, head, body = _send(port, "HEAD", files)
+        st, head, body = _send(port, "HEAD", seed_path)
         assert st == 200 and body == b"" and head["content-length"] == str(len(data))
-        for method, path in (("GET", "/api/tools/capture/files/TNT-capture-20990101-000000.pcapng"), ("GET", "/api/tools/capture/files/..%5Cx.pcapng"),
-                             ("DELETE", "/api/tools/capture/files/notes.txt")):
+        for method, path in (("GET", "/api/capture/files/TNT-capture-20990101-000000.pcapng"), ("GET", "/api/capture/files/..%5Cx.pcapng"),
+                             ("DELETE", "/api/capture/files/notes.txt")):
             st, _, err = _req(port, method, path)
-            assert st == 404 and err["error"] == {"code": "not_found", "message": "The capture file was not found"}, path
-        for body, message in (({"adapter": "Ethernet", "seconds": 4}, "seconds must be a whole number from 5 to 1800"),
-                              ({"adapter": "Wi-Fi"}, "adapter 'Wi-Fi' is not up"),
-                              ({"adapter": "Ethernet", "port": 80, "protocol": "icmp"}, "port cannot be combined with protocol icmp"),
-                              ({"adapter": "Ethernet", "size_mb": 100}, "size_mb must be one of 64, 128, 256, 512 or 1024")):
-            st, _, err = _req(port, "POST", "/api/tools/capture", body)
+            assert st == 404 and err["error"] == {"code": "not_found", "message": mod.CAPTURE_FILE_MISSING_TEXT}, path
+        st, _, err = _req(port, "POST", "/api/capture/open", {"name": "notes.txt"})
+        assert st == 404 and err["error"] == {"code": "not_found", "message": mod.CAPTURE_FILE_MISSING_TEXT}
+        # a body with neither a saved capture's name nor a path on this PC is 400, as the service answers
+        for body in ({}, {"name": None}):
+            st, _, err = _req(port, "POST", "/api/capture/open", body)
+            assert st == 400 and err["error"]["code"] == "bad_request", body
+        # opening any file on this PC by its path: the same checks the service makes (tnt.capture._check_open_path)
+        for bad in ("", "capture.pcapng", "..\\capture.pcapng", "\\\\server\\share\\x.pcapng"):
+            st, _, err = _req(port, "POST", "/api/capture/open", {"path": bad})
+            assert st == 400 and err["error"] == {"code": "bad_request", "message": mod.CAPTURE_PATH_TEXT}, bad
+        st, _, ok = _req(port, "POST", "/api/capture/open", {"path": "C:\\Users\\me\\from-the-switch.pcapng"})
+        assert st == 200 and ok["session"]["source"] == "file" and ok["session"]["file"] == "from-the-switch.pcapng"
+        assert list(ok["session"]) == list(mod.CAPTURE_SESSION_KEYS)
+        assert _req(port, "POST", "/api/capture/discard", {})[0] == 200
+        st, _, err = _req(port, "POST", "/api/capture/save", {})
+        assert st == 404 and err["error"] == {"code": "not_found", "message": mod.CAPTURE_NOTHING_TEXT}, "nothing is open"
+        assert _req(port, "POST", "/api/capture/stop", {})[2] == {"session": None}
+        for body, message in (({"adapter": "Wi-Fi"}, "adapter 'Wi-Fi' is not up"), ({}, "adapter '' is not up"),
+                              ({"adapter": "Ethernet", "max_seconds": 45}, mod.CAPTURE_SECONDS_TEXT),
+                              ({"adapter": "Ethernet", "max_mb": 100}, mod.CAPTURE_SIZE_TEXT)):
+            st, _, err = _req(port, "POST", "/api/capture/start", body)
             assert st == 400 and err["error"] == {"code": "bad_request", "message": message}, body
-        with _knobs(state, pktmon_reason=mod.PKTMON_REASONS[1]):
-            st, _, err = _req(port, "POST", "/api/tools/capture", {"adapter": "Ethernet"})
-            assert st == 409 and err["error"] == {"code": "unavailable", "message": "Packet Monitor (pktmon.exe) is missing from this PC"}
-            assert _req(port, "GET", "/api/tools/capture")[2]["available"] is False
-        # a capture that runs its time and lists a new file
+        # this PC cannot capture at all
+        with _knobs(state, capture_reason=etw.NOT_WINDOWS_REASON):
+            st, _, err = _req(port, "POST", "/api/capture/start", {"adapter": "Ethernet"})
+            assert st == 409 and err["error"] == {"code": "unavailable", "message": etw.NOT_WINDOWS_REASON}
+            off = _req(port, "GET", "/api/capture")[2]
+            assert (off["available"], off["reason"]) == (False, etw.NOT_WINDOWS_REASON)
+            assert _req(port, "GET", "/api/status")[2]["capture"]["available"] is False
+        # a capture that runs its time: capture.state while it runs, and once more when it stops by itself
         q = state.hub.subscribe()
         try:
-            with _knobs(state, capture_s=0.3):
-                st, _, started = _req(port, "POST", "/api/tools/capture", {"adapter": "Ethernet", "seconds": 10, "size_mb": 64, "full_packets": False,
-                                                                            "host": " 192.0.2.10 ", "protocol": "ICMP"})
-                job = started["capture"]
-                assert st == 200 and list(job) == list(mod.CAPTURE_JOB_KEYS) and list(job["adapter"]) == list(mod.CAPTURE_ADAPTER_KEYS)
-                assert (job["state"], job["filters"], job["full_packets"], job["seconds"], job["size_mb"], job["file"]) == (
-                    "capturing", {"host": "192.0.2.10", "port": None, "protocol": "icmp"}, False, 10, 64, None)
-                st, _, busy = _req(port, "POST", "/api/tools/capture", {"adapter": "Ethernet 2"})
-                assert st == 409 and busy["error"] == {"code": "conflict", "message": "A packet capture is running: stop it first"}
-                st, _, busy = _req(port, "POST", "/api/netcheck/switch", {})
-                assert st == 409 and busy["error"]["message"] == "A packet capture is running: stop it first"
-                frames = _frames(q, ("capture.state",), lambda kind, data: data["capture"]["state"] == "done")
-                assert [data["capture"]["state"] for _kind, data in frames][-2:] == ["converting", "done"]
-            done = _req(port, "GET", "/api/tools/capture")[2]
-            name = done["capture"]["file"]
-            assert done["capture"]["state"] == "done" and done["files"][0] == {"name": name, "size": len(data), "created_ts": done["files"][0]["created_ts"],
-                                                                                 "packets": 1}
-            assert mod._CAPTURE_FILE.fullmatch(name)
-            # Stop and save keeps the capture
-            with _knobs(state, capture_s=30.0):
-                _req(port, "POST", "/api/tools/capture", {"adapter": "Ethernet 3"})
-                st, _, stopped = _req(port, "DELETE", "/api/tools/capture")
-                assert st == 200 and stopped["capture"]["state"] in ("converting", "done")
-                kept = _until(lambda: (lambda c: c if c["state"] == "done" else None)(_req(port, "GET", "/api/tools/capture")[2]["capture"]))
-                assert kept["file"] and kept["file"] != name and kept["elapsed_s"] < 5
+            with _knobs(state, capture_s=0.5):
+                st, _, started = _req(port, "POST", "/api/capture/start", {"adapter": "Ethernet", "max_seconds": 60, "max_mb": 64})
+                session = started["session"]
+                assert st == 200 and list(session) == list(mod.CAPTURE_SESSION_KEYS) and list(session["adapter"]) == list(mod.CAPTURE_ADAPTER_KEYS)
+                assert (session["state"], session["source"], session["adapter"]["name"], session["file"], session["saved"], session["packets"],
+                        session["truncated"], session["stop_reason"], session["error"]) == ("capturing", "live", "Ethernet", None, False, 0, False,
+                                                                                            None, None)
+                st, _, busy = _req(port, "POST", "/api/capture/start", {"adapter": "Ethernet 2"})
+                assert st == 409 and busy["error"] == {"code": "conflict", "message": mod.CAPTURE_BUSY_TEXT}
+                st, _, busy = _req(port, "POST", "/api/capture/open", {"name": SEED_CAPTURE})
+                assert st == 409 and busy["error"] == {"code": "conflict", "message": mod.CAPTURE_BUSY_TEXT}
+                running = _req(port, "GET", "/api/status")[2]["capture"]
+                assert (running["running"], running["adapter"]) == (True, "Ethernet")
+                frames = _frames(q, ("capture.state",), lambda kind, data: (data["session"] or {}).get("state") == "stopped")
+                assert frames and all(list(data["session"]) == list(mod.CAPTURE_SESSION_KEYS) for _kind, data in frames)
+                assert frames[-1][1]["session"]["stop_reason"] == "seconds"
+            done = _req(port, "GET", "/api/capture")[2]["session"]
+            assert (done["state"], done["source"], done["stop_reason"], done["saved"], done["file"]) == ("stopped", "live", "seconds", False, None)
+            assert done["packets"] >= 1 and done["packets"] == done["shown"] and done["bytes"] > 0 and 0.4 <= done["elapsed_s"] < 5
+            # saving lists it under a name of the service's own shape; saving again does nothing
+            st, _, saved = _req(port, "POST", "/api/capture/save", {})
+            name = saved["session"]["file"]
+            assert st == 200 and mod._CAPTURE_FILE.fullmatch(name) and name != SEED_CAPTURE
+            assert (saved["session"]["saved"], saved["session"]["state"]) == (True, "stopped")
+            row = next(f for f in saved["files"] if f["name"] == name)
+            assert (row["packets"], row["size"]) == (done["packets"], max(len(data), done["bytes"]))
+            assert [f["name"] for f in saved["files"]] == [name, SEED_CAPTURE], "newest first"
+            assert _req(port, "POST", "/api/capture/save", {})[2]["session"]["file"] == name
+            assert _req(port, "GET", f"/api/capture/files/{name}", raw=True)[2][:4] == b"\x0a\x0d\x0d\x0a"
+            # a saved capture read back: the rows the file says it holds, its calls, and no adapter
+            st, _, opened = _req(port, "POST", "/api/capture/open", {"name": SEED_CAPTURE})
+            loaded = opened["session"]
+            assert st == 200 and (loaded["state"], loaded["source"], loaded["file"], loaded["saved"], loaded["adapter"]) == (
+                "loaded", "file", SEED_CAPTURE, True, None)
+            assert (loaded["packets"], loaded["shown"], loaded["truncated"], loaded["dropped"]) == (
+                mod.CAPTURE_SEED_PACKETS, mod.CAPTURE_SEED_PACKETS, False, 0)
+            assert loaded["calls"] == 1 and loaded["id"] != done["id"]
+            assert _req(port, "POST", "/api/capture/stop", {})[2]["session"]["state"] == "loaded", "nothing is running"
+            # deleting the file that is open throws the open capture away with it
+            st, _, left = _req(port, "DELETE", seed_path)
+            assert st == 200 and [f["name"] for f in left["files"]] == [name]
+            assert _req(port, "GET", "/api/capture")[2]["session"] is None
+            gone = _frames(q, ("capture.state",), lambda kind, data: data["session"] is None)
+            assert gone and gone[-1][1] == {"session": None}
         finally:
             state.hub.unsubscribe(q)
-        st, _, left = _req(port, "DELETE", f"/api/tools/capture/files/{name}")
-        assert st == 200 and name not in [f["name"] for f in left["files"]] and SEED_CAPTURE in [f["name"] for f in left["files"]]
+        # discard leaves nothing open and forgets the packets
+        _req(port, "POST", "/api/capture/open", {"name": name})
+        assert _req(port, "POST", "/api/capture/discard", {})[2] == {"session": None}
+        empty = _req(port, "GET", "/api/capture")[2]
+        assert empty["session"] is None and _req(port, "GET", "/api/capture/packets")[2]["rows"] == []
+        assert [f["name"] for f in _req(port, "DELETE", f"/api/capture/files/{name}")[2]["files"]] == []
     finally:
+        state.capture_discard()
         state.capture_files = seeded
-        state.capture_job, state.capture_next_id = before
+        state.capture_session, state.capture_next_id = before
+
+
+def test_mock_capture_packet_list_is_filtered_and_paged_like_the_service(mock, monkeypatch):
+    """GET /api/capture/packets: the newest `limit` rows, the rows after `since` while the page tails, `dropped_before`
+    when the ring has already rolled past it (and `truncated` on the session), the ip / mac / proto filters (repeated and
+    comma separated, ORed among themselves and ANDed with the fields), and one packet's detail tree and hex dump."""
+    mod, state, port = mock.mod, mock.state, mock.port
+    seeded = [dict(f) for f in state.capture_files]
+    before = (state.capture_session, state.capture_next_id)
+    held = mod.CAPTURE_SEED_PACKETS
+    try:
+        opened = _req(port, "POST", "/api/capture/open", {"name": SEED_CAPTURE})[2]["session"]
+        assert (opened["packets"], opened["shown"], opened["truncated"]) == (held, held, False)
+        st, _, page = _req(port, "GET", "/api/capture/packets")
+        rows = page["rows"]
+        assert st == 200 and list(page) == list(mod.CAPTURE_PACKETS_KEYS)
+        assert [list(r) for r in rows] == [list(mod.CAPTURE_ROW_KEYS)] * len(rows)
+        assert (page["total"], page["shown"], page["matched"], page["dropped_before"]) == (held, held, held, False)
+        assert [r["no"] for r in rows] == list(range(1, held + 1)) and page["last"] == held
+        assert list(page["session"]) == list(mod.CAPTURE_SESSION_KEYS)
+        assert all(r["rel"] >= 0 and r["length"] > 0 for r in rows)
+        # limit: without `since` the newest rows, with it the oldest after it; both clamped, never refused
+        assert [r["no"] for r in _req(port, "GET", "/api/capture/packets?limit=5")[2]["rows"]] == [r["no"] for r in rows[-5:]]
+        assert len(_req(port, "GET", "/api/capture/packets?limit=0")[2]["rows"]) == 1
+        assert len(_req(port, "GET", "/api/capture/packets?limit=nonsense")[2]["rows"]) == held, "the default 500"
+        assert len(_req(port, "GET", f"/api/capture/packets?limit={mod.CAPTURE_MAX_ROW_LIMIT + 1000}")[2]["rows"]) == held
+        tail = _req(port, "GET", f"/api/capture/packets?since={rows[-3]['no']}")[2]
+        assert [r["no"] for r in tail["rows"]] == [r["no"] for r in rows[-2:]] and tail["dropped_before"] is False
+        assert _req(port, "GET", f"/api/capture/packets?since={rows[-1]['no']}")[2]["rows"] == []
+        assert [r["no"] for r in _req(port, "GET", f"/api/capture/packets?since={rows[0]['no']}&limit=2")[2]["rows"]] == [
+            r["no"] for r in rows[1:3]], "oldest first while tailing"
+        assert _req(port, "GET", "/api/capture/packets?since=99999")[2]["rows"] == []
+        # the filters: an address, a MAC in any spelling, and the protocol keys of the page's buttons
+        ip = mod.CAPTURE_PC["ip"]
+        mine = _req(port, "GET", f"/api/capture/packets?ip={ip}")[2]
+        wanted = [r["no"] for r in rows if ip in (r["src"], r["dst"])]
+        assert wanted and [r["no"] for r in mine["rows"]] == wanted and mine["matched"] == len(wanted)
+        assert (mine["total"], mine["shown"]) == (held, held), "the counts are the whole list's, not the filter's"
+        for spelling in (mod.CAPTURE_GATEWAY["mac"], mod.CAPTURE_GATEWAY["mac"].upper(), mod.CAPTURE_GATEWAY["mac"].replace(":", "-"),
+                         mod.CAPTURE_GATEWAY["mac"].replace(":", "")):
+            by_mac = _req(port, "GET", f"/api/capture/packets?mac={spelling}")[2]
+            wanted = [r["no"] for r in rows if mod.capture_norm_mac(mod.CAPTURE_GATEWAY["mac"]) in (
+                mod.capture_norm_mac(r["src_mac"]), mod.capture_norm_mac(r["dst_mac"]))]
+            assert wanted and [r["no"] for r in by_mac["rows"]] == wanted, spelling
+        icmp = [r["no"] for r in _req(port, "GET", "/api/capture/packets?proto=icmp")[2]["rows"]]
+        arp = [r["no"] for r in _req(port, "GET", "/api/capture/packets?proto=ARP")[2]["rows"]]
+        both = [r["no"] for r in _req(port, "GET", "/api/capture/packets?proto=icmp&proto=arp")[2]["rows"]]
+        comma = [r["no"] for r in _req(port, "GET", "/api/capture/packets?proto=icmp,arp")[2]["rows"]]
+        mixed = [r["no"] for r in _req(port, "GET", "/api/capture/packets?proto=icmp&proto=arp,nonsense")[2]["rows"]]
+        assert icmp and arp and both == comma == mixed == sorted(set(icmp) | set(arp))
+        assert {r["proto"] for r in _req(port, "GET", "/api/capture/packets?proto=icmp,arp")[2]["rows"]} <= {"ICMP", "ICMPv6", "ARP"}
+        # the three AND: the phone's SIP only
+        sip = _req(port, "GET", f"/api/capture/packets?proto=sip&ip={mod.CAPTURE_PHONE['ip']}")[2]["rows"]
+        assert sip and all(r["proto"] == "SIP" and mod.CAPTURE_PHONE["ip"] in (r["src"], r["dst"]) for r in sip)
+        assert len(sip) < len([r for r in rows if r["proto"] == "SIP"]) + 1
+        # a filter the service cannot read is ignored, never refused
+        loose = _req(port, "GET", "/api/capture/packets?ip=example.com&mac=nonsense&proto=nonsense")[2]
+        assert [r["no"] for r in loose["rows"]] == [r["no"] for r in rows]
+        # one packet: the detail tree and the hex dump of the bytes behind that row
+        st, _, detail = _req(port, "GET", f"/api/capture/packets/{rows[-1]['no']}")
+        assert st == 200 and list(detail) == list(mod.CAPTURE_DETAIL_KEYS) and detail["row"] == rows[-1]
+        assert [list(layer) for layer in detail["layers"]] == [list(mod.CAPTURE_LAYER_KEYS)] * len(detail["layers"])
+        assert all(list(f) == list(mod.CAPTURE_FIELD_KEYS) for layer in detail["layers"] for f in layer["fields"])
+        assert [layer["name"] for layer in detail["layers"]][:2] == ["Frame", "ETH"]
+        assert detail["bytes"] >= 60 and len(detail["hex"]) == -(-detail["bytes"] // 16)
+        assert re.fullmatch(r"0000  (?:[0-9a-f]{2} ){15}[0-9a-f]{2}   .{16}", detail["hex"][0]), detail["hex"][0]
+        st, _, gone = _req(port, "GET", f"/api/capture/packets/{held + 1}")
+        assert st == 404 and gone["error"] == {"code": "not_found", "message": mod.CAPTURE_PACKET_GONE_TEXT}
+        assert _req(port, "GET", "/api/capture/packets/nonsense")[2]["error"]["code"] == "not_found"
+        # a capture whose list rolls past what it holds: the session is truncated and a tail from before the hole is told
+        monkeypatch.setattr(mod, "CAPTURE_MAX_ROWS", 8)
+        with _knobs(state, capture_s=30.0):
+            assert _req(port, "POST", "/api/capture/start", {"adapter": "Ethernet"})[0] == 200
+            assert _until(lambda: state.capture_total > 20, timeout=15.0), "the fake capture invented no packets"
+            live = _req(port, "POST", "/api/capture/stop", {})[2]["session"]
+        assert (live["truncated"], live["shown"]) == (True, 8) and live["packets"] > 20
+        rolled = _req(port, "GET", "/api/capture/packets")[2]
+        assert [r["no"] for r in rolled["rows"]] == list(range(live["packets"] - 7, live["packets"] + 1))
+        assert (rolled["dropped_before"], rolled["total"], rolled["shown"]) == (False, live["packets"], 8)
+        assert rolled["session"]["truncated"] is True
+        hole = _req(port, "GET", "/api/capture/packets?since=1")[2]
+        assert hole["dropped_before"] is True and [r["no"] for r in hole["rows"]] == [r["no"] for r in rolled["rows"]]
+        assert _req(port, "GET", f"/api/capture/packets?since={rolled['rows'][0]['no'] - 1}")[2]["dropped_before"] is False
+        assert _req(port, "GET", f"/api/capture/packets/{rolled['rows'][0]['no'] - 1}")[0] == 404, "that packet rolled off"
+    finally:
+        state.capture_discard()
+        state.capture_files = seeded
+        state.capture_session, state.capture_next_id = before
+
+
+def test_mock_capture_finds_the_sip_call_and_rebuilds_its_audio(mock, monkeypatch):
+    """The scripted SIP call: one capture.sip while the capture runs, the call on GET /api/capture/calls with its
+    messages and its two RTP streams, and calls/{id}/audio a real WAV the page's player can play."""
+    mod, state, port = mock.mod, mock.state, mock.port
+    # the call's script, shortened so the capture is over in under two seconds
+    monkeypatch.setattr(mod, "CAPTURE_SIP_AT", {"invite": 0.2, "ringing": 0.3, "answer": 0.5, "ack": 0.55, "bye": 1.0, "byeok": 1.05})
+    seeded = [dict(f) for f in state.capture_files]
+    before = (state.capture_session, state.capture_next_id)
+    q = state.hub.subscribe()
+    try:
+        with _knobs(state, capture_s=1.8):
+            assert _req(port, "POST", "/api/capture/start", {"adapter": "Ethernet"})[0] == 200
+            frames = _frames(q, ("capture.sip", "capture.state"),
+                             lambda kind, data: kind == "capture.state" and (data["session"] or {}).get("state") == "stopped", timeout=15.0)
+        heard = [data["call"] for kind, data in frames if kind == "capture.sip"]
+        assert len(heard) == 1, "one capture.sip per call, however long it runs"
+        assert list(heard[0]) == list(mod.SIP_CALL_KEYS) and heard[0]["state"] in ("calling", "ringing")
+        st, _, answer = _req(port, "GET", "/api/capture/calls")
+        assert st == 200 and len(answer["calls"]) == 1
+        call = answer["calls"][0]
+        assert list(call) == list(mod.SIP_CALL_KEYS) and call["id"] == heard[0]["id"]
+        assert (call["from_uri"], call["to_uri"], call["state"], call["status"]) == (mod.CAPTURE_SIP_FROM, mod.CAPTURE_SIP_TO, "ended", 200)
+        assert call["answer_ts"] > call["start_ts"] and call["end_ts"] >= call["answer_ts"] and call["duration_s"] > 0
+        assert all(list(m) == list(mod.SIP_MESSAGE_KEYS) for m in call["messages"])
+        assert [m["method"] or m["status"] for m in call["messages"]] == ["INVITE", 180, 200, "ACK", "BYE", 200]
+        assert all(list(s) == list(mod.SIP_STREAM_KEYS) for s in call["streams"])
+        assert {(s["src"], s["sport"], s["dst"], s["dport"]) for s in call["streams"]} == {
+            (mod.CAPTURE_PHONE["ip"], mod.CAPTURE_SIP_RTP_PORTS[0], mod.CAPTURE_PBX["ip"], mod.CAPTURE_SIP_RTP_PORTS[1]),
+            (mod.CAPTURE_PBX["ip"], mod.CAPTURE_SIP_RTP_PORTS[1], mod.CAPTURE_PHONE["ip"], mod.CAPTURE_SIP_RTP_PORTS[0])}
+        assert all(s["codec"] == mod.CAPTURE_SIP_CODEC and s["decodable"] and s["packets"] > 0 for s in call["streams"])
+        assert _req(port, "GET", "/api/capture")[2]["session"]["calls"] == 1
+        assert _req(port, "GET", "/api/status")[2]["capture"]["calls"] == 1
+        # the audio: an 8 kHz 16-bit mono RIFF/WAVE the browser can play, sent like the service's FileResponse
+        st, headers, wav = _req(port, "GET", f"/api/capture/calls/{call['id']}/audio", raw=True)
+        assert st == 200 and wav[:4] == b"RIFF" and wav[8:12] == b"WAVE" and wav[12:16] == b"fmt "
+        assert struct.unpack("<I", wav[4:8])[0] == len(wav) - 8 and struct.unpack("<I", wav[40:44])[0] == len(wav) - 44
+        assert struct.unpack("<HHIIHH", wav[20:36]) == (1, 1, mod.CAPTURE_WAV_RATE, mod.CAPTURE_WAV_RATE * 2, 2, 16)
+        assert (headers["content-type"], int(headers["content-length"]), headers["x-content-type-options"]) == ("audio/wav", len(wav), "nosniff")
+        assert headers["content-disposition"].startswith('attachment; filename="TNT-call-') and headers["cache-control"] == "no-cache"
+        st, _, err = _req(port, "GET", "/api/capture/calls/no-such-call/audio")
+        assert st == 404 and err["error"] == {"code": "not_found", "message": mod.CAPTURE_NO_AUDIO_TEXT}
+        # the packet list holds the call's signalling and its RTP both ways
+        sip_rows = _req(port, "GET", "/api/capture/packets?proto=sip&limit=2000")[2]["rows"]
+        rtp_rows = _req(port, "GET", "/api/capture/packets?proto=rtp&limit=2000")[2]["rows"]
+        assert len(sip_rows) == 6 and len(rtp_rows) >= 2
+        assert [r["info"].split(":")[0] for r in sip_rows] == ["Request", "Status", "Status", "Request", "Request", "Status"]
+        assert {r["src"] for r in rtp_rows} == {mod.CAPTURE_PHONE["ip"], mod.CAPTURE_PBX["ip"]}
+        assert all(r["sport"] in mod.CAPTURE_SIP_RTP_PORTS for r in rtp_rows)
+        # every address it made up is a documentation one, every MAC locally administered
+        for row in _req(port, "GET", "/api/capture/packets?limit=2000")[2]["rows"]:
+            for value in (row["src"], row["dst"]):
+                assert value == "" or _documentation_address(value), value
+            for value in (row["src_mac"], row["dst_mac"]):
+                assert value == mod.CAPTURE_BROADCAST_MAC or int(value.split(":")[0], 16) & 0x02, value
+        assert _req(port, "POST", "/api/capture/discard", {})[2] == {"session": None}
+        assert _req(port, "GET", "/api/capture/calls")[2] == {"calls": []}
+    finally:
+        state.hub.unsubscribe(q)
+        state.capture_discard()
+        state.capture_files = seeded
+        state.capture_session, state.capture_next_id = before
+
+
+def _documentation_address(value: str) -> bool:
+    """True for the addresses a mock may invent: RFC 5737 / RFC 3849 documentation ranges, and the unspecified and
+    broadcast addresses of a DHCP exchange - never a real public address."""
+    import ipaddress
+
+    if value in ("0.0.0.0", "255.255.255.255"):
+        return True
+    address = ipaddress.ip_address(value)
+    nets = ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24", "2001:db8::/32")
+    return any(address in ipaddress.ip_network(net) for net in nets if address.version == ipaddress.ip_network(net).version)
 
 
 def _sse_until(resp: Any, want: str) -> List[Tuple[str, Any]]:
@@ -830,13 +1145,15 @@ def _sse_until(resp: Any, want: str) -> List[Tuple[str, Any]]:
             return got
 
 
-def test_mock_event_stream_sends_capture_state_to_administrators_only(mock):
-    """GET /api/events follows the service: capture.state (the capture job, which every capture route refuses to a standard
-    user) goes only to a Windows administrator (STATE.wifi_admin), every other event to everyone."""
+def test_mock_event_stream_sends_capture_events_to_administrators_only(mock):
+    """GET /api/events follows the service: capture.state (the open session) and capture.sip (a call the capture
+    rebuilt), which every capture route refuses to a standard user, go only to a Windows administrator
+    (STATE.wifi_admin); every other event goes to everyone."""
     from tnt.api import routes
     mod, state, port = mock.mod, mock.state, mock.port
-    assert mod.ADMIN_ONLY_EVENTS == routes.ADMIN_ONLY_EVENTS
-    job = {"capture": {"id": "sse-admin-test", "state": "capturing", "filters": {"host": "192.0.2.50", "port": 5060, "protocol": "udp"}}}
+    assert mod.ADMIN_ONLY_EVENTS == routes.ADMIN_ONLY_EVENTS == frozenset({"capture.state", "capture.sip"})
+    session = {"session": {"id": 4242, "state": "capturing", "source": "live", "packets": 12, "calls": 1}}
+    call = {"call": {"id": "sse-admin-test", "from_uri": "sip:2001@192.0.2.70", "to_uri": "sip:2002@192.0.2.70", "state": "ringing"}}
     for admin in (False, True):
         with _knobs(state, wifi_admin=admin):
             conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
@@ -844,13 +1161,15 @@ def test_mock_event_stream_sends_capture_state_to_administrators_only(mock):
                 conn.request("GET", "/api/events")
                 resp = conn.getresponse()
                 assert resp.status == 200 and _sse_until(resp, "hello")[-1][0] == "hello"
-                state.hub.publish("capture.state", job)
+                state.hub.publish("capture.state", session)
+                state.hub.publish("capture.sip", call)
                 state.hub.publish("test.sentinel", {"admin": admin})
                 seen = _sse_until(resp, "test.sentinel")
             finally:
                 conn.close()
-        mine = [data for kind, data in seen if kind == "capture.state" and (data.get("capture") or {}).get("id") == "sse-admin-test"]
-        assert mine == ([job] if admin else []), admin
+        mine = [data for kind, data in seen if kind == "capture.state" and (data.get("session") or {}).get("id") == 4242]
+        sip = [data for kind, data in seen if kind == "capture.sip" and (data.get("call") or {}).get("id") == "sse-admin-test"]
+        assert (mine, sip) == (([session], [call]) if admin else ([], [])), admin
 
 
 def test_mock_speed_tests_carry_quality(mock, monkeypatch):
@@ -941,8 +1260,10 @@ def test_mock_dns_lookups_of_one_record_type(mock):
 
 @pytest.mark.parametrize("method, path, body", [
     ("POST", "/api/netcheck/nat", {}), ("POST", "/api/netcheck/switch", {}), ("DELETE", "/api/netcheck/switch", None),
-    ("POST", "/api/netcheck/portforward", {"port": 8000}), ("POST", "/api/tools/capture", {"adapter": "Ethernet"}), ("DELETE", "/api/tools/capture", None),
-    ("GET", f"/api/tools/capture/files/{SEED_CAPTURE}", None), ("DELETE", f"/api/tools/capture/files/{SEED_CAPTURE}", None),
+    ("POST", "/api/netcheck/portforward", {"port": 8000}),
+    ("POST", "/api/capture/start", {"adapter": "Ethernet"}), ("POST", "/api/capture/stop", {}), ("POST", "/api/capture/save", {}),
+    ("POST", "/api/capture/discard", {}), ("POST", "/api/capture/open", {"name": SEED_CAPTURE}),
+    ("GET", f"/api/capture/files/{SEED_CAPTURE}", None), ("DELETE", f"/api/capture/files/{SEED_CAPTURE}", None),
     ("POST", "/api/tftp/start", {}), ("POST", "/api/tftp/stop", {}), ("POST", "/api/tftp/uploads", {"on": True}),
     ("PUT", "/api/tftp/settings", {"max_upload_mb": 1}),
 ])
@@ -953,7 +1274,8 @@ def test_mock_network_tools_refuse_a_page_of_another_origin_115(mock, method, pa
     def snapshot() -> Any:
         with state.lock:
             return json.dumps([state.nat_last, state.nat_running, state.switch_job, state.portcheck_last, state.portcheck_running, state.tftp_running,
-                               state.tftp_uploads, state.settings["tftp"], state.capture_job, [f["name"] for f in state.capture_files]], sort_keys=True)
+                               state.tftp_uploads, state.settings["tftp"], state.capture_session, state.capture_total,
+                               [f["name"] for f in state.capture_files]], sort_keys=True)
 
     before = snapshot()
     with _knobs(state, wifi_admin=False, portcheck_delay_s=0.0):
@@ -1034,8 +1356,8 @@ async function run() {
   const grid = doc.querySelector('#view .adapter-grid');
   const cells = Array.from(grid.children);
   const box = (el) => { const r = el.getBoundingClientRect(); return { left: Math.round(r.left), top: Math.round(r.top), width: Math.round(r.width) }; };
-  out.layout = { cells: cells.slice(0, 3).map((c) => c.className), columns: getComputedStyle(grid).gridTemplateColumns.split(' ').length,
-                 map: box(cells[0]), card: box(cells[1]), third: box(cells[2]),
+  out.layout = { cells: cells.slice(0, 4).map((c) => c.className), columns: getComputedStyle(grid).gridTemplateColumns.split(' ').length,
+                 map: box(cells[0]), throughput: box(cells[1]), card: box(cells[2]), third: box(cells[3]),
                  overflow: doc.documentElement.scrollWidth > doc.documentElement.clientWidth };
   const detailsBtn = nat.querySelector('.nc-details-btn');
   out.nat = { title: text(card.querySelector('.card-title')), titleIcon: !!card.querySelector('.card-title svg'),
@@ -1079,10 +1401,16 @@ def test_network_info_card_follows_the_link_map_and_checks_nat_by_itself_in_a_br
     with _knobs(state, nat_last=None, nat_delay_s=0.0, switch_job=None, switch_kept={}, portcheck_last=None):
         res = _run_probe(browser_page, mock, monkeypatch, "nat-probe.html", "ipinfo", _NAT_CARD_PROBE)
     lay = res["layout"]
-    assert "linkmap" in lay["cells"][0].split() and lay["cells"][1] == "card netcheck-card" and "adapter" in lay["cells"][2].split(), lay
+    # the live link map, then realtime throughput, then NAT & switch port, then the adapters
+    assert "linkmap" in lay["cells"][0].split() and lay["cells"][1] == "card tp-card", lay
+    assert lay["cells"][2] == "card netcheck-card" and "adapter" in lay["cells"][3].split(), lay
     assert lay["columns"] == 3 and lay["overflow"] is False, lay
-    assert lay["map"]["top"] == lay["card"]["top"] == lay["third"]["top"], lay
-    assert lay["map"]["left"] < lay["card"]["left"] < lay["third"]["left"] and abs(lay["card"]["width"] - lay["map"]["width"]) <= 1, lay
+    # three to a row, all the same width: the throughput card is one cell like the other two
+    assert lay["map"]["top"] == lay["throughput"]["top"] == lay["card"]["top"], lay
+    assert lay["map"]["left"] < lay["throughput"]["left"] < lay["card"]["left"], lay
+    assert abs(lay["card"]["width"] - lay["map"]["width"]) <= 1, lay
+    assert abs(lay["throughput"]["width"] - lay["map"]["width"]) <= 1, lay
+    assert lay["third"]["top"] > lay["map"]["top"] and lay["third"]["left"] == lay["map"]["left"], lay
     nat = res["nat"]
     title, explanation = mod.NAT_TEXT["single_nat"]
     assert (nat["title"], nat["titleIcon"], nat["sections"]) == ("NAT & switch port", False, ["NAT", "Switch port - LLDP"])
@@ -1224,14 +1552,16 @@ async function run() {
   const toggle = card.querySelector('.tool-head-right input[type="checkbox"]');
   const cardToggle = card.querySelector('.card-toggle');
   const tile = doc.getElementById('tile-tools');
-  const tftpLine = () => {
-    const l = Array.from(tile.querySelectorAll('.tile-line')).find((x) => x.textContent.indexOf('TFTP server ') === 0);
-    return l ? { text: l.textContent, badge: l.querySelector('.badge').className, title: l.title } : null;
+  // the half-height Tools tile: the DHCP server's line carries the TFTP server's badge, and the tool names are one line
+  const tftpBadge = () => {
+    const b = Array.from(tile.querySelectorAll('.tile-line .badge')).find((x) => x.textContent.indexOf('TFTP') === 0);
+    return b ? { text: b.textContent, badge: b.className, line: b.closest('.tile-line').textContent } : null;
   };
+  const names = () => { const l = tile.querySelector('.tile-line .tile-ellipsis'); return l ? { text: l.textContent, title: l.title } : null; };
   const boxes = () => texts(Array.from(card.querySelectorAll('.dhcp-info.bad')).filter((b) => !b.hidden));
-  await until(() => badge.textContent === 'error' && tftpLine(), 10000);
+  await until(() => badge.textContent === 'error' && tftpBadge(), 10000);
   out.error = { badge: badge.textContent, cls: badge.className, title: badge.title, checked: toggle.checked, expanded: cardToggle.getAttribute('aria-expanded'),
-                boxes: boxes(), tile: tftpLine() };
+                boxes: boxes(), tile: tftpBadge() };
   toggle.click();
   await until(() => badge.textContent === 'on' && card.querySelector('.tftp-files tbody tr'), 10000);
   out.on = { badge: badge.textContent, cls: badge.className, checked: toggle.checked, expanded: cardToggle.getAttribute('aria-expanded'), errorBoxes: boxes().length,
@@ -1239,21 +1569,21 @@ async function run() {
              folder: text(card.querySelector('.tftp-folder code')), note: text(card.querySelector('.tftp-uploads-note')),
              scopeMatches: text(card.querySelector('.tftp-scope')) === win.TNT.tools.tftp.TFTP_SCOPE_TEXT };
   out.toastsOn = texts(doc.querySelectorAll('#toasts .toast'));      // before the tile wait: a toast leaves after 3.2 s of the page's clock
-  out.tileOn = await until(() => { const l = tftpLine(); return l && l.text === 'TFTP server on' ? l : null; }, 20000);
+  out.tileOn = await until(() => { const b = tftpBadge(); return b && b.text === 'TFTP on' ? b : null; }, 20000);
   // "Allow uploads" while it serves: yellow on the card and on the Tools tile, then green again
   const uploads = () => card.querySelector('input[aria-label="Allow uploads"]');
   uploads().click();
   await until(() => badge.textContent === 'uploads on', 10000);
   out.uploads = { badge: badge.textContent, cls: badge.className, checked: uploads().checked, toasts: texts(doc.querySelectorAll('#toasts .toast')) };
-  out.tileUploads = await until(() => { const l = tftpLine(); return l && l.text === 'TFTP server uploads on' ? l : null; }, 20000);
+  out.tileUploads = await until(() => { const b = tftpBadge(); return b && b.text === 'TFTP uploads' ? b : null; }, 20000);
   uploads().click();
   await until(() => badge.textContent === 'on', 10000);
-  out.uploadsOff = { checked: uploads().checked, tile: await until(() => { const l = tftpLine(); return l && l.text === 'TFTP server on' ? l : null; }, 20000) };
+  out.uploadsOff = { checked: uploads().checked, tile: await until(() => { const b = tftpBadge(); return b && b.text === 'TFTP on' ? b : null; }, 20000) };
   toggle.click();
   await until(() => badge.textContent === 'off', 10000);
-  await until(() => !tftpLine(), 20000);
-  out.off = { badge: badge.textContent, cls: badge.className, checked: toggle.checked, tile: tftpLine(), summary: text(card.querySelector('.tftp-summary')),
-              names: texts(tile.querySelectorAll('.tile-tool')) };
+  await until(() => !tftpBadge(), 20000);
+  out.off = { badge: badge.textContent, cls: badge.className, checked: toggle.checked, tile: tftpBadge(), summary: text(card.querySelector('.tftp-summary')),
+              names: names(), lines: tile.querySelectorAll('.tile-line').length };
   out.server = await win.fetch('/api/tftp/status').then((r) => r.json()).then((s) => ({ running: s.running, error: s.error }));
 }
 """
@@ -1261,9 +1591,10 @@ async function run() {
 
 def test_tftp_card_on_and_off_and_its_tools_tile_line_in_a_browser(browser_page, mock, monkeypatch):
     """§9.7 / §10.1 as built: a server stopped by a network change shows a red "error" badge (the error as its title and in a red
-    box) and a red "TFTP server error" line on the Tools tile while it is off; switching it on opens the card, serves (green "on",
-    the files, the folder, the uploads note, the scope text) and the tile line turns green; "Allow uploads" turns the badge and the
-    tile line yellow ("uploads on") and back; switching it off clears the tile line."""
+    box) and a red "TFTP error" badge on the DHCP line of the half-height Tools tile while it is off; switching it on opens the
+    card, serves (green "on", the files, the folder, the uploads note, the scope text) and the tile badge turns green; "Allow
+    uploads" turns the card badge and the tile badge yellow and back; switching it off clears the tile badge. The tools
+    themselves are one ellipsized line of names there (Packet capture has its own tile now)."""
     mod, state = mock.mod, mock.state
     kept = (state.tftp_history, dict(state.tftp_counts), state.tftp_next_id)
     stopped = mod.TFTP_STOPPED_TEXT
@@ -1277,122 +1608,155 @@ def test_tftp_card_on_and_off_and_its_tools_tile_line_in_a_browser(browser_page,
             state.tftp_history, state.tftp_counts, state.tftp_next_id = kept[0], dict(kept[1]), kept[2]
     err = res["error"]
     assert (err["badge"], err["cls"], err["title"], err["checked"], err["expanded"], err["boxes"]) == ("error", "badge red", stopped, False, "false", [stopped])
-    assert err["tile"] == {"text": "TFTP server error", "badge": "badge red", "title": stopped}
+    assert (err["tile"]["text"], err["tile"]["badge"]) == ("TFTP error", "badge red")
+    assert err["tile"]["line"].startswith("DHCP server"), err["tile"]
     on = res["on"]
     assert (on["badge"], on["cls"], on["checked"], on["expanded"], on["errorBoxes"], on["scopeMatches"]) == ("on", "badge green", True, "true", 0, True)
     assert re.fullmatch(r"Serving on Ethernet · \d{1,3}(\.\d{1,3}){3} · on .+", on["summary"]), on["summary"]
     assert on["files"] == sorted(name for name, _size, _age in mod.TFTP_FILES)
     assert on["folder"].endswith("\\tftp") and on["note"] == "Anyone on this network can upload files while this is on"
-    assert res["tileOn"] == {"text": "TFTP server on", "badge": "badge green", "title": ""}
+    assert (res["tileOn"]["text"], res["tileOn"]["badge"]) == ("TFTP on", "badge green")
     assert "TFTP server is on" in res["toastsOn"]
     up = res["uploads"]
     assert (up["badge"], up["cls"], up["checked"]) == ("uploads on", "badge yellow", True) and "Uploads are on" in up["toasts"], up
-    assert res["tileUploads"] == {"text": "TFTP server uploads on", "badge": "badge yellow", "title": ""}
-    assert res["uploadsOff"] == {"checked": False, "tile": {"text": "TFTP server on", "badge": "badge green", "title": ""}}
+    assert (res["tileUploads"]["text"], res["tileUploads"]["badge"]) == ("TFTP uploads", "badge yellow")
+    assert res["uploadsOff"]["checked"] is False
+    assert (res["uploadsOff"]["tile"]["text"], res["uploadsOff"]["tile"]["badge"]) == ("TFTP on", "badge green")
     off = res["off"]
     assert (off["badge"], off["cls"], off["checked"], off["tile"], off["summary"]) == ("off", "badge grey", False, None, "Would serve on Ethernet")
-    assert off["names"] == ["LAN throughput", "Port forward", "Traceroute", "TFTP server", "Subnet calc", "DNS", "Packet capture", "WiFi passwords"]
+    # the tools on one ellipsized line, in the order of their cards; Packet capture is a page with its own tile now
+    names = ["LAN throughput", "Port forward check", "Traceroute", "TFTP server", "Subnet calc", "DNS", "WiFi passwords"]
+    assert off["names"] == {"text": " · ".join(names), "title": ", ".join(names)}
+    assert "Packet capture" not in off["names"]["text"] and off["lines"] == 2, "the half-height tile: one state line and the names"
     assert res["server"] == {"running": False, "error": None}
 
 
 _CAPTURE_ADMIN_PROBE = r"""
 async function run() {
-  const doc = await until(() => app() && app().querySelector('[data-tool="capture"] .capture-admin') && app(), 10000);
-  const card = doc.querySelector('[data-tool="capture"]');
-  await until(() => !card.querySelector('.capture-admin').hidden, 10000);
-  card.querySelector('.card-title').click();
-  out.admin = { text: text(card.querySelector('.capture-admin')), shown: shown(card.querySelector('.capture-admin')), main: shown(card.querySelector('.capture-main')),
-                expanded: card.querySelector('.card-toggle').getAttribute('aria-expanded'), toasts: texts(doc.querySelectorAll('#toasts .toast')) };
-  const r = await frame.contentWindow.fetch('/api/tools/capture');
+  const doc = await until(() => app() && app().querySelector('#view > .dhcp-info.warn') && app(), 10000);
+  const note = doc.querySelector('#view > .dhcp-info.warn');
+  await until(() => shown(note), 10000);
+  out.admin = { text: text(note), shown: shown(note), main: shown(doc.querySelector('#view .cap-controls')),
+                heading: text(doc.querySelector('#view .section-head h2')), toasts: texts(doc.querySelectorAll('#toasts .toast')) };
+  const r = await frame.contentWindow.fetch('/api/capture');
   out.status = { code: r.status, body: await r.json() };
 }
 """
 
 _CAPTURE_RUN_PROBE = r"""
 async function run() {
-  const doc = await until(() => app() && app().querySelector('[data-tool="capture"] .capture-table tbody tr') && app(), 10000);
+  const doc = await until(() => app() && app().querySelector('#view .cap-controls select[aria-label="Adapter"]') && app(), 10000);
   const win = frame.contentWindow;
-  const card = doc.querySelector('[data-tool="capture"]');
-  card.querySelector('.card-title').click();
-  const q = (s) => card.querySelector(s);
-  const adapter = q('select[aria-label="Adapter"]'), duration = q('select[aria-label="Duration"]'), size = q('select[aria-label="File size limit"]');
-  const protocol = q('select[aria-label="Protocol"]'), host = q('input[aria-label="Host (optional)"]'), port = q('input[aria-label="Port (optional)"]');
-  const start = q('.capture-actions .btn-primary');
-  const stop = Array.from(card.querySelectorAll('.capture-actions button')).find((b) => b.textContent === 'Stop and save');
-  const rows = () => Array.from(card.querySelectorAll('.capture-table tbody tr')).map((tr) => texts(Array.from(tr.children).slice(0, 3)));
-  out.form = { adapters: texts(adapter.options), durations: texts(duration.options), duration: duration.value, sizes: texts(size.options), size: size.value,
-               protocols: texts(protocol.options),
-               packets: Array.from(card.querySelectorAll('.capture-actions .seg button')).map((b) => [b.textContent, b.getAttribute('aria-selected'), b.title]),
-               warningMatches: text(q('.capture-warning')) === win.TNT.tools.capture.WARNING_TEXT, stopShown: shown(stop), files: rows() };
-  protocol.value = 'icmp';
-  fire(protocol, 'change');
-  out.icmpPortDisabled = port.disabled;
-  protocol.value = '';
-  fire(protocol, 'change');
-  out.portEnabledAgain = !port.disabled;
-  host.value = 'not an address';
+  const q = (s) => doc.querySelector('#view ' + s);
+  const adapter = q('select[aria-label="Adapter"]'), seconds = q('select[aria-label="Stop after"]'), size = q('select[aria-label="Size limit"]');
+  const start = q('.cap-buttons .btn-primary');
+  const buttons = () => texts(Array.from(doc.querySelectorAll('#view .cap-buttons button')).filter((b) => shown(b)));
+  const rows = () => Array.from(doc.querySelectorAll('#view .cap-table tbody tr')).map((tr) => texts(tr.children));
+  const status = () => text(q('.cap-status')) || '';
+  await until(() => seconds.options.length && adapter.options.length, 10000);
+  out.form = { adapters: texts(adapter.options), seconds: texts(seconds.options), secondsValue: seconds.value, sizes: texts(size.options),
+               sizeValue: size.value, buttons: buttons(), columns: texts(doc.querySelectorAll('#view .cap-table thead th')),
+               protos: Array.from(doc.querySelectorAll('#view .cap-proto')).map((b) => [b.textContent, b.getAttribute('aria-pressed')]),
+               warningMatches: text(q('.cap-warning')) === win.TNT.views.capture.WARNING_TEXT,
+               callsShown: shown(q('.cap-calls-btn')), status: status(), empty: text(q('.cap-empty')), rows: rows().length };
   start.click();
-  out.invalid = { text: text(q('.capture-invalid')), shown: shown(q('.capture-invalid')), ariaInvalid: host.getAttribute('aria-invalid') };
-  host.value = '';
-  fire(host, 'input');
-  out.invalidCleared = !shown(q('.capture-invalid'));
-  duration.value = '10';
-  start.click();
-  await until(() => shown(q('.capture-progress')), 5000);
-  out.running = { label: text(q('.capture-progress .fuse-label .l')), stopShown: shown(stop), startShown: shown(start), adapterDisabled: adapter.disabled };
-  await realWait(900);
-  await until(() => q('.capture-main > .tool-summary.ok') && rows().length === 2, 20000);
-  out.done = { result: text(q('.capture-main > .tool-summary.ok')), files: rows(), progress: shown(q('.capture-progress')), startShown: shown(start),
-               toasts: texts(doc.querySelectorAll('#toasts .toast')) };
-  // the download is this page's own origin (the service refuses a page of another origin)
-  const url = win.TNT.api.captureFileUrl(out.done.files[0][0]);
-  const r = await win.fetch(url);
-  const bytes = new Uint8Array(await r.arrayBuffer());
-  out.download = { url, status: r.status, magic: Array.from(bytes.slice(0, 4)), length: bytes.length, disposition: r.headers.get('content-disposition') };
+  await until(() => status().indexOf('Capturing on') === 0, 10000);
+  out.started = { status: status(), buttons: buttons(), adapterDisabled: adapter.disabled, secondsDisabled: seconds.disabled };
+  await realWait(2400);                                      // the mock's capture runs its time and its scripted SIP call
+  await until(() => status().indexOf('Stopped') === 0 && rows().length > 5, 20000);
+  out.captured = { status: status(), buttons: buttons(), rows: rows().length, counts: text(q('.cap-filters .muted.small')),
+                   protos: Array.from(new Set(rows().map((r) => r[5]))).sort(), first: rows()[0], adapterDisabled: adapter.disabled };
+  // the SIP calls filter: the list narrows to the call's signalling and the "Show calls" button appears
+  const sip = Array.from(doc.querySelectorAll('#view .cap-proto')).find((b) => b.textContent.indexOf('SIP calls') >= 0);
+  sip.click();
+  await until(() => { const r = rows(); return r.length && r.every((c) => c[5] === 'SIP'); }, 10000);
+  out.sip = { pressed: sip.getAttribute('aria-pressed'), on: sip.classList.contains('on'), rows: rows().length,
+              protos: Array.from(new Set(rows().map((r) => r[5]))), infos: rows().map((r) => r[7].split(':')[0]),
+              counts: text(q('.cap-filters .muted.small')), calls: text(q('.cap-calls-btn')), callsShown: shown(q('.cap-calls-btn')) };
+  // a row opens the packet detail window: the layer tree over the hex dump
+  doc.querySelector('#view .cap-table tbody tr').click();
+  const detail = await until(() => doc.querySelector('#modal-root .modal .cap-detail'), 10000);
+  const modal = detail.closest('.modal');
+  out.detail = { title: text(modal.querySelector('.modal-head h2')), head: text(detail.querySelector('.cap-detail-head')),
+                 layers: texts(detail.querySelectorAll('.cap-layer > summary .strong')),
+                 fields: texts(detail.querySelectorAll('.cap-layer .cap-field-name')).slice(0, 3),
+                 hex: (text(detail.querySelector('.cap-hex')) || '').split('\n')[0], hexLines: (text(detail.querySelector('.cap-hex')) || '').split('\n').length };
+  modal.querySelector('.modal-head button').click();
+  await until(() => !doc.querySelector('#modal-root .modal'), 5000);
+  // "Show calls (1)" opens the calls the capture rebuilt, each with its own player
+  q('.cap-calls-btn').click();
+  const calls = await until(() => doc.querySelector('#modal-root .modal .cap-calls'), 10000);
+  out.calls = { title: text(calls.closest('.modal').querySelector('.modal-head h2')),
+                rows: Array.from(calls.querySelectorAll('.cap-call')).map((c) => [text(c.querySelector('.badge')), c.querySelector('.badge').className,
+                                                                                  text(c.querySelector('.cap-call-title')), text(c.querySelector('.cap-call-meta'))]),
+                buttons: texts(calls.querySelectorAll('.cap-call-actions button')) };
+  out.session = await win.fetch('/api/capture').then((r) => r.json()).then((s) => ({ state: s.session.state, source: s.session.source,
+    stop: s.session.stop_reason, saved: s.session.saved, calls: s.session.calls, packets: s.session.packets, adapter: s.session.adapter.name }));
 }
 """
 
 
-def test_packet_capture_card_needs_an_administrator_then_captures_in_a_browser(browser_page, mock, monkeypatch):
-    """§8.8: a standard user's 403 admin_required shows the note instead of the form (no toast); an administrator gets the form
-    (durations, sizes, protocols, Full packets / First 128 bytes, the warning), ICMP disables Port, a bad host is caught on the page,
-    and a capture runs (fuse, Stop and save) and is listed first with its packet count, downloadable from the page's own origin."""
+def test_packet_capture_page_needs_an_administrator_then_captures_in_a_browser(browser_page, mock, monkeypatch):
+    """§8.8 as built: the Packet capture page. A standard user's 403 admin_required shows the note instead of the page (no
+    toast); an administrator gets the controls the service's limits filled in, Start captures on the picked adapter (the
+    buttons change, the selects lock) and the rows arrive in the list; the SIP calls filter narrows the list to the call's
+    signalling and reveals "Show calls (1)", which lists the rebuilt call; a row opens the packet detail window with its
+    layer tree and hex dump."""
     mod, state = mock.mod, mock.state
     seeded = [dict(f) for f in state.capture_files]
-    before = (state.capture_job, state.capture_next_id)
+    before = (state.capture_session, state.capture_next_id)
+    # the scripted call, shortened so the whole capture is over inside the probe's wait
+    monkeypatch.setattr(mod, "CAPTURE_SIP_AT", {"invite": 0.2, "ringing": 0.3, "answer": 0.5, "ack": 0.55, "bye": 1.0, "byeok": 1.05})
     try:
         with _knobs(state, wifi_admin=False):
-            admin = _run_probe(browser_page, mock, monkeypatch, "capture-admin-probe.html", "tools", _CAPTURE_ADMIN_PROBE)
-        with _knobs(state, wifi_admin=True, capture_s=0.3, pktmon_reason=None, switch_job=None):
-            res = _run_probe(browser_page, mock, monkeypatch, "capture-probe.html", "tools", _CAPTURE_RUN_PROBE, budget_ms=30000)
+            admin = _run_probe(browser_page, mock, monkeypatch, "capture-admin-probe.html", "capture", _CAPTURE_ADMIN_PROBE)
+        with _knobs(state, wifi_admin=True, capture_s=1.8, capture_reason=None, capture_session=None):
+            res = _run_probe(browser_page, mock, monkeypatch, "capture-probe.html", "capture", _CAPTURE_RUN_PROBE, budget_ms=30000)
     finally:
-        _until(lambda: (state.capture_job or {}).get("state") not in ("starting", "capturing", "converting"), timeout=5.0)
+        state.capture_discard()
         state.capture_files = seeded
-        state.capture_job, state.capture_next_id = before
-    assert admin["admin"] == {"text": "Packet capture needs a Windows administrator account", "shown": True, "main": False, "expanded": "true", "toasts": []}
+        state.capture_session, state.capture_next_id = before
+    assert admin["admin"] == {"text": "Packet capture needs a Windows administrator account", "shown": True, "main": False,
+                              "heading": "Packet capture", "toasts": []}
     assert admin["status"] == {"code": 403, "body": {"error": {"code": "admin_required", "message": mod.CAPTURE_ADMIN_REQUIRED_MSG}}}
     f = res["form"]
     assert f["adapters"] == ["Ethernet", "Ethernet 2", "Ethernet 3"]
-    assert (f["durations"], f["duration"]) == (["10 s", "30 s", "1 min", "5 min", "15 min"], "60")
-    assert (f["sizes"], f["size"]) == ([f"{mb} MB" for mb in mod.CAPTURE_SIZES_MB], "128")
-    assert f["protocols"] == ["Any", "TCP", "UDP", "ICMP"]
-    assert f["packets"] == [["Full packets", "true", ""],
-                            ["First 128 bytes", "false", "Mostly headers, but the start of unencrypted data (such as FTP or SNMP passwords) can still be in it"]]
-    assert f["warningMatches"] is True and f["stopShown"] is False
-    assert [row[0] for row in f["files"]] == [SEED_CAPTURE] and f["files"][0][2] == "1"
-    assert (res["icmpPortDisabled"], res["portEnabledAgain"]) == (True, True)
-    assert res["invalid"] == {"text": "host must be an IP address", "shown": True, "ariaInvalid": "true"} and res["invalidCleared"] is True
-    running = res["running"]
-    assert re.fullmatch(r"Capturing… 0:0\d of 0:10", running["label"] or ""), running
-    assert (running["stopShown"], running["startShown"], running["adapterDisabled"]) == (True, False, True), running
-    done = res["done"]
-    name = done["files"][0][0]
-    assert re.fullmatch(r"TNT-capture-\d{8}-\d{6}\.pcapng", name) and name != SEED_CAPTURE
-    assert [row[0] for row in done["files"]] == [name, SEED_CAPTURE] and [row[2] for row in done["files"]] == ["1", "1"]
-    assert (done["result"], done["progress"], done["startShown"]) == (f"Saved {name}", False, True)
-    assert f"Capture saved: {name}" in done["toasts"]
-    assert res["download"] == {"url": f"/api/tools/capture/files/{name}", "status": 200, "magic": [10, 13, 13, 10], "length": len(mod.tiny_pcapng(0.0)),
-                               "disposition": f'attachment; filename="{name}"'}
+    assert (f["seconds"], f["secondsValue"]) == (["1 min", "5 min", "15 min", "30 min", "60 min"], str(mod.CAPTURE_DEFAULT_SECONDS))
+    assert (f["sizes"], f["sizeValue"]) == ([f"{mb} MB" for mb in mod.CAPTURE_SIZES_MB], str(mod.CAPTURE_DEFAULT_MB))
+    assert f["buttons"] == ["Start", "Open…"] and f["warningMatches"] is True and f["callsShown"] is False
+    assert f["columns"] == ["No.", "Time", "Since start", "Source", "Destination", "Protocol", "Length", "Info"]
+    assert [label for label, _pressed in f["protos"]] == ["ICMP", "ARP", "DNS", "DHCP", "HTTP", "HTTPS", "TCP", "UDP", "RTSP", "RTP", "SIP calls"]
+    assert {pressed for _label, pressed in f["protos"]} == {"false"} and f["rows"] == 0
+    assert (f["status"], f["empty"]) == ("Not capturing", "Pick an adapter and hit Start, or open a capture you saved earlier.")
+    started = res["started"]
+    # the label ("Capturing on <adapter> · m:ss") and the detail ("<n> packets · <size>") share the line
+    assert re.fullmatch(r"Capturing on Ethernet · \d+:\d\d[\d,]* packets?(?: · .+)?", started["status"]), started["status"]
+    assert started["buttons"] == ["Stop", "Save to disk", "Open…", "Discard"] and started["adapterDisabled"] is True
+    assert started["secondsDisabled"] is True
+    cap = res["captured"]
+    assert cap["status"].startswith("Stopped — not saved yet (it reached its time limit)"), cap["status"]
+    assert cap["buttons"] == ["Start", "Save to disk", "Open…", "Discard"] and cap["adapterDisabled"] is False
+    assert cap["rows"] > 5 and re.fullmatch(r"[\d,]+ packets", cap["counts"] or ""), cap["counts"]
+    assert {"SIP", "RTP"} <= set(cap["protos"]), cap["protos"]
+    assert re.fullmatch(r"\d\d:\d\d:\d\d\.\d{3}", cap["first"][1]) and re.fullmatch(r"\d+\.\d{3}", cap["first"][2]), cap["first"]
+    sip = res["sip"]
+    assert (sip["pressed"], sip["on"], sip["protos"]) == ("true", True, ["SIP"])
+    assert sip["rows"] == 6 and sip["infos"] == ["Request", "Status", "Status", "Request", "Request", "Status"]
+    assert sip["counts"] == f"6 matching · {cap['counts'].split(' ')[0]} captured", sip["counts"]
+    assert (sip["calls"], sip["callsShown"]) == ("Show calls (1)", True)
+    d = res["detail"]
+    assert d["title"] == f"SIP — {mod.CAPTURE_PHONE['ip']} → {mod.CAPTURE_PBX['ip']}", d["title"]
+    assert d["layers"] == ["Frame", "ETH", "IPv4", "UDP", "SIP"] and d["fields"] == ["Arrival time", "Epoch time", "Captured length"]
+    assert re.match(r"^Packet \d+\d\d:\d\d:\d\d\.\d{3} · \+\d+\.\d{3} s · \d+ bytes$", d["head"] or ""), d["head"]
+    assert re.fullmatch(r"0000  (?:[0-9a-f]{2} ){15}[0-9a-f]{2}   .{16}", d["hex"]) and d["hexLines"] > 4
+    calls = res["calls"]
+    assert calls["title"] == "SIP calls" and calls["buttons"] == ["Listen"]
+    assert calls["rows"] == [["ended", "badge grey", f"{mod.CAPTURE_SIP_FROM} → {mod.CAPTURE_SIP_TO}",
+                              calls["rows"][0][3]]], calls["rows"]
+    assert re.fullmatch(r"Started \d\d:\d\d:\d\d\.\d{3} · 0:0\d · PCMU/8000", calls["rows"][0][3]), calls["rows"][0][3]
+    assert res["session"] == {"state": "stopped", "source": "live", "stop": "seconds", "saved": False, "calls": 1,
+                              "packets": res["session"]["packets"], "adapter": "Ethernet"}
+    assert res["session"]["packets"] > 5
 
 
 _DNS_TYPES_PROBE = r"""
@@ -1479,9 +1843,9 @@ async function run() {
 
 def test_latency_under_load_card_states_in_a_browser(browser_page, mock, monkeypatch):
     """§6.5: the card between Latest result and History. A graded test shows the grade chip (A+ / A / B green), the headline with
-    both directions, the grade text, the call quality idle and busy, the Zoom / Teams chips with the service's detail and the
-    details line; a result without the measurement, an unavailable one, a failed test and no test yet show a grey "—" and their
-    text."""
+    both directions, the grade text and the details line; a result without the measurement, an unavailable one, a failed test and
+    no test yet show a grey "—" and their text. The call-quality lines and the Zoom / Teams chips are not here any more: they
+    moved to the SIP page, which is where somebody asking about calls is looking (tests/test_ui_sip.py)."""
     import math
 
     mod, state = mock.mod, mock.state
@@ -1507,24 +1871,19 @@ def test_latency_under_load_card_states_in_a_browser(browser_page, mock, monkeyp
         return ("0" if v == 0 else f"{v:.2f}" if v < 0.1 else f"{v:.1f}" if v < 10 else str(js_round(v))) + "%"
 
     q = row["quality"]
-    bb, call = q["bufferbloat"], q["call"]
+    bb = q["bufferbloat"]
     base_w, down, up = q["windows"]["baseline"], q["windows"]["download"], q["windows"]["upload"]
-    checks = [[{"zoom": "Zoom", "teams": "Teams"}[c["key"]] + (" ✓" if c["ok"] else " ✗"), "badge " + ("green" if c["ok"] else "red"), c["detail"] or ""]
-              for c in call["checks"]]
     lines = [["strong quality-headline", f"Latency under load +{js_round(bb['increase_ms'])} ms (download +{js_round(down['increase_ms'])} ms, "
                                          f"upload +{js_round(up['increase_ms'])} ms)"],
              ["", bb["text"]]]
     if bb["warning"]:
         lines.append(["muted small quality-warning", bb["warning"]])
-    lines.append(["quality-call", f"Call quality: {call['idle']['label']} (MOS {call['idle']['mos']:.2f}, estimate)"])
-    if call["loaded"]:
-        lines.append(["quality-call", f"While the line is busy: {call['loaded']['label']} (MOS {call['loaded']['mos']:.2f})"])
-    lines.append(["row quality-checks", "".join(c[0] for c in checks)])
     lines.append(["muted small quality-details", f"Idle {fmt_ms(base_w['median_ms'])} ms to {q['target']} · busy {fmt_ms(down['mean_ms'])} / "
                                                  f"{fmt_ms(up['mean_ms'])} ms · loss {fmt_pct(down['loss_pct'])} / {fmt_pct(up['loss_pct'])} · "
                                                  f"{down['sent']} / {up['sent']} probes"])
     colour = {"A+": "green", "A": "green", "B": "green", "C": "yellow", "D": "red", "F": "red"}[bb["grade"]]
-    measured = {"chip": bb["grade"], "cls": f"grade-chip {colour}", "title": f"Bufferbloat grade {bb['grade']}", "lines": lines, "checks": checks}
+    measured = {"chip": bb["grade"], "cls": f"grade-chip {colour}", "title": f"Bufferbloat grade {bb['grade']}", "lines": lines,
+                "checks": []}
     assert res["cards"] == ["Latest result", "Latency under load", "History", "Patterns"]
     assert res["measured"] == measured and res["again"] == measured
     grey = {"chip": "—", "cls": "grade-chip grey", "title": "", "checks": []}
@@ -1584,13 +1943,15 @@ def test_latency_under_load_css_block_uses_tokens_only():
 
 
 def test_tftp_capture_and_dns_type_rules_sit_in_the_tools_css_section():
-    """§10.4 / §1.8: every TFTP, capture and DNS record-type rule sits inside the tools section (the comment prefix tests/test_ui.py
-    slices on), before the easter egg, and that section uses no colour function and none of grid-column, :has(, @container or
-    nth-child(odd) (tests/test_ui.py already refuses hex colours there)."""
+    """§10.4 / §1.8: every TFTP, packet capture (the page's own .cap- rules) and DNS record-type rule sits inside the tools
+    section (the comment prefix tests/test_ui.py slices on), before the easter egg, and that section uses no colour function and none
+    of grid-column, :has(, @container or nth-child(odd) (tests/test_ui.py already refuses hex colours there).
+    The old card's .capture- rules went with the card: none may come back."""
     css = _read("css/tnt.css")
     start, end = css.index("tools: traceroute, LAN throughput, subnet calculator"), css.index("/* ---------- easter egg")
     code = re.sub(r"/\*.*?\*/", lambda m: " " * len(m.group(0)), css, flags=re.S)      # comments blanked, offsets kept
-    for pattern in (r"\.tftp-", r"\.capture-", r"\.dns-(?:type|values?|hint)\b"):
+    assert not re.search(r"\.capture-", code), "the deleted Packet capture card's .capture- rules are back"
+    for pattern in (r"\.tftp-", r"\.cap-", r"\.dns-(?:type|values?|hint)\b"):
         at = [m.start() for m in re.finditer(pattern, code)]
         assert at and all(start <= p < end for p in at), (pattern, "rules outside the tools section", [p for p in at if not start <= p < end])
     tools = code[start:end]
@@ -1602,8 +1963,8 @@ def test_tftp_capture_and_dns_type_rules_sit_in_the_tools_css_section():
 def test_shared_ui_wiring_keeps_the_contract():
     """§10.1-§10.3 and §5.1, which the browser tests cannot see (they refuse the event stream, and a missing icon falls back to
     another one silently): the api.js wrappers with their paths, methods and timeouts, the new KNOWN_EVENTS lines (every event the
-    new cards listen to is one of them), the two icons and every icon name the new cards use, the tftp.state merge into the Tools
-    tile, the Tools card entries and ctx.open, and the Network info card made before the first render and placed after the map."""
+    new cards and the capture page listen to is one of them), the icons they use, the tftp.state merge into the Tools tile, the
+    Tools card entries and ctx.open, and the Network info card made before the first render and placed after the map."""
     api = _read("js/api.js")
     for s in ("natGet: () => api.get('/netcheck/nat'),", "natRun: () => api.post('/netcheck/nat', {}, { timeout: 45000 }),",
               "switchGet: () => api.get('/netcheck/switch'),", "switchStart: (body) => api.post('/netcheck/switch', body || {}),",
@@ -1612,32 +1973,46 @@ def test_shared_ui_wiring_keeps_the_contract():
               "tftpStatus: () => api.get('/tftp/status'),", "tftpStart: (body) => api.post('/tftp/start', body || {}, { timeout: 20000 }),",
               "tftpStop: () => api.post('/tftp/stop'),", "tftpUploads: (on) => api.post('/tftp/uploads', { on: !!on }),",
               "tftpSettings: (patch) => api.put('/tftp/settings', patch || {}),", "tftpFiles: () => api.get('/tftp/files'),",
-              "captureGet: () => api.get('/tools/capture'),", "captureStart: (body) => api.post('/tools/capture', body || {}, { timeout: 20000 }),",
-              "captureStop: () => api.del('/tools/capture'),",
-              "captureDeleteFile: (name) => api.del('/tools/capture/files/' + encodeURIComponent(name)),",
-              "captureFileUrl: (name) => BASE + '/tools/capture/files/' + encodeURIComponent(name),"):   # a URL only: no request
+              # the packet capture page: its own routes, and two URLs the page hands to a download link and an <audio>
+              "captureGet: () => api.get('/capture'),", "captureStart: (body) => api.post('/capture/start', body || {}, { timeout: 20000 }),",
+              "captureStop: () => api.post('/capture/stop', {}, { timeout: 20000 }),",
+              "captureSave: () => api.post('/capture/save', {}, { timeout: 30000 }),",
+              "captureDiscard: () => api.post('/capture/discard', {}),",
+              "captureOpen: (name) => api.post('/capture/open', { name }, { timeout: 60000 }),",
+              # any capture file on this PC, by its full path: a bigger timeout, because it may be a 4 GB one
+              "captureOpenPath: (path) => api.post('/capture/open', { path }, { timeout: 120000 }),",
+              "capturePackets: (q) => api.get('/capture/packets' + captureQuery(q)),",
+              "capturePacket: (no) => api.get('/capture/packets/' + encodeURIComponent(no)),",
+              "captureCalls: () => api.get('/capture/calls'),",
+              "captureCallAudioUrl: (id) => BASE + '/capture/calls/' + encodeURIComponent(id) + '/audio',",
+              "captureDeleteFile: (name) => api.del('/capture/files/' + encodeURIComponent(name)),",
+              "captureFileUrl: (name) => BASE + '/capture/files/' + encodeURIComponent(name),",   # a URL only: no request
+              "api.captureQuery = captureQuery;"):
         assert s in api, s
+    assert "'/tools/capture" not in api, "the capture routes moved out of /tools"
+    assert not (UI / "js" / "tools" / "capture.js").exists(), "the Packet capture card became js/views/capture.js"
     at = api.index("const KNOWN_EVENTS = [")
     events = api[at:api.index("];", at)]
     lines = [ln.strip() for ln in events.splitlines()[1:] if ln.strip()]
-    assert "'dhcp.state', 'dhcp.lease', 'dhcp.scan', 'map.sample', 'geoip.state'," in lines, "the pinned line is unchanged"
+    assert "'dhcp.state', 'dhcp.lease', 'dhcp.scan', 'map.sample', 'throughput.sample', 'geoip.state'," in lines, "the pinned line is unchanged"
     report = lines.index("'report.progress', 'report.saved', 'report.deleted', 'report.updated',")
-    assert lines[report + 1:] == ["'netcheck.switch',", "'tftp.state', 'tftp.transfer',", "'capture.state',"], lines[report:]
+    assert lines[report + 1:] == ["'netcheck.switch',", "'tftp.state', 'tftp.transfer',", "'capture.state', 'capture.sip',"], lines[report:]
     known = set(re.findall(r"'([\w.]+)'", events))
     for rel, heard in (("js/netcheck.js", {"netcheck.switch", "hello"}), ("js/tools/tftp.js", {"tftp.state", "tftp.transfer", "hello"}),
-                       ("js/tools/capture.js", {"capture.state", "hello"})):
+                       ("js/views/capture.js", {"capture.state", "capture.sip", "hello"})):
         found = set(re.findall(r"TNT\.api\.events\.on\('([\w.]+)'", _read(rel)))
         assert found == heard and found <= known, (rel, sorted(found), sorted(found - known))
 
     app = _read("js/app.js")
     icons = app[app.index("const ICONS = {"):app.index("TNT.icons = {")]
     names = set(re.findall(r"^    '?([\w-]+)'?\s*:", icons, re.M))
-    assert {"tftp", "capture"} <= names and "natcheck" not in names
-    for name in ("tftp", "capture"):
-        comment = icons[:icons.index(f"\n    {name}: '<svg ")].splitlines()[-1]
-        assert re.match(r"^    // .+: the .+ card", comment), (name, comment)          # // picture: where
+    assert {"tftp", "capture", "phone"} <= names and "natcheck" not in names
+    # every icon the new cards and the capture page brought carries a "// picture: where" comment of its own
+    described = [c for c in re.findall(r"^    // (.+)$", icons, re.M) if ": the " in c]
+    for what in ("the TFTP server card", "the Packet capture", "the SIP calls"):
+        assert any(what in c for c in described), (what, described)
     used = set()
-    for rel in ("js/netcheck.js", "js/tools/tftp.js", "js/tools/capture.js", "js/tools/dns.js", "js/views/speed.js"):
+    for rel in ("js/netcheck.js", "js/tools/tftp.js", "js/views/capture.js", "js/tools/dns.js", "js/views/speed.js"):
         used |= set(re.findall(r"\bicon\('([\w-]+)'", _read(rel)))
     tools = _read("js/views/tools.js")
     cards_at = tools.index("const EXTRA_CARDS = [")
@@ -1649,22 +2024,39 @@ def test_shared_ui_wiring_keeps_the_contract():
                  "renderTiles(); } });")
     assert app.index("ev.on(", dhcp_at + 1) == app.index(tftp_line), "the tftp.state merge comes right after dhcp.state"
 
-    assert re.findall(r"\{ key: '(\w+)'", cards) == ["lan", "portforward", "traceroute", "tftp", "subnet", "dns", "capture", "wifi"]
-    assert "const CARD_ORDER = ['lan', 'portforward', 'traceroute', 'dhcp', 'tftp', 'subnet', 'dns', 'capture', 'wifi'];" in tools
+    assert re.findall(r"\{ key: '(\w+)'", cards) == ["lan", "portforward", "traceroute", "tftp", "subnet", "dns", "wifi"]
+    assert "const CARD_ORDER = ['lan', 'portforward', 'traceroute', 'dhcp', 'tftp', 'subnet', 'dns', 'wifi'];" in tools
+    assert "capture" not in cards and "TNT.tools.capture" not in tools, "Packet capture is a page of its own now"
     for s in ("{ key: 'tftp', title: 'TFTP server', icon: 'tftp', create: (ctx) => TNT.tools.tftp.create(ctx) },",
-              "{ key: 'portforward', title: 'Port forward', icon: 'target', create: (ctx) => TNT.tools.portforward.create(ctx) },",
-              "{ key: 'capture', title: 'Packet capture', icon: 'capture', create: () => TNT.tools.capture.create() },",
+              "{ key: 'portforward', title: 'Port forward check', icon: 'target', create: (ctx) => TNT.tools.portforward.create(ctx) },",
               "try { mod = c.create({ open: () => openCard(c.key) }); }"):
         assert s in tools, s
+    # the page itself: its own view, its own tile, loaded like the other views
+    index = _read("index.html")
+    assert '<script src="js/views/capture.js"></script>' in index and "js/tools/capture.js" not in index
+    assert '<a class="tile half" data-view="capture" href="#capture"' in index
+    assert '<span class="tile-icon" data-icon="capture"></span><span class="tile-title">Packet capture</span>' in index
+    assert '<div class="tile-body" id="tile-capture">' in index
+    capture = _read("js/views/capture.js")
+    assert "TNT.views.capture = {" in capture and "TNT.api.captureGet()" in capture and "TNT.api.capturePackets(" in capture
+    assert "tileEls.capture" in app and "const c = st && st.capture;" in app, "the tile reads status.capture"
 
     ipinfo = _read("js/views/ipinfo.js")
     mount = ipinfo[ipinfo.index("    mount(el) {"):ipinfo.index("    update(state) {")]
-    assert mount.index("nc = TNT.netcheck.create();") < mount.index("render();"), "the card exists before the first render"
+    for made in ("tp = TNT.throughput.create();", "nc = TNT.netcheck.create();"):
+        assert mount.index(made) < mount.index("render();"), f"{made} must run before the first render"
     render = ipinfo[ipinfo.index("  function render() {"):ipinfo.index("  async function load(quiet) {")]
     appends = re.findall(r"gridEl\.appendChild\(([^;]*)\);", render)
-    placed = [i for i, a in enumerate(appends) if a == "nc.el"]
-    assert len(placed) == 2 and all(i > 0 and appends[i - 1] == "buildMapCard()" for i in placed), appends   # loading and normal branches
+    # both branches of render() (loading, and with the adapters) lay the same three out in the same
+    # order: the live link map, realtime throughput, then NAT & switch port
+    maps = [i for i, a in enumerate(appends) if a == "buildMapCard()"]
+    assert len(maps) == 2, appends
+    for i in maps:
+        assert appends[i + 1:i + 3] == ["tp.el", "nc.el"], appends
     load = ipinfo[ipinfo.index("  async function load(quiet) {"):]
-    assert load.index("if (nc) gridEl.appendChild(nc.el);") < load.index("TNT.ui.emptyState('Could not load adapters: '"), "before the error card"
-    for s in ("if (nc) nc.update(state);", "nc.unmount();", "netChanged() { if (root) load(true); },"):
+    error = load.index("TNT.ui.emptyState('Could not load adapters: '")
+    # a failed adapter read says nothing about the counters or about a NAT result already in hand
+    assert load.index("if (tp) gridEl.appendChild(tp.el);") < load.index("if (nc) gridEl.appendChild(nc.el);") < error
+    for s in ("if (nc) nc.update(state);", "nc.unmount();", "if (tp) tp.update(state);", "tp.unmount();",
+              "netChanged() { if (root) load(true); },"):
         assert s in ipinfo, s

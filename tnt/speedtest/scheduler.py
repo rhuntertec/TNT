@@ -457,6 +457,15 @@ class SpeedScheduler:
 
     # -- config helpers -------------------------------------------------------
     def _enabled(self) -> bool:
+        """Whether automatic tests run.  Switching the Speed tool off in Settings stops them whatever
+        ``speedtest.enabled`` says: a tool that is off takes no automated action of its own."""
+        try:
+            from ..config import tool_on
+
+            if not tool_on(self._config, "speed"):
+                return False
+        except Exception:  # noqa: BLE001 - an unreadable tools block means the tool is on
+            pass
         try:
             return bool(self._config.get("speedtest.enabled", True))
         except Exception:  # noqa: BLE001

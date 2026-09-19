@@ -42,28 +42,45 @@
     return { pings, pct: (o.sent_estimated ? '≈' : '') + pct, title };
   }
 
-  function renderList(rows) {
+  /** One outage table row (a <tr>), the row the Outages list draws. Reused by the Ping tile's
+   *  detail modal so its "last 5 outages" list is exactly the same. */
+  function outageRow(o, now) {
     const { h, fmtDateTime, fmtDateTimeSec, fmtTime, fmtDuration } = TNT.util;
-    tableBody.innerHTML = '';
-    if (!rows.length) {
-      tableBody.appendChild(h('tr', { class: 'empty-row' }, h('td', { colspan: '7' }, 'No outages in this period — nice and quiet.')));
-      return;
-    }
+    const open = !!o.open || o.end_ts == null;
+    const dur = o.duration_s != null ? o.duration_s : ((open ? now : o.end_ts) - o.start_ts);
+    return h('tr', null,
+      h('td', { class: 'copy', data: { copy: TNT.util.fmtStamp(o.start_ts) } }, fmtDateTimeSec(o.start_ts)),
+      // an open target outage is yellow; only an open full (total_*) outage is red
+      h('td', { class: 'copy', data: { copy: open ? 'ongoing' : TNT.util.fmtStamp(o.end_ts) } }, open ? h('span', { class: 'badge ' + (String(o.kind || '').startsWith('total') ? 'red' : 'yellow') + ' pulse' }, 'ongoing') : (new Date(o.end_ts * 1000).toDateString() === new Date(o.start_ts * 1000).toDateString() ? fmtTime(o.end_ts) : fmtDateTime(o.end_ts))),
+      h('td', { class: 'copy num' }, fmtDuration(dur)),
+      h('td', null, kindCell(o)),
+      h('td', { class: 'copy num' }, missedCells(o).pings),
+      h('td', { class: 'copy num', title: missedCells(o).title || null }, missedCells(o).pct),
+      h('td', { class: 'wrap muted small' }, o.note || ''));
+  }
+
+  /** The Outages table header row (Started / Ended / Duration / What / Missed Pings / Missed % / Note). */
+  function outageHead() {
+    const { h } = TNT.util;
+    return h('thead', null, h('tr', null, h('th', null, 'Started'), h('th', null, 'Ended'), h('th', { class: 'num' }, 'Duration'),
+      h('th', null, 'What'), h('th', { class: 'num' }, 'Missed Pings'), h('th', { class: 'num' }, 'Missed %'), h('th', null, 'Note')));
+  }
+
+  /** A complete outages table (a `.table-wrap`) for the given rows — the same look as the Outages list. */
+  function outageTable(rows, emptyMsg) {
+    const { h } = TNT.util;
+    const body = h('tbody');
     const now = TNT.util.nowS();
-    for (const o of rows) {
-      const open = !!o.open || o.end_ts == null;
-      const dur = o.duration_s != null ? o.duration_s : ((open ? now : o.end_ts) - o.start_ts);
-      const tr = h('tr', null,
-        h('td', { class: 'copy', data: { copy: TNT.util.fmtStamp(o.start_ts) } }, fmtDateTimeSec(o.start_ts)),
-        // an open target outage is yellow; only an open full (total_*) outage is red
-        h('td', { class: 'copy', data: { copy: open ? 'ongoing' : TNT.util.fmtStamp(o.end_ts) } }, open ? h('span', { class: 'badge ' + (String(o.kind || '').startsWith('total') ? 'red' : 'yellow') + ' pulse' }, 'ongoing') : (new Date(o.end_ts * 1000).toDateString() === new Date(o.start_ts * 1000).toDateString() ? fmtTime(o.end_ts) : fmtDateTime(o.end_ts))),
-        h('td', { class: 'copy num' }, fmtDuration(dur)),
-        h('td', null, kindCell(o)),
-        h('td', { class: 'copy num' }, missedCells(o).pings),
-        h('td', { class: 'copy num', title: missedCells(o).title || null }, missedCells(o).pct),
-        h('td', { class: 'wrap muted small' }, o.note || ''));
-      tableBody.appendChild(tr);
-    }
+    if (!rows || !rows.length) body.appendChild(h('tr', { class: 'empty-row' }, h('td', { colspan: '7' }, emptyMsg || 'No outages in this period — nice and quiet.')));
+    else for (const o of rows) body.appendChild(outageRow(o, now));
+    return h('div', { class: 'table-wrap' }, h('table', { class: 'table' }, outageHead(), body));
+  }
+
+  function renderList(rows) {
+    tableBody.innerHTML = '';
+    const now = TNT.util.nowS();
+    if (!rows.length) tableBody.appendChild(TNT.util.h('tr', { class: 'empty-row' }, TNT.util.h('td', { colspan: '7' }, 'No outages in this period — nice and quiet.')));
+    else for (const o of rows) tableBody.appendChild(outageRow(o, now));
   }
 
   function renderSummary(tl, rows) {
@@ -157,7 +174,10 @@
       if (timeline) { timeline.destroy(); timeline = null; }
       root = null; tableBody = null; summaryEl = null; listTitle = null; refreshBtn = null; lastTl = null; tlTitle = null;
     },
-    // exposed for tests
+    // exposed for tests and for the Ping tile's detail modal (its "last 5 outages" list)
     missedCells,
+    outageTable,
+    outageRow,
+    kindCell,
   };
 })();

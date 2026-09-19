@@ -24,6 +24,36 @@
     return 'Cannot reach the TNT service';
   }
 
+  /** Pure: a query string for the SIP routes -> '' or '?a=1&b=2'. A null, an undefined and an empty string are
+   *  left out, so "every target, the default window" is a bare path rather than a path with empty parameters. */
+  function sipQuery(q) {
+    const v = q && typeof q === 'object' ? q : {};
+    const parts = [];
+    for (const key of ['hours', 'host', 'side', 'stream']) {
+      const value = v[key];
+      if (value === null || value === undefined || value === '') continue;
+      parts.push(key + '=' + encodeURIComponent(String(value)));
+    }
+    return parts.length ? '?' + parts.join('&') : '';
+  }
+
+  /** Pure: the packet list's query string for { since, limit, ip, mac, protos } -> '' or '?a=1&b=2'. A null, an empty
+   *  string and a protocol the page does not have on are left out, and the protocols are repeated parameters. */
+  function captureQuery(q) {
+    const v = q && typeof q === 'object' ? q : {};
+    const parts = [];
+    for (const key of ['since', 'limit', 'ip', 'mac']) {
+      const value = v[key];
+      if (value === null || value === undefined || value === '') continue;
+      parts.push(key + '=' + encodeURIComponent(String(value)));
+    }
+    for (const p of Array.isArray(v.protos) ? v.protos : []) {
+      const text = String(p == null ? '' : p).trim();
+      if (text) parts.push('proto=' + encodeURIComponent(text));
+    }
+    return parts.length ? '?' + parts.join('&') : '';
+  }
+
   /** Perform a request. Resolves the parsed JSON body (or Blob for binary responses). */
   async function request(method, path, body, opts) {
     opts = opts || {};
@@ -87,6 +117,8 @@
     health: () => api.get('/health'),
     status: () => api.get('/status'),
     netinfo: () => api.get('/netinfo'),
+    // Realtime throughput: the backlog for one window. The live feed is the throughput.sample event.
+    throughput: (windowS) => api.get('/throughput?window_s=' + encodeURIComponent(windowS)),
     // IP location (DB-IP Lite): the data's state, a lookup made on this PC only, and Retry now
     geoip: () => api.get('/geoip'),
     geoipLookup: (ip) => api.get('/geoip/lookup?ip=' + encodeURIComponent(ip)),
@@ -107,6 +139,7 @@
     targets: () => api.get('/targets'),
     addTarget: (host, label) => api.post('/targets', label ? { host, label } : { host }),
     removeTarget: (id) => api.del('/targets/' + encodeURIComponent(id)),
+    renameTarget: (id, name) => api.patch('/targets/' + encodeURIComponent(id), { name: name == null ? null : name }),
     loadDefaultTargets: () => api.post('/targets/defaults'),
     reorderTargets: (ids) => api.put('/targets/order', { ids }),
     samples: (id, seconds) => api.get('/targets/' + encodeURIComponent(id) + '/samples?seconds=' + (seconds || 300)),
@@ -165,14 +198,39 @@
     dnsLookup: (name, server, type) => api.post('/tools/dns/lookup', Object.assign({ name }, server ? { server } : {}, type ? { type } : {}), { timeout: 30000 }),
     flushDns: () => api.post('/tools/dns/flush', {}, { timeout: 45000 }),
     ipRenew: () => api.post('/tools/ip/renew', {}, { timeout: 240000 }),
-    // Tools: packet capture, for a Windows administrator only (else 403 admin_required). Start waits for Packet Monitor to begin
-    // capturing; DELETE stops the capture and keeps what was captured. captureFileUrl is the address of a saved capture for a
-    // download link: it makes no request.
-    captureGet: () => api.get('/tools/capture'),
-    captureStart: (body) => api.post('/tools/capture', body || {}, { timeout: 20000 }),
-    captureStop: () => api.del('/tools/capture'),
-    captureDeleteFile: (name) => api.del('/tools/capture/files/' + encodeURIComponent(name)),
-    captureFileUrl: (name) => BASE + '/tools/capture/files/' + encodeURIComponent(name),
+    // Packet capture (its own page), for a Windows administrator only (else 403 admin_required). start begins a live
+    // capture on one adapter, stop ends it and keeps it, save writes it to disk under a listed name and discard throws it
+    // away. capturePackets tails the list (since = the last row number seen; leave it out for the newest rows) with the
+    // filters the page has on. captureFileUrl is the address of a saved capture for a download link: it makes no request.
+    captureGet: () => api.get('/capture'),
+    captureStart: (body) => api.post('/capture/start', body || {}, { timeout: 20000 }),
+    captureStop: () => api.post('/capture/stop', {}, { timeout: 20000 }),
+    captureSave: () => api.post('/capture/save', {}, { timeout: 30000 }),
+    captureDiscard: () => api.post('/capture/discard', {}),
+    captureOpen: (name) => api.post('/capture/open', { name }, { timeout: 60000 }),
+    captureOpenPath: (path) => api.post('/capture/open', { path }, { timeout: 120000 }),
+    capturePackets: (q) => api.get('/capture/packets' + captureQuery(q)),
+    capturePacket: (no) => api.get('/capture/packets/' + encodeURIComponent(no)),
+    captureCalls: () => api.get('/capture/calls'),
+    captureCallAudioUrl: (id) => BASE + '/capture/calls/' + encodeURIComponent(id) + '/audio',
+    captureDeleteFile: (name) => api.del('/capture/files/' + encodeURIComponent(name)),
+    captureFileUrl: (name) => BASE + '/capture/files/' + encodeURIComponent(name),
+    // SIP (its own page). sipQualifier grades this network for calls out of the ping history and the last speed
+    // test (hours = the window, host = the SIP server to grade as its own leg); the rest run on request and block
+    // while they do, which is why their timeouts are long. sipStunLifetime is the slow one - it sits idle for up
+    // to eight minutes - and sipFlowAudioUrl is an address for an <audio> element, not a request.
+    sipQualifier: (hours, host) => api.get('/sip/qualifier' + sipQuery({ hours, host })),
+    sipAlg: () => api.get('/sip/alg'),
+    sipAlgRun: (host, port) => api.post('/sip/alg', { host, port }, { timeout: 30000 }),
+    sipStun: () => api.get('/sip/stun'),
+    sipStunRun: (servers) => api.post('/sip/stun', { servers }, { timeout: 30000 }),
+    sipStunLifetime: (server) => api.post('/sip/stun/lifetime', { server }, { timeout: 600000 }),
+    sipFlow: () => api.get('/sip/flow'),
+    sipFlowOpen: (path, slot) => api.post('/sip/flow', { path, slot }, { timeout: 120000 }),
+    sipFlowClose: (slot) => api.del('/sip/flow' + (slot ? '?slot=' + encodeURIComponent(slot) : '')),
+    sipFlowCall: (id) => api.get('/sip/flow/calls/' + encodeURIComponent(id)),
+    sipFlowPacket: (side, no) => api.get('/sip/flow/packets/' + encodeURIComponent(side) + '/' + encodeURIComponent(no)),
+    sipFlowAudioUrl: (id, opts) => BASE + '/sip/flow/calls/' + encodeURIComponent(id) + '/audio' + sipQuery(opts || {}),
     // WiFi page: vendor names for 24-bit OUIs ("AA:BB:CC", 1-256 per call). Only OUIs go to the
     // service, never a full BSSID: the survey itself stays inside the TNT window.
     ouiVendors: (prefixes) => api.get('/oui?' + (prefixes || []).map((p) => 'prefix=' + encodeURIComponent(p)).join('&')),
@@ -380,8 +438,11 @@
     STALE_GRACE_MS: NET_STALE_GRACE_MS, TOAST_GAP_MS: NET_TOAST_GAP_MS,
   };
 
+  api.captureQuery = captureQuery;
+  api.sipQuery = sipQuery;
+
   /* ---------------------------------------------------------- quick tools */
-  // Pure: what the top bar's IP Release/Renew and Flush DNS buttons say once the service answered (app.js drives them;
+  // Pure: what the Tools page's IP Release/Renew and Flush DNS buttons say once the service answered (app.js drives them;
   // node tests load this file on its own).
   const QUICK_NAMES = { renew: 'IP Release/Renew', flush: 'Flush DNS' };
 
@@ -420,14 +481,14 @@
     'hello', 'ping.sample', 'ping.targets', 'outage.start', 'outage.end',
     'speedtest.start', 'speedtest.progress', 'speedtest.done',
     'discovery.progress', 'discovery.done', 'settings.changed', 'monitoring.paused',
-    'dhcp.state', 'dhcp.lease', 'dhcp.scan', 'map.sample', 'geoip.state',
+    'dhcp.state', 'dhcp.lease', 'dhcp.scan', 'map.sample', 'throughput.sample', 'geoip.state',
     'trace.start', 'trace.hop', 'trace.done',
     'lan.peers', 'lan.state', 'lan.throughput.progress', 'lan.throughput.done',
     'net.changed',
     'report.progress', 'report.saved', 'report.deleted', 'report.updated',
     'netcheck.switch',
     'tftp.state', 'tftp.transfer',
-    'capture.state',
+    'capture.state', 'capture.sip',
   ];
 
   /**

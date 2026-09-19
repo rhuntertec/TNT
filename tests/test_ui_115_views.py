@@ -1,6 +1,6 @@
 """Node-driver tests for the pure helpers of the 1.15.0 UI modules: the Network info "NAT, switch port & port forward" card
 (ui/js/netcheck.js), the Speed page's "Latency under load" card (views/speed.js qualityView), the DNS card's record types
-(tools/dns.js), and the TFTP server and packet capture cards (tools/tftp.js, tools/capture.js).
+(tools/dns.js), the TFTP server card (tools/tftp.js) and the Packet capture page (views/capture.js).
 
 Every driver loads its module into a node vm with a stubbed ``window.TNT = {views:{}, util:{}, api:{}, ui:{}}`` (no DOM, no
 app.js), the way ``_NODE_DNS_DRIVER`` in test_ui.py does, so what is pinned here stays pure; the Speed driver adds app.js's own
@@ -14,6 +14,7 @@ import json
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -21,7 +22,7 @@ import pytest
 
 from test_ui import ROOT, UI, _read  # noqa: F401
 
-NEW_MODULES = ("js/netcheck.js", "js/tools/portforward.js", "js/tools/tftp.js", "js/tools/capture.js", "js/views/speed.js", "js/tools/dns.js")
+NEW_MODULES = ("js/netcheck.js", "js/tools/portforward.js", "js/tools/tftp.js", "js/views/capture.js", "js/views/speed.js", "js/tools/dns.js")
 NODE = pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
 
 _PRELUDE = r"""
@@ -442,21 +443,19 @@ def test_speed_quality_view_states_and_grades(tmp_path):
     cases += [[_quality(bufferbloat={"grade": g, "increase_ms": 7, "direction": "download", "text": None, "warning": None, "reason": None}), {"ok": True}]
               for g in GRADE_TEXT]
     out = _node(tmp_path, _SPEED_DRIVER, ["js/views/speed.js", "js/app.js"], cases)
-    blank = {"state": "none", "grade": "—", "cls": "grey", "text": "", "headline": "", "gradeText": "", "warning": "", "call": "", "busy": "",
-             "checks": [], "details": ""}
+    # the call-quality lines and the Zoom/Teams checks are the SIP page's now (tests/test_ui_sip.py): what is
+    # left here is the bufferbloat grade, which is measured here
+    blank = {"state": "none", "grade": "—", "cls": "grey", "text": "", "headline": "", "gradeText": "", "warning": "",
+             "details": ""}
     assert out[0] == {**blank, "text": "Runs with every speed test"}
     assert out[1] == {**blank, "state": "failed", "text": "The last speed test failed"}
     assert out[2] == out[3] == {**blank, "state": "missing", "text": "Not measured for this test"}, "a test from before 1.15 has no quality key"
     assert out[4] == {**blank, "state": "unavailable", "text": "1.1.1.1 did not answer pings"}
     assert out[5] == {"state": "measured", "grade": "B", "cls": "green", "text": "",
                       "headline": "Latency under load +38 ms (download +12 ms, upload +38 ms)", "gradeText": GRADE_TEXT["B"], "warning": "",
-                      "call": "Call quality: Good (MOS 4.39, estimate)", "busy": "While the line is busy: Fair (MOS 3.87)",
-                      "checks": [{"label": "Zoom ✓", "ok": True, "title": "mean 52 ms, jitter 9 ms, loss 2.9%"},
-                                 {"label": "Teams ✗", "ok": False, "title": "loss 2.9% is 1% or more"}],
                       "details": "Idle 14 ms to 1.1.1.1 · busy 26 / 52 ms · loss 0% / 2.9% · 30 / 34 probes"}
     assert out[6] == out[5], "the quality comes from last.quality when q is not given"
-    assert out[7] == {**blank, "state": "measured", "gradeText": "phase too short to grade", "call": "Call quality: Excellent (MOS 4.39, estimate)",
-                      "checks": [{"label": "Zoom ✓", "ok": True, "title": "idle: mean 14 ms, jitter 1.1 ms, loss 0%"}],
+    assert out[7] == {**blank, "state": "measured", "gradeText": "phase too short to grade",
                       "details": "Idle 14 ms to 1.1.1.1 · busy — / — ms · loss — / — · — / — probes"}
     assert (out[8]["grade"], out[8]["cls"], out[8]["headline"], out[8]["gradeText"], out[8]["warning"]) == (
         "F", "red", "", GRADE_TEXT["F"], "some probes were lost under load")
@@ -478,20 +477,17 @@ def test_speed_quality_view_reads_a_real_quality(tmp_path):
     phases = {"baseline": (0.0, 3.0), "download": (3.0, 8.0), "upload": (8.0, 13.0)}
     graded = quality.build_quality([sample(i, {100}) for i in range(130)], phases, target="1.1.1.1", interval_ms=100, payload=32)
     silent = quality.build_quality([sample(i, set(range(30))) for i in range(130)], phases, target="1.1.1.1", interval_ms=100, payload=32)
-    bb, call = graded["bufferbloat"], graded["call"]
+    bb = graded["bufferbloat"]
     assert (bb["grade"], bb["direction"], bb["increase_ms"], bb["warning"]) == ("B", "upload", 38.0, None), "the synthetic run grades as planned"
     out = _node(tmp_path, _SPEED_DRIVER, ["js/views/speed.js", "js/app.js"], [[graded, {"ok": True}], [None, {"ok": True, "quality": silent}]])
     view = out[0]
     assert (view["state"], view["grade"], view["cls"], view["text"], view["warning"]) == ("measured", "B", "green", "", "")
     assert view["headline"] == "Latency under load +38 ms (download +12 ms, upload +38 ms)"
     assert view["gradeText"] == quality.GRADE_TEXT["B"] == GRADE_TEXT["B"]
-    assert view["call"] == "Call quality: %s (MOS %.2f, estimate)" % (call["idle"]["label"], call["idle"]["mos"])
-    assert view["busy"] == "While the line is busy: %s (MOS %.2f)" % (call["loaded"]["label"], call["loaded"]["mos"])
-    assert view["checks"] == [{"label": {"zoom": "Zoom", "teams": "Teams"}[c["key"]] + (" ✓" if c["ok"] else " ✗"), "ok": c["ok"], "title": c["detail"]}
-                              for c in call["checks"]] and len(view["checks"]) == 2
+    assert "call" not in view and "checks" not in view, "the call lines moved to the SIP page"
     assert view["details"] == "Idle 14 ms to 1.1.1.1 · busy 26 / 52 ms · loss 0% / 2.5% · 40 / 40 probes"
     assert out[1] == {"state": "unavailable", "grade": "—", "cls": "grey", "text": "1.1.1.1 did not answer pings", "headline": "", "gradeText": "",
-                      "warning": "", "call": "", "busy": "", "checks": [], "details": ""}
+                      "warning": "", "details": ""}
     assert silent["reason"] == quality.REASON_NO_REPLIES.format(target="1.1.1.1")
 
 
@@ -723,95 +719,199 @@ def test_tftp_card_helpers(tmp_path):
                             "empty": "No files yet: put the files devices will ask for in this folder", "open": "Could not open the TFTP folder", "shown": 10}
 
 
-# ------------------------------------------------------------------------------------------ tools/capture.js
+# ------------------------------------------------------------------------------------------- views/capture.js
 CAPTURE_WARNING = ("Captures can contain passwords and private data. TNT keeps the newest 10 (at most 2 GB, 7 days) in a folder only "
-                   "administrators can open; a copy you download is not protected.")
+                   "administrators can open; a copy you save elsewhere is not protected.")
+CAPTURE_LEAVE_TITLE = "Save this capture?"
+CAPTURE_FILE = "TNT-capture-20260101-120000.pcapng"
+# the quick filter buttons, in the page's order; the keys are tnt.dissect.PROTO_FILTERS keys
+CAPTURE_PROTOS = ["icmp", "arp", "dns", "dhcp", "http", "https", "tcp", "udp", "rtsp", "rtp", "sip"]
+CAPTURE_COLUMNS = ["no", "time", "rel", "src", "dst", "proto", "length", "info"]
 
-def _capture_job(**over: Any) -> Dict[str, Any]:
-    """A CAPTURE_JOB 23.4 s into a 1 min capture of Ethernet, with `over` replacing keys."""
-    j = {"id": "c1", "state": "capturing", "adapter": {"name": "Ethernet"}, "filters": {"host": None, "port": None, "protocol": None},
-         "full_packets": True, "seconds": 60, "size_mb": 128, "started_ts": 10.0, "elapsed_s": 23.4, "bytes": 1048576, "file": None, "error": None,
-         "note": None, "ts": 33.4}
-    j.update(over)
-    return j
+
+def _capture_session(**over: Any) -> Dict[str, Any]:
+    """A SESSION 23.4 s into a live capture of Ethernet, with `over` replacing keys."""
+    s = {"id": "c1", "state": "capturing", "source": "live", "adapter": {"name": "Ethernet"}, "file": None, "saved": False,
+         "started_ts": 1767268800.0, "first_ts": 1767268800.25, "elapsed_s": 23.4, "packets": 12, "shown": 12, "bytes": 2048,
+         "dropped": 0, "truncated": False, "calls": 0, "stop_reason": None, "error": None, "ts": 1767268823.4}
+    s.update(over)
+    return s
 
 
 def _capture_file(name: str, size: int, created_ts: float, packets: Optional[int]) -> Dict[str, Any]:
     return {"name": name, "size": size, "created_ts": created_ts, "packets": packets}
 
 
+def _capture_stream(**over: Any) -> Dict[str, Any]:
+    """One rebuilt RTP stream of a call (tnt.sipcalls STREAM), G.711 µ-law and playable unless `over` says otherwise."""
+    s = {"id": "s1", "src": "192.0.2.50", "sport": 16384, "dst": "192.0.2.60", "dport": 16386, "ssrc": 305419896,
+         "payload_type": 0, "codec": "PCMU", "packets": 2100, "lost": 0, "out_of_order": 0, "first_ts": 1767268810.0,
+         "last_ts": 1767268852.0, "duration_s": 42.0, "bytes": 336000, "jitter_ms": 1.75, "decodable": True}
+    s.update(over)
+    return s
+
+
+def _capture_call(**over: Any) -> Dict[str, Any]:
+    """An answered 42 s call (tnt.sipcalls CALL) with one playable stream, with `over` replacing keys."""
+    c = {"id": "1", "call_id": "9f3c1a@192.0.2.50", "from_uri": "sip:1001@192.0.2.50", "to_uri": "sip:1002@192.0.2.60",
+         "state": "answered", "start_ts": 1767268810.5, "answer_ts": 1767268812.0, "end_ts": 1767268852.5, "duration_s": 42.0,
+         "status": None, "messages": [], "streams": [_capture_stream()], "note": None}
+    c.update(over)
+    return c
+
+
+def _time_of_day(ts: float) -> str:
+    """What views/capture.js timeOfDay(ts) must say in this PC's time zone: "HH:MM:SS.mmm"."""
+    lt = time.localtime(ts)
+    return "%02d:%02d:%02d.%03d" % (lt.tm_hour, lt.tm_min, lt.tm_sec, round(ts % 1 * 1000))
+
+
 _CAPTURE_DRIVER = r"""
-load(process.argv[2]);
-const C = T.tools.capture;
+load(process.argv[2]);                      // js/api.js: the page's filter becomes its query string here
+load(process.argv[3]);                      // js/views/capture.js
+const C = T.views.capture;
+T.util.fmtBytes = (n) => n + ' B';          // app.js's own, which the page borrows for a session's byte count
+const shared = { ip: '192.0.2.7', mac: '02-00-5e-10-00-01', protos: ['sip', 'rtp'] };
 process.stdout.write(JSON.stringify({
-  bodies: input.bodies.map((v) => C.startBody(v)),
-  ips: input.ips.map((ip) => C.isIp(ip)),
-  labels: input.adapters.map((a) => C.adapterLabel(a)),
+  times: input.times.map((ts) => C.timeOfDay(ts)),
+  rels: input.rels.map((r) => C.relText(r)),
+  protoClasses: input.protoNames.map((p) => C.protoClass(p)),
+  queries: input.filters.map(([f, since]) => C.filterQuery(f, since)),
+  copied: C.filterQuery(shared, null).protos !== shared.protos,
+  on: input.filters.map(([f]) => C.filterOn(f)),
+  urls: input.filters.map(([f, since]) => T.api.captureQuery(C.filterQuery(f, since))),
+  rawUrls: input.raw.map((q) => T.api.captureQuery(q)),
+  sessions: input.sessions.map((s) => C.sessionView(s)),
+  stops: input.stops.map((r) => C.stopSuffix(r)),
   clocks: input.clocks.map((s) => C.clock(s)),
-  jobs: input.jobs.map((j) => C.jobView(j)),
-  files: C.fileRows(input.files).map((f) => [f.name, f.packets]),
-  polls: input.polls.map(([j, live]) => C.pollDelay(j, live)),
-  constants: { durations: C.DURATIONS, seconds: C.DEFAULT_SECONDS, sizes: C.SIZES_MB, size: C.DEFAULT_SIZE_MB, protocols: C.PROTOCOLS,
-               warning: C.WARNING_TEXT, admin: C.ADMIN_TEXT, first: C.FIRST_BYTES_TITLE },
+  calls: input.calls.map((c) => C.callView(c)),
+  constants: { protos: C.PROTO_BUTTONS.map((p) => p.key), labels: C.PROTO_BUTTONS.map((p) => p.label),
+               calls: C.PROTO_BUTTONS.filter((p) => p.calls).map((p) => p.key), columns: C.COLUMNS, tail: C.TAIL_MS,
+               rows: C.DOM_ROWS, warning: C.WARNING_TEXT, admin: C.ADMIN_TEXT, leave: C.LEAVE_TITLE },
 }));
 """
 
 
 @NODE
-def test_capture_card_helpers(tmp_path):
-    form = {"adapter": "Ethernet", "seconds": "60", "size_mb": "128", "full_packets": True, "host": "", "port": "", "protocol": ""}
-    bodies = [form, dict(form, host=" 192.0.2.7 ", port="443", protocol="TCP", seconds="10", size_mb="1024", full_packets=False),
-              dict(form, host="2001:db8::7", protocol="icmp"), dict(form, host="example.com"), dict(form, host="192.0.2.300"),
-              dict(form, port="0"), dict(form, port="65536"), dict(form, port="1.5"), dict(form, port="80", protocol="icmp"),
-              dict(form, protocol="sctp"), dict(form, port=" 53 ", protocol="udp")]
-    job = _capture_job()
+def test_capture_page_helpers(tmp_path):
+    """views/capture.js's pure helpers: a packet row's time and age, the protocol colour, the filter the page has on as a
+    query (and the query string api.js makes of it), what a session says, why a capture stopped by itself, m:ss and one
+    rebuilt SIP call."""
+    stopped = _capture_session(state="stopped", source="live", elapsed_s=60.0, packets=340, shown=340, ts=1767268860.0)
     payload = {
-        "bodies": bodies,
-        "ips": ["192.0.2.7", "2001:db8::7", "::1", "::ffff:192.0.2.1", "1:2:3:4:5:6:7:8", "1::2::3", "192.0.2", "example.com", "", None, "fe80::1%12"],
-        "adapters": [{"name": "Wi-Fi", "wifi": True}, {"name": "Ethernet", "wifi": False}, {}],
-        "clocks": [0, 23, 59.9, 60, 900, None],
-        "jobs": [None, dict(job, state="starting", elapsed_s=0), job, dict(job, state="converting", elapsed_s=60),
-                 dict(job, state="done", file="TNT-capture-20260101-120000.pcapng", note="3 Wi-Fi frames that were not data frames were left out"),
-                 dict(job, state="error", error="Packet Monitor could not start (exit 87)"), dict(job, state="cancelled"), dict(job, seconds=0)],
-        "files": [_capture_file("TNT-capture-20260101-120000.pcapng", 4096, 1.0, 12), _capture_file("TNT-capture-20260102-120000.pcapng", 8192, 2.0, None),
-                  {"size": 1}],
-        "polls": [[job, False], [job, True], [dict(job, state="converting"), False], [dict(job, state="done"), False], [None, True]],
+        # 2026-01-01 12:00:23.500 local; a whole number of milliseconds so node and Python agree to the millisecond
+        "times": [1767268823.5, 1767268823.25, 1767268800.0, None, "12:00", True],
+        "rels": [0, 0.5, 12.48, 123.456, -3, None, "x"],
+        "protoNames": ["SIP", "RTP", "RTCP", "RTSP", "TLS", "HTTPS", "QUIC", "HTTP", "DNS", "MDNS", "LLMNR", "NBNS", "ICMP",
+                       "ICMPv6", "IGMP", "ARP", "LLDP", "CDP", "STP", "EAPOL", "DHCP", "DHCPv6", "NTP", "sip", "SSDP", "", None],
+        "filters": [[None, None], [{}, 0], [{"ip": "192.0.2.7"}, None], [{"mac": "02-00-5E-10-00-01"}, None],
+                    [{"protos": ["sip"]}, None], [{"ip": "", "mac": "", "protos": []}, None], [{"protos": "sip"}, None],
+                    [{"ip": "192.0.2.7", "mac": "02-00-5E-10-00-01", "protos": ["sip", "rtp"]}, 4096]],
+        # what api.captureQuery leaves out on its own, and the repeated protocol parameters
+        "raw": [{}, {"limit": 800, "since": None, "ip": "", "mac": None}, {"since": 0, "limit": 800},
+                {"limit": 800, "protos": ["sip", "", None, " rtp "]}, {"limit": 800, "ip": "2001:db8::7", "mac": "02:00:5E:10:00:01"}],
+        "sessions": [
+            None, {}, _capture_session(), _capture_session(adapter=None, elapsed_s=0, packets=1, bytes=0),
+            _capture_session(dropped=3, truncated=True, shown=800),
+            _capture_session(truncated=True, shown=None),
+            stopped, dict(stopped, stop_reason="seconds"), dict(stopped, stop_reason="service"),
+            dict(stopped, saved=True, file=CAPTURE_FILE), dict(stopped, saved=True, file=None),
+            _capture_session(state="loaded", source="file", file=CAPTURE_FILE, saved=True),
+            _capture_session(state="loaded", source="file", file=None, saved=True),
+            _capture_session(state="error", error="Packet Monitor could not start (exit 87)"),
+            _capture_session(state="error", error=None),
+            _capture_session(state="winding-down"),
+        ],
+        "stops": [None, "user", "seconds", "size", "packets", "adapter", "service", "made up"],
+        "clocks": [0, 23.4, 59.9, 60, 900, 3600, -5, None, "x"],
+        "calls": [
+            _capture_call(), _capture_call(state="ringing", duration_s=None, streams=[]),
+            _capture_call(state="ended"), _capture_call(state="failed"), _capture_call(state="cancelled"),
+            _capture_call(state="calling"), _capture_call(state=""),
+            _capture_call(id=3, from_uri=None, to_uri=None, start_ts=None, streams=[_capture_stream(codec="G729", decodable=False)]),
+            _capture_call(streams=[_capture_stream(codec=None), _capture_stream(decodable=False, codec="PCMU")]),
+            {},
+        ],
     }
-    out = _node(tmp_path, _CAPTURE_DRIVER, ["js/tools/capture.js"], payload)
-    b = out["bodies"]
-    assert b[0] == {"ok": True, "body": {"adapter": "Ethernet", "seconds": 60, "size_mb": 128, "full_packets": True, "host": None, "port": None, "protocol": None}}
-    assert b[1] == {"ok": True, "body": {"adapter": "Ethernet", "seconds": 10, "size_mb": 1024, "full_packets": False, "host": "192.0.2.7", "port": 443, "protocol": "tcp"}}
-    assert b[2]["body"]["host"] == "2001:db8::7" and b[2]["body"]["protocol"] == "icmp" and b[2]["body"]["port"] is None
-    assert b[3] == b[4] == {"ok": False, "field": "host", "error": "host must be an IP address"}
-    assert b[5] == b[6] == b[7] == {"ok": False, "field": "port", "error": "port must be a whole number from 1 to 65535"}
-    assert b[8] == {"ok": False, "field": "port", "error": "port cannot be combined with protocol icmp"}
-    assert b[9] == {"ok": False, "field": "protocol", "error": "protocol must be tcp, udp, icmp or null"}
-    assert b[10]["body"]["port"] == 53 and b[10]["body"]["protocol"] == "udp"
-    assert out["ips"] == [True, True, True, True, True, False, False, False, False, False, False]
-    assert out["labels"] == ["Wi-Fi (Wi-Fi)", "Ethernet", "?"]
-    assert out["clocks"] == ["0:00", "0:23", "0:59", "1:00", "15:00", "0:00"]
-    none, starting, capturing, converting, done, error, cancelled, no_seconds = out["jobs"]
-    assert none == {"running": False, "state": "", "label": "", "pct": 0, "bytes": None, "cls": "", "text": "", "note": ""}
-    assert (starting["running"], starting["label"], starting["pct"]) == (True, "Starting…", 0)
-    assert (capturing["running"], capturing["label"], capturing["bytes"]) == (True, "Capturing… 0:23 of 1:00", 1048576)
-    assert capturing["pct"] == pytest.approx(23.4 / 60)
-    assert (converting["label"], converting["pct"]) == ("Saving the capture…", 1)
-    assert (done["running"], done["cls"], done["text"], done["note"]) == (False, "ok", "Saved TNT-capture-20260101-120000.pcapng",
-                                                                         "3 Wi-Fi frames that were not data frames were left out")
-    assert (error["cls"], error["text"]) == ("bad", "Packet Monitor could not start (exit 87)")
-    assert (cancelled["cls"], cancelled["text"]) == ("muted", "The capture was cancelled")
-    assert no_seconds["pct"] == 0 and no_seconds["label"] == "Capturing… 0:23 of 0:00"
-    assert out["files"] == [["TNT-capture-20260102-120000.pcapng", None], ["TNT-capture-20260101-120000.pcapng", 12]]
-    assert out["polls"] == [2000, 10000, 2000, None, None]
+    out = _node(tmp_path, _CAPTURE_DRIVER, ["js/api.js", "js/views/capture.js"], payload)
+    assert out["times"] == [_time_of_day(1767268823.5), _time_of_day(1767268823.25), _time_of_day(1767268800.0), "", "", ""]
+    assert out["rels"] == ["0.000", "0.500", "12.480", "123.456", "0.000", "", ""]
+    # the protocol colours: voice, encrypted, web, name lookups, ICMP, link-local and the housekeeping protocols
+    # ICMPv6 and DHCPv6 colour like their IPv4 siblings: protoClass upper-cases both sides of the comparison
+    assert out["protoClasses"] == ["p-voice", "p-voice", "p-voice", "p-voice", "p-secure", "p-secure", "p-secure", "p-web",
+                                   "p-name", "p-name", "p-name", "p-name", "p-icmp", "p-icmp", "p-icmp",
+                                   "p-link", "p-link", "p-link", "p-link", "p-link", "p-admin", "p-admin", "p-admin",
+                                   "p-voice", "", "", ""]
+    # the query: the row limit always, `since` only while tailing, and only the filters that are on
+    none, empty, ip, mac, proto, blank, junk, every = out["queries"]
+    assert none == {"limit": 800} and empty == {"limit": 800, "since": 0}
+    assert ip == {"limit": 800, "ip": "192.0.2.7"} and mac == {"limit": 800, "mac": "02-00-5E-10-00-01"}
+    assert proto == {"limit": 800, "protos": ["sip"]} and blank == junk == {"limit": 800}
+    assert every == {"limit": 800, "since": 4096, "ip": "192.0.2.7", "mac": "02-00-5E-10-00-01", "protos": ["sip", "rtp"]}
+    assert out["copied"] is True, "the protocol list is copied, never the page's own array"
+    assert out["on"] == [False, False, True, True, True, False, False, True]
+    assert out["urls"][0] == "?limit=800" and out["urls"][1] == "?since=0&limit=800"
+    assert out["urls"][-1] == ("?since=4096&limit=800&ip=192.0.2.7&mac=02-00-5E-10-00-01&proto=sip&proto=rtp")
+    assert out["rawUrls"] == ["", "?limit=800", "?since=0&limit=800", "?limit=800&proto=sip&proto=rtp",
+                              "?limit=800&ip=2001%3Adb8%3A%3A7&mac=02%3A00%3A5E%3A10%3A00%3A01"]
+    (none, blank, capturing, first, dropped, unknown_shown, stopped_v, seconds, service, saved, saved_bare,
+     loaded, loaded_bare, error, error_bare, junk_state) = out["sessions"]
+    idle = {"state": "", "running": False, "unsaved": False, "label": "Not capturing", "detail": "", "cls": "muted"}
+    assert none == idle and blank == dict(idle, detail="0 packets")
+    # a running capture is always unsaved: the page asks before it is left
+    assert capturing == {"state": "capturing", "running": True, "unsaved": True, "label": "Capturing on Ethernet · 0:23",
+                         "detail": "12 packets · 2048 B", "cls": "ok"}
+    assert first["label"] == "Capturing on this PC · 0:00" and first["detail"] == "1 packet"
+    assert dropped["detail"] == "12 packets · 2048 B · 3 dropped · list holds the newest 800"
+    assert unknown_shown["detail"].endswith("list holds the newest few")
+    # stopped and never saved is unsaved too, and says so; a limit it reached by itself is named
+    assert stopped_v == {"state": "stopped", "running": False, "unsaved": True, "label": "Stopped — not saved yet",
+                         "detail": "340 packets · 2048 B", "cls": ""}
+    assert seconds["label"] == "Stopped — not saved yet (it reached its time limit)" and seconds["unsaved"] is True
+    assert service["label"] == "Stopped — not saved yet (the service stopped)"
+    assert (saved["unsaved"], saved["cls"], saved["label"]) == (False, "ok", "Saved as " + CAPTURE_FILE)
+    assert saved_bare["label"] == "Saved as a file"
+    # a capture read back from a file, and one that failed: nothing to save either way
+    assert (loaded["unsaved"], loaded["cls"], loaded["label"]) == (False, "", "Reading " + CAPTURE_FILE)
+    assert loaded_bare["label"] == "Reading a saved capture"
+    assert (error["unsaved"], error["cls"], error["label"]) == (False, "bad", "Packet Monitor could not start (exit 87)")
+    assert error_bare["label"] == "The capture failed"
+    # a state this page does not know (a newer service) reads as idle, with the state kept for the console
+    assert junk_state["state"] == "winding-down" and (junk_state["label"], junk_state["cls"]) == ("Not capturing", "muted")
+    # STOP_REASONS: only the user's own stop (and a reason a newer service invents) hangs nothing off "Stopped"
+    assert out["stops"] == ["", "", " (it reached its time limit)", " (it reached its size limit)", " (it reached its packet limit)",
+                            " (the adapter went away)", " (the service stopped)", ""]
+    assert out["clocks"] == ["0:00", "0:23", "0:59", "1:00", "15:00", "60:00", "0:00", "0:00", "0:00"]
+    (answered, ringing, ended, failed, cancelled, calling, no_state, one_way, mixed, bare) = out["calls"]
+    assert answered == {"id": "1", "title": "sip:1001@192.0.2.50 → sip:1002@192.0.2.60", "state": "answered", "cls": "green",
+                        "when": _time_of_day(1767268810.5), "duration": "0:42", "playable": True, "note": "PCMU"}
+    assert (ringing["cls"], ringing["playable"], ringing["duration"]) == ("blue", False, "")
+    assert ringing["note"] == "No audio was captured for this call"
+    assert [c["cls"] for c in (ended, failed, cancelled, calling, no_state)] == ["grey", "red", "yellow", "blue", "blue"]
+    # a codec TNT cannot rebuild is named, and so is the one it can where a call carries both
+    assert one_way["id"] == "3" and one_way["title"] == "unknown → unknown" and one_way["when"] == ""
+    assert (one_way["playable"], one_way["note"]) == (False, "G729 — TNT cannot play this codec")
+    assert mixed["playable"] is True and mixed["note"] == "PCMU"
+    assert bare == {"id": "", "title": "unknown → unknown", "state": "", "cls": "blue", "when": "", "duration": "",
+                    "playable": False, "note": "No audio was captured for this call"}
     c = out["constants"]
-    assert c["durations"] == [[10, "10 s"], [30, "30 s"], [60, "1 min"], [300, "5 min"], [900, "15 min"]] and c["seconds"] == 60
-    assert c["sizes"] == [64, 128, 256, 512, 1024] and c["size"] == 128 and c["protocols"] == [["", "Any"], ["tcp", "TCP"], ["udp", "UDP"], ["icmp", "ICMP"]]
+    assert c["protos"] == CAPTURE_PROTOS and c["calls"] == ["sip"]
+    assert c["labels"] == ["ICMP", "ARP", "DNS", "DHCP", "HTTP", "HTTPS", "TCP", "UDP", "RTSP", "RTP", "SIP calls"]
+    assert c["columns"] == CAPTURE_COLUMNS and c["tail"] == 700 and c["rows"] == 3000
     assert c["warning"] == CAPTURE_WARNING and c["admin"] == "Packet capture needs a Windows administrator account"
-    assert c["first"] == "Mostly headers, but the start of unencrypted data (such as FTP or SNMP passwords) can still be in it"
-    for attr, expected in (("CAPTURE_SECONDS", [10, 30, 60, 300, 900]), ("CAPTURE_SIZES_MB", [64, 128, 256, 512, 1024])):
-        service = _service("tnt.capture", attr)
-        if service is not None:
-            assert list(service) == expected, attr
+    assert c["leave"] == CAPTURE_LEAVE_TITLE
+    # every quick filter button is a filter the service knows, and every row column a field it sends
+    filters = _service("tnt.dissect", "PROTO_FILTERS")
+    if filters is not None:
+        assert set(c["protos"]) <= set(filters), sorted(set(c["protos"]) - set(filters))
+    row_keys = _service("tnt.capture", "ROW_KEYS")
+    if row_keys is not None:
+        # every column is a ROW field, but for "Time", which is the row's `ts` as a time of day
+        assert set(c["columns"]) - {"time"} <= set(row_keys), sorted(set(c["columns"]) - {"time"} - set(row_keys))
+        assert "ts" in row_keys
+    limits = _service("tnt.capture", "MAX_ROWS")
+    if limits is not None:
+        assert c["rows"] <= limits, "the table never holds more rows than the service keeps"
 
 
 # ------------------------------------------------------------------------------------------ fixtures vs the service
@@ -834,7 +934,8 @@ def test_fixtures_follow_the_service_shapes():
         ("tnt.speedtest.quality", "BUFFERBLOAT_KEYS", q["bufferbloat"]), ("tnt.speedtest.quality", "CALL_KEYS", q["call"]),
         ("tnt.speedtest.quality", "SCORE_KEYS", q["call"]["idle"]), ("tnt.speedtest.quality", "CHECK_KEYS", q["call"]["checks"][0]),
         ("tnt.tftp", "TFTP_TRANSFER_KEYS", _transfer("t1", "sending")),
-        ("tnt.capture", "CAPTURE_JOB_KEYS", _capture_job()), ("tnt.capture", "CAPTURE_FILE_KEYS", _capture_file("TNT-capture-20260101-120000.pcapng", 1, 1.0, 1)),
+        ("tnt.capture", "SESSION_KEYS", _capture_session()), ("tnt.capture", "CAPTURE_FILE_KEYS", _capture_file(CAPTURE_FILE, 1, 1.0, 1)),
+        ("tnt.sipcalls", "CALL_KEYS", _capture_call()), ("tnt.sipcalls", "STREAM_KEYS", _capture_stream()),
     ]
     for module, attr, fixture in shapes:
         expected = _service(module, attr)
@@ -920,10 +1021,30 @@ def test_new_card_sources_keep_the_contract():
     # the yellow note goes with the "Allow uploads" switch whether uploads are on or off (§9.7)
     assert "uploadsNote.hidden" not in tftp
 
-    cap = _read("js/tools/capture.js")
-    for s in ("const a = h('a', {href: TNT.api.captureFileUrl(name), download: name, hidden: true}); document.body.appendChild(a); a.click(); a.remove();",
-              "'Stop and save'", "'Full packets'", "'First 128 bytes'", "'capture.state'", "netChanged()", "TNT.api.captureGet()",
-              "TNT.api.captureStart(", "TNT.api.captureStop()", "TNT.api.captureDeleteFile(", "err.code === 'admin_required'"):
+    cap = _read("js/views/capture.js")
+    for s in ("TNT.views.capture = {", "'capture.state'", "'capture.sip'", "netChanged()", "TNT.api.captureGet()",
+              "TNT.api.captureStart(", "TNT.api.captureStop()", "TNT.api.captureSave()", "TNT.api.captureDiscard()",
+              "TNT.api.captureOpen(", "TNT.api.capturePackets(filterQuery(filter, null))", "TNT.api.capturePackets(filterQuery(filter, lastNo))",
+              "TNT.api.capturePacket(", "TNT.api.captureCalls()", "TNT.api.captureDeleteFile(", "err.code === 'admin_required'",
+              # the packet list: tailed from the last row number, started over when the ring rolled past it, capped in the DOM
+              "if (r.dropped_before) {", "els.tbody.children.length - DOM_ROWS",
+              # leaving with a capture that was never saved: Save / Discard / Stay, and the same warning on the window
+              "foot: [stay, throwAway, keep]", "window.addEventListener('beforeunload', beforeUnload)", "e.returnValue = ''",
+              # a call's audio is fetched as a blob, so a 404 never navigates the page
+              "const res = await fetch(TNT.api.captureCallAudioUrl(call.id), { credentials: 'same-origin' });", "URL.createObjectURL(blob)"):
         assert s in cap, s
-    # a download never navigates the page and never depends on the TNT window
-    assert not re.search(r"\blocation\b", cap) and "target:" not in cap and "window.pywebview" not in cap
+    # a saved capture is downloaded through a link the page makes and throws away, never by navigating
+    assert ("const a = h('a', { href: TNT.api.captureFileUrl(name), download: name, hidden: true });" in cap
+            and "document.body.appendChild(a);" in cap and "a.click();" in cap and "a.remove();" in cap)
+    assert "target:" not in cap
+    # the page works in a plain browser tab: the one thing it asks the TNT window for is the native file picker, it
+    # checks for it first (hasPicker) and hides Browse… without it, and the path field opens a file either way
+    bridge = [line.strip() for line in cap.splitlines() if "window.pywebview" in line]
+    assert bridge == [
+        "return !!(window.pywebview && window.pywebview.api && typeof window.pywebview.api.pick_capture_file === 'function');",
+        "const picked = await window.pywebview.api.pick_capture_file();"], bridge
+    assert "hidden: !hasPicker()" in cap
+    for s in ("TNT.api.captureOpenPath(what.path)", "TNT.api.captureOpen(what.name)"):
+        assert s in cap, s
+    # the only place the page sets location is the in-app link it held back while asking about an unsaved capture
+    assert re.findall(r"\blocation\.\w+", cap) == ["location.hash"]

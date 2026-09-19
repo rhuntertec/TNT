@@ -407,14 +407,31 @@ def test_view_shape(env):
     tid = env.mgr.add_target("1.1.1.1", label="CF")["id"]
     env.tick_all(tid, 2)
     v = env.mgr.target(tid)
-    assert set(v) == {"id", "host", "label", "kind", "ip", "enabled", "resolved", "resolve_error", "light",
+    assert set(v) == {"id", "host", "label", "name", "kind", "ip", "enabled", "resolved", "resolve_error", "light",
                       "in_outage", "last", "consecutive_missed", "consecutive_ok", "window", "day", "since_ts"}
     assert set(v["window"]) == {"seconds", "sent", "received", "lost", "loss_pct", "avg_ms", "min_ms", "max_ms",
                                 "jitter_ms"}
     assert set(v["day"]) == {"sent", "received", "lost", "loss_pct", "avg_ms", "min_ms", "max_ms"}
-    assert v["label"] == "CF" and v["enabled"] is True and v["kind"] == "internet" and v["since_ts"] == T0
+    assert v["label"] == "CF" and v["name"] is None and v["enabled"] is True and v["kind"] == "internet" and v["since_ts"] == T0
     assert env.mgr.target(12345) is None
     assert [t["id"] for t in env.mgr.targets()] == [tid]
+
+
+def test_set_target_name(env):
+    tid = env.mgr.add_target("1.1.1.1", label="CF")["id"]
+    view = env.mgr.set_target_name(tid, "  Cloudflare DNS  ")
+    assert view["name"] == "Cloudflare DNS" and view["label"] == "CF"       # trimmed; label is untouched
+    assert env.mgr.target(tid)["name"] == "Cloudflare DNS"
+    # persisted: a fresh manager on the same db reads it back
+    fresh = PingManager(env.db, env.config, env.bus, pinger=env.pinger, raw_log=env.raw, resolver=env.resolver)
+    assert env.db.get_target(tid)["name"] == "Cloudflare DNS"
+    # clearing (empty or None) reverts to no custom name
+    assert env.mgr.set_target_name(tid, "")["name"] is None
+    assert env.db.get_target(tid)["name"] is None
+    assert env.mgr.set_target_name(tid, None)["name"] is None
+    # a name longer than the cap is trimmed to 80 chars; an unknown id is None
+    assert len(env.mgr.set_target_name(tid, "x" * 200)["name"]) == 80
+    assert env.mgr.set_target_name(999999, "nope") is None
 
 
 def test_traffic_light_thresholds(env):

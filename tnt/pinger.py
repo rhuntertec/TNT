@@ -682,6 +682,7 @@ class _TargetState:
         self.id = int(row["id"])
         self.host = str(row["host"])
         self.label = row.get("label")
+        self.name = row.get("name")             # a custom display name the user set (overrides label/host)
         self.kind_db = str(row.get("kind") or "auto")
         self.enabled = bool(row.get("enabled", True))
         self.sort_order = int(row.get("sort_order") or 0)
@@ -1422,6 +1423,7 @@ class PingManager:
             "id": st.id,
             "host": st.host,
             "label": st.label,
+            "name": st.name,
             "kind": st.kind,
             "ip": st.ip,
             "enabled": st.enabled,
@@ -1560,6 +1562,25 @@ class PingManager:
             if publish:
                 self._publish_targets()
         return self._view(st, now)
+
+    def set_target_name(self, target_id: Any, name: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Set (or clear) a target's custom display name. Returns the updated view, or None when the
+        target does not exist. An empty name clears it (the UI reverts to the label/host)."""
+        st = self._state(target_id)
+        if st is None:
+            return None
+        clean = (str(name).strip()[:_LABEL_MAX] if name is not None else "") or None
+        with st.lock:
+            if st.name == clean:
+                return self._view_locked(st, float(self._clock()))
+            st.name = clean
+        try:
+            self._db.set_target_name(int(st.id), clean)
+        except Exception:  # noqa: BLE001
+            log.exception("saving the custom name for target %s failed", st.host)
+        log.info("target %d custom name %s", st.id, repr(clean) if clean else "cleared")
+        self._publish_targets()
+        return self._view(st, float(self._clock()))
 
     def remove_target(self, target_id: int) -> bool:
         """Stop the worker, flush its minute, delete the db row, notify listeners."""

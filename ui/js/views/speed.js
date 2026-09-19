@@ -1,6 +1,7 @@
 /* TNT — views/speed.js
    Latest result (big numbers), Run now with live progress, the "Latency under load" card (the last
-   test's bufferbloat grade, call quality, Zoom / Teams checks), history chart (24 h / 7 d / 30 d),
+   test's bufferbloat grade; the call-quality lines and the Zoom / Teams checks moved to the SIP page,
+   which is where somebody asking about calls is looking), history chart (24 h / 7 d / 30 d),
    patterns panel (by-hour bars + findings). */
 (function () {
   'use strict';
@@ -29,7 +30,6 @@
     F: 'Unusable under load: the connection stalls when it is busy',
   };
   const GRADE_CLASS = { 'A+': 'green', A: 'green', B: 'green', C: 'yellow', D: 'red', F: 'red' };
-  const CHECK_NAMES = { zoom: 'Zoom', teams: 'Teams' };
   const QUALITY_TEXT = {
     none: 'Runs with every speed test',
     failed: 'The last speed test failed',
@@ -37,14 +37,14 @@
   };
 
   /** Pure: what the "Latency under load" card shows for a speed result's quality (q, else last.quality) -> { state, grade, cls,
-   *  text, headline, gradeText, warning, call, busy, checks: [{ label, ok, title }], details }. state: 'none' (no test yet),
+   *  text, headline, gradeText, warning, details }. state: 'none' (no test yet),
    *  'failed', 'missing' (a test without the measurement), 'unavailable' (text = the service's reason), 'measured'. The chip is
    *  the bufferbloat grade (A+/A/B green, C yellow, D/F red) or a grey "—". Percentages go through TNT.util.fmtPct and
    *  milliseconds through TNT.util.fmtMs, so this runs once app.js has loaded. */
   function qualityView(q, last) {
     const isObj = (v) => !!v && typeof v === 'object';
     const isNum = (v) => typeof v === 'number' && isFinite(v);
-    const out = { state: 'none', grade: '—', cls: 'grey', text: '', headline: '', gradeText: '', warning: '', call: '', busy: '', checks: [], details: '' };
+    const out = { state: 'none', grade: '—', cls: 'grey', text: '', headline: '', gradeText: '', warning: '', details: '' };
     if (!isObj(last)) return Object.assign(out, { text: QUALITY_TEXT.none });
     if (!last.ok) return Object.assign(out, { state: 'failed', text: QUALITY_TEXT.failed });
     const qq = isObj(q) ? q : isObj(last.quality) ? last.quality : null;
@@ -64,12 +64,6 @@
     }
     out.gradeText = bb.grade ? String(bb.text || GRADE_TEXT[bb.grade] || '') : String(bb.reason || '');
     out.warning = bb.warning ? String(bb.warning) : '';
-    const call = isObj(qq.call) ? qq.call : {};
-    const mos = (x) => (isNum(x.mos) ? x.mos.toFixed(2) : '—');
-    if (isObj(call.idle) && call.idle.label) out.call = 'Call quality: ' + call.idle.label + ' (MOS ' + mos(call.idle) + ', estimate)';
-    if (isObj(call.loaded) && call.loaded.label) out.busy = 'While the line is busy: ' + call.loaded.label + ' (MOS ' + mos(call.loaded) + ')';
-    out.checks = (Array.isArray(call.checks) ? call.checks : []).filter((c) => isObj(c) && c.key)
-      .map((c) => ({ label: (CHECK_NAMES[c.key] || String(c.key)) + (c.ok ? ' ✓' : ' ✗'), ok: !!c.ok, title: c.detail ? String(c.detail) : '' }));
     const sent = (x) => (isNum(x.sent) ? String(x.sent) : '—');
     out.details = 'Idle ' + fmtMs(base.median_ms) + ' ms to ' + (qq.target || '?') + ' · busy ' + fmtMs(down.mean_ms) + ' / ' + fmtMs(up.mean_ms) + ' ms'
       + ' · loss ' + fmtPct(down.loss_pct) + ' / ' + fmtPct(up.loss_pct) + ' · ' + sent(down) + ' / ' + sent(up) + ' probes';
@@ -93,9 +87,6 @@
     if (v.headline) add(h('div', { class: 'strong quality-headline' }, v.headline));
     if (v.gradeText) add(h('div', null, v.gradeText));
     if (v.warning) add(h('div', { class: 'muted small quality-warning' }, TNT.ui.icon('warning'), h('span', null, v.warning)));
-    if (v.call) add(h('div', { class: 'quality-call' }, v.call));
-    if (v.busy) add(h('div', { class: 'quality-call' }, v.busy));
-    if (v.checks.length) add(h('div', { class: 'row quality-checks' }, v.checks.map((c) => h('span', { class: 'badge ' + (c.ok ? 'green' : 'red'), title: c.title || null }, c.label))));
     if (v.details) add(h('div', { class: 'muted small quality-details' }, v.details));
   }
 

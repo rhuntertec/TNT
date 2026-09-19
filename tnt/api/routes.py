@@ -70,12 +70,21 @@ run()``), ``engine.portcheck`` (``tnt.portcheck.PortChecker.test(port)``), ``eng
 update_settings(patch) / files()``).  ``GET /api/netcheck/nat`` is ``{"result": NAT_RESULT|null, "running"}`` and ``POST``
 (no body) runs a check, ``{"result", "running": false}``.  ``GET /api/netcheck/switch`` is SWITCH_STATUS, ``POST``
 ``{"adapter", "seconds"}`` starts listening and ``DELETE`` cancels (both ``{"job"}``).  ``POST /api/netcheck/portforward``
-``{"port"}`` is PORTCHECK_RESULT.  ``GET /api/tools/capture`` is CAPTURE_STATUS, ``POST`` the start body (a key left out
-takes the service default) and ``DELETE`` stops and keeps the capture (both ``{"capture": JOB}``); ``GET
-/api/tools/capture/files/{name}`` is the file as a :class:`FileResponse` download and ``DELETE`` on it ``{"files"}``.
+``{"port"}`` is PORTCHECK_RESULT.  The packet capture answers ``GET /api/capture`` with CAPTURE STATUS; ``POST
+/api/capture/start`` ``{"adapter", "max_seconds"?, "max_mb"?}``, ``/stop``, ``/save``, ``/discard`` and ``/open``
+``{"name"}`` all answer ``{"session": SESSION|null}`` (``/save`` adds ``{"files"}``); ``GET /api/capture/packets``
+``?since=&limit=&ip=&mac=&proto=`` is the packet list and ``/packets/{no}`` one packet's detail tree and hex dump;
+``GET /api/capture/calls`` is ``{"calls"}`` and ``/calls/{call}/audio`` the call rebuilt as a WAV; ``GET
+/api/capture/files/{name}`` is the file as a :class:`FileResponse` download and ``DELETE`` on it ``{"files"}``.
 ``GET /api/tftp/status``, ``POST /api/tftp/start`` ``{"adapter", "uploads"}``, ``/api/tftp/stop``, ``/api/tftp/uploads``
 ``{"on"}`` and ``PUT /api/tftp/settings`` ``{"adapter", "max_upload_mb"}`` answer the TFTP STATUS; ``GET /api/tftp/files`` is
-``{"files": [...]}`` and ``GET /api/status`` carries ``"tftp"`` (``TftpServer.summary()``, null without the component).
+``{"files": [...]}`` and ``GET /api/status`` carries ``"tftp"`` (``TftpServer.summary()``, null without the component)
+and ``"capture"`` (``CaptureManager.tile()``: counts and the adapter's name for the Packet capture tile, never any
+packet contents; the packets themselves are behind the admin-gated ``/api/capture`` routes).  Pro AV answers ``GET
+/api/proav`` with its STATUS, ``POST /api/proav/scan`` ``{"seconds"?, "adapter"?, "deep"?}`` with ``{"job": JOB}``,
+``POST /api/proav/cancel`` with ``{"cancelled", "job"}`` and ``GET /api/proav/result`` with ``{"result": RESULT|null}``
+(``tnt.proav``; the scan only listens, so the routes are not admin-gated, but a cross-origin browser page may not
+start or stop one).
 Every POST/PUT/DELETE among them, and the capture download, refuses a browser page of another origin first (403
 ``forbidden``, :data:`QUICK_TOOLS_CROSS_ORIGIN_MSG`).  Every capture route then needs a Windows administrator, checked
 like the Wi-Fi keys (403 ``admin_required``, :data:`CAPTURE_ADMIN_REQUIRED_MSG` / :data:`CAPTURE_ADMIN_UNVERIFIED_MSG`,
@@ -84,7 +93,8 @@ failing closed), before the 503 for a missing component; ``GET /api/events`` lea
 errors are answered before
 :func:`_tool_call` (:data:`TYPED_ERRORS`, :func:`_typed_call`): ``PktmonBusy`` 409 ``conflict``, ``PktmonUnavailable``
 409 ``unavailable``, ``RateLimited`` 429 ``rate_limited`` with ``Retry-After``, ``NoPublicIp`` 409 ``no_public_ip``,
-``VpnActive`` 409 ``vpn``, ``CaptureFileBusy`` 409 ``conflict``, ``CaptureFileMissing`` 404 ``not_found`` and
+``VpnActive`` 409 ``vpn``, ``CaptureFileBusy`` and ``CaptureBusy`` 409 ``conflict``, ``CaptureUnavailable`` 409
+``unavailable``, ``CaptureFileMissing`` 404 ``not_found`` and
 ``TftpPortInUse`` 409 ``{"error": {"code": "tftp_port_in_use", "message"}, "owners": [{"pid", "name"}]}``; a busy text
 ("already running") stays 409 ``conflict``.
 ``GET /api/oui?prefix=AA:BB:CC&prefix=...`` (1-256 prefixes, repeated and/or comma separated;
@@ -128,6 +138,12 @@ Contract gaps resolved here (documented deviations):
   and ``"changed_ts"`` to the snapshot.  Without a watcher (``engine.netwatch`` missing or
   ``None``) generation is 0, ``changed_ts`` and ``summary`` null, ``networks`` empty and the
   gateway / adapter name come from ``netinfo_summary()``.
+* Realtime throughput (``engine.throughput``, :mod:`tnt.throughput`): ``GET /api/throughput?window_s=``
+  is the card's payload - ``{"ts","window_s","step_s","history_s","windows","nics":[NIC...],"note"}``, one
+  NIC per interface that moved something inside the window (plus the internet-facing one, always).  An
+  unknown or missing ``window_s`` is the nearest of ``tnt.throughput.WINDOWS``, never an error, so a stale
+  page cannot 400.  503 without the component.  The live feed is the ``throughput.sample`` SSE event, one a
+  second, carrying the same NIC rows without their series - the route is only ever asked for the backlog.
 * IP location (DB-IP Lite, ``engine.geoip``): ``GET /api/status`` carries ``"geoip"`` (STATUS from
   ``GeoIpManager.status()``, null without the component) and ``map.public_geo`` (GEO of ``map.public_ip.ip``
   or null, from the link map).  ``GET /api/geoip`` is STATUS; ``GET /api/geoip/lookup?ip=`` is
@@ -139,6 +155,7 @@ Contract gaps resolved here (documented deviations):
 from __future__ import annotations
 
 import importlib
+import io
 import ipaddress
 import json
 import logging
@@ -519,8 +536,11 @@ DHCP_CONFLICT_CODE = "dhcp_server_present"
 DHCP_CONFLICT_MESSAGE = "Another DHCP server is active on this network"
 DHCP_SETTINGS_KEYS = ("adapter", "pool_start", "pool_end", "pool_size", "lease_s", "ping_check")
 LAN_SETTINGS_KEYS = ("enabled",)
-#: ``POST /api/tools/capture``: the body keys handed to ``CaptureManager.start`` (a key left out takes its default).
-CAPTURE_START_KEYS = ("adapter", "seconds", "size_mb", "full_packets", "host", "port", "protocol")
+#: ``POST /api/proav/scan``: the body keys handed to ``ProAvScanner.start`` (a key left out takes its default).
+PROAV_START_KEYS = ("seconds", "adapter", "deep")
+
+#: ``POST /api/capture/start``: the body keys handed to ``CaptureManager.start`` (a key left out takes its default).
+CAPTURE_START_KEYS = ("adapter", "max_seconds", "max_mb")
 
 
 def _dhcp_conflict(exc: BaseException) -> Optional[Tuple[int, Dict[str, Any]]]:
@@ -609,11 +629,117 @@ def _tool_call(what: str, fn: Callable[[], Any]) -> Any:
 TFTP_PORT_IN_USE_CODE = "tftp_port_in_use"
 #: The network tools' typed errors, by module and class name: ``(HTTP status, error code)``.  Most are RuntimeErrors
 #: that :func:`_tool_call` would answer with 500, so :func:`_typed_call` answers them first.
+#: A main tool that is switched off in Settings (tnt.config.TOOLS) takes no automated action and cannot be
+#: started.  Reads still answer, so the page can say why and re-enabling needs nothing but the toggle.
+TOOL_OFF_CODE = "tool_off"
+TOOL_NAMES = {"speed": "Speed", "discovery": "Discovery", "wifi": "WiFi", "capture": "Packet capture",
+              "proav": "Pro AV", "sip": "SIP"}
+
+
+def _tools_on(engine: Any) -> Dict[str, bool]:
+    """``{tool: on}`` for every switchable tool.  Anything unreadable is on."""
+    cfg = getattr(engine, "config", None)
+    try:
+        from tnt.config import TOOLS, tool_on
+
+        return {name: tool_on(cfg, name) for name in TOOLS}
+    except Exception:                       # noqa: BLE001
+        log.debug("the tools block could not be read", exc_info=True)
+        return {}
+
+
+def _need_tool(engine: Any, name: str) -> None:
+    """Refuse when *name* is switched off.  409 rather than 404: the route exists and will work again the moment
+    the toggle goes back on, which is a different thing from a route that is not there."""
+    if _tools_on(engine).get(name, True):
+        return
+    raise ApiError(409, TOOL_OFF_CODE,
+                   f"The {TOOL_NAMES.get(name, name)} tool is switched off in Settings")
+
+
+SIP_WINDOW_H = 24               # the qualifier's default window: a working day and the night around it
+
+
+def _sip_setting(engine: Any, key: str, default: Any = None) -> Any:
+    """One value out of the ``sip`` settings block, or *default*.  Read when it is needed rather than at start:
+    the tech names their PBX on the SIP page and expects the next reading to use it."""
+    try:
+        block = (engine.config.get("sip") or {}) if getattr(engine, "config", None) is not None else {}
+        value = block.get(key, default)
+    except Exception:                       # noqa: BLE001
+        return default
+    return value if value not in (None, "") else default
+
+
+def _sip_host(engine: Any) -> Optional[str]:
+    host = _sip_setting(engine, "host")
+    return str(host).strip() or None if isinstance(host, str) else None
+
+
+def _sip_servers(engine: Any) -> Optional[list]:
+    """The configured STUN servers as ``[(host, port), ...]``, or None to let the checker use its own pair.
+
+    Stored as ``"host:port"`` strings because that is how a tech writes one down; a bare host keeps the default
+    port.  A malformed entry is dropped rather than refused: the test is worth running on the ones that parse."""
+    raw = _sip_setting(engine, "stun")
+    if not isinstance(raw, (list, tuple)) or not raw:
+        return None
+    out = []
+    for entry in raw:
+        if isinstance(entry, (list, tuple)) and entry:
+            out.append((str(entry[0]), entry[1] if len(entry) > 1 else None))
+            continue
+        text = str(entry or "").strip()
+        if not text:
+            continue
+        host, _sep, port = text.rpartition(":")
+        if host and port.isdigit():
+            out.append((host, int(port)))
+        else:
+            out.append((text, None))
+    return out or None
+
+
+def _sip_tile(engine: Any) -> Optional[Dict[str, Any]]:
+    """``status.sip``: the qualifier's tile, with the ALG and STUN verdicts each check last kept.
+
+    All three are reads.  Nothing here starts a check - the home page must never make this PC send SIP or STUN
+    at a server because somebody left the window open."""
+    qual = getattr(engine, "sipqual", None)
+    if qual is None:
+        return {"available": False, "reason": "the SIP qualifier is not available", "verdict": "unknown",
+                "lan": None, "wan": None, "sip": None, "calls": None, "sip_host": None, "ts": None,
+                "alg": None, "nat": None}
+    tracker = getattr(engine, "networks", None)
+    view = _safe_call("networks.current()", tracker.current, None) if tracker is not None else None
+    row = _safe_call("sipqual.tile()", lambda: qual.tile(
+        network_id=_current_network_id(engine), sip_host=_sip_host(engine),
+        gateway=view.get("gateway_ip") if isinstance(view, dict) else None,
+        window_h=float(_sip_setting(engine, "window_h", SIP_WINDOW_H) or SIP_WINDOW_H)), None)
+    if not isinstance(row, dict):
+        return None
+    alg, stun = getattr(engine, "sipalg", None), getattr(engine, "sipnat", None)
+    row["alg"] = (_safe_call("sipalg.last()", alg.last, None) or {}).get("verdict") if alg is not None else None
+    row["nat"] = (_safe_call("sipnat.last()", stun.last, None) or {}).get("mapping") if stun is not None else None
+    return row
+
+
+def _safe_name(text: Any) -> str:
+    """A Call-ID or stream id as a download file name: they are free-form and arrive from a capture file."""
+    cleaned = "".join(ch if ch.isalnum() or ch in "-_." else "-" for ch in str(text or ""))[:60]
+    return cleaned.strip("-") or "audio"
+
+
 TYPED_ERRORS: Dict[str, Dict[str, Tuple[int, str]]] = {
     "tnt.pktmon": {"PktmonBusy": (409, "conflict"), "PktmonUnavailable": (409, "unavailable")},
     "tnt.portcheck": {"RateLimited": (429, "rate_limited"), "NoPublicIp": (409, "no_public_ip"), "VpnActive": (409, "vpn")},
     "tnt.tftp": {"TftpPortInUse": (409, TFTP_PORT_IN_USE_CODE)},
-    "tnt.capture": {"CaptureFileBusy": (409, "conflict"), "CaptureFileMissing": (404, "not_found")},
+    "tnt.capture": {"CaptureFileBusy": (409, "conflict"), "CaptureFileMissing": (404, "not_found"),
+                    "CaptureBusy": (409, "conflict"), "CaptureUnavailable": (409, "unavailable")},
+    "tnt.proav": {"ProAvUnavailable": (409, "unavailable")},
+    "tnt.sipflow": {"FlowError": (400, "bad_request")},
+    "tnt.sipalg": {"AlgUnavailable": (409, "unavailable")},
+    "tnt.sipnat": {"NatError": (409, "unavailable")},
 }
 
 
@@ -759,8 +885,9 @@ CAPTURE_ADMIN_REQUIRED_MSG = "Packet capture needs a Windows administrator accou
 CAPTURE_ADMIN_UNVERIFIED_MSG = ("Packet capture needs a Windows administrator account; "
                                 "this request could not be verified as one.")
 #: Event types GET /api/events sends only to a Windows administrator, as every packet capture route answers only one:
-#: ``capture.state`` carries the capture job (adapter, host / port / protocol filters, file name) and the saved files.
-ADMIN_ONLY_EVENTS = frozenset({"capture.state"})
+#: ``capture.state`` carries the open capture (adapter, counts, file name) and ``capture.sip`` a SIP call that was found
+#: (the numbers that called each other).
+ADMIN_ONLY_EVENTS = frozenset({"capture.state", "capture.sip"})
 
 
 def _cross_origin_browser_request(req: Request, api: Any) -> bool:
@@ -844,6 +971,9 @@ def build_routes(engine: Any, api: Any) -> Router:
         geoip = getattr(engine, "geoip", None)
         updater = getattr(engine, "update", None)
         tftp = getattr(engine, "tftp", None)
+        capture = getattr(engine, "capture", None)
+        proav = getattr(engine, "proav", None)
+        tools = _tools_on(engine)
         watch = _net_state(engine)
         nic = (net.get("internet_nic") if isinstance(net, dict) else None) or {}
         return {
@@ -853,6 +983,14 @@ def build_routes(engine: Any, api: Any) -> Router:
             "geoip": _safe_call("geoip.status()", geoip.status, None) if geoip is not None else None,
             "update": _safe_call("update.status()", updater.status, None) if updater is not None else None,
             "tftp": _safe_call("tftp.summary()", tftp.summary, None) if tftp is not None else None,
+            # counts and the adapter's name only (TILE_KEYS): the packets themselves need the admin-gated routes
+            "capture": (_safe_call("capture.tile()", capture.tile, None) if capture is not None else None) if tools.get("capture", True) else None,
+            # counts and the worst finding only (tnt.proav.TILE_KEYS); the whole result is behind /api/proav/result
+            "proav": (_safe_call("proav.tile()", proav.tile, None) if proav is not None else None) if tools.get("proav", True) else None,
+            # the verdict and each leg's grade only (tnt.sipqual.TILE_KEYS), cached a minute; the ALG check's and
+            # the STUN test's verdicts come from whatever each last kept. A tool that is off gets null rather
+            # than a block: the tile is gone, and the qualifier's database reads go with it.
+            "sip": _sip_tile(engine) if tools.get("sip", True) else None,
             "version": getattr(engine, "version", ""),
             "started_ts": started,
             "uptime_s": round(now - started, 1) if started else 0.0,
@@ -862,7 +1000,8 @@ def build_routes(engine: Any, api: Any) -> Router:
             "overall_light": _safe_call("overall_light()", engine.overall_light, "grey"),
             "targets": targets,
             "outages": _safe_call("outages.status()", outages.status) if outages is not None else None,
-            "speed": _safe_call("speed.status()", speed.status) if speed is not None else None,
+            "speed": (_safe_call("speed.status()", speed.status) if speed is not None else None)
+                     if tools.get("speed", True) else None,
             "discovery": {
                 "running": bool(disc.get("running", False)),
                 "progress": disc.get("progress"),
@@ -878,6 +1017,9 @@ def build_routes(engine: Any, api: Any) -> Router:
                 "networks": [str(n) for n in (watch.get("networks") or [])] if watch is not None else [],
                 "network_id": _current_network_id(engine),
             },
+            # which main tools are switched on, so the page knows which tiles exist before it has
+            # loaded the settings at all (tnt.config.TOOLS)
+            "tools": tools,
             "settings": {
                 "theme": config.get("ui.theme", "light") if config is not None else "light",
                 "loaded": bool(config.get("ping.loaded", True)) if config is not None else True,
@@ -893,6 +1035,12 @@ def build_routes(engine: Any, api: Any) -> Router:
             snap["generation"] = int(watch.get("generation") or 0)
             snap["changed_ts"] = watch.get("changed_ts")
         return snap
+
+    # -- realtime throughput (Network info) -----------------------------------
+    @r.get("/api/throughput")
+    def throughput(req: Request) -> Any:
+        mon = _need(engine, "throughput", "realtime throughput")
+        return mon.view(req.query.get("window_s"))
 
     # -- IP location (DB-IP Lite) --------------------------------------------
     @r.get("/api/geoip")
@@ -1000,6 +1148,20 @@ def build_routes(engine: Any, api: Any) -> Router:
             raise ApiError(404, "not_found", f"target {tid} not found")
         return {"removed": True}
 
+    @r.route("PATCH", "/api/targets/{id}")
+    def rename_target(req: Request) -> Any:
+        """``{"name": str|null}``: set or clear a target's custom display name (null/empty clears it).
+        Returns the updated target view; 404 when the target does not exist."""
+        ping = _need(engine, "ping", "ping monitoring")
+        tid = req.int_param("id")
+        body = req.json_object()
+        raw = body.get("name")
+        name = str(raw).strip() or None if raw is not None else None
+        view = ping.set_target_name(tid, name)
+        if view is None:
+            raise ApiError(404, "not_found", f"target {tid} not found")
+        return view
+
     @r.get("/api/targets/{id}/samples")
     def samples(req: Request) -> Any:
         ping = _need(engine, "ping", "ping monitoring")
@@ -1048,6 +1210,7 @@ def build_routes(engine: Any, api: Any) -> Router:
 
     @r.post("/api/speedtests/run")
     def speedtest_run(req: Request) -> Any:
+        _need_tool(engine, "speed")
         sched = _need(engine, "speed", "speed tests")
         if not sched.run_now():
             raise ApiError(409, "conflict", "a speed test is already running")
@@ -1081,6 +1244,7 @@ def build_routes(engine: Any, api: Any) -> Router:
 
     @r.post("/api/discovery/scan")
     def discovery_scan(req: Request) -> Any:
+        _need_tool(engine, "discovery")
         _need(engine, "discovery", "network discovery")
         body = req.json_object()
         range_text = body.get("range")
@@ -1109,6 +1273,49 @@ def build_routes(engine: Any, api: Any) -> Router:
         st.setdefault("default_range", None)
         st.setdefault("default_ports", [])
         return st
+
+    # -- Pro AV -------------------------------------------------------------
+    def _proav(req: Request) -> Any:
+        """The Pro AV scanner for *req*: a browser page of another origin may not start or stop a listen.
+
+        The routes are not admin-gated. A scan joins four multicast groups and reads what is already being announced
+        to every device on the VLAN; it carries no payload out (the Layer 2 listen reports counts, an IGMP querier's
+        address and DSCP numbers, never packet contents), so it is the same class of thing as a discovery scan."""
+        if req.method != "GET":
+            _quick_tool_origin(req, "Pro AV scan")
+        return _need(engine, "proav", "Pro AV scanning")
+
+    def _proav_call(what: str, fn: Callable[[], Any]) -> Any:
+        return _typed_call(what, fn, "tnt.proav")
+
+    @r.get("/api/proav")
+    def proav_status(req: Request) -> Any:
+        """``STATUS``: whether this PC can scan, the adapters it can scan on, the running job and the limits."""
+        mgr = _proav(req)
+        return _tool_call("proav.status()", mgr.status)
+
+    @r.post("/api/proav/scan")
+    def proav_scan(req: Request) -> Any:
+        """``{"seconds"?, "adapter"?, "deep"?}`` -> ``{"job": JOB}``. A key left out takes its default; ``deep``
+        false leaves out the Layer 2 listen (and with it the IGMP, flooding and marking checks)."""
+        _need_tool(engine, "proav")
+        mgr = _proav(req)
+        body = req.json_object()
+        kwargs = {k: body[k] for k in PROAV_START_KEYS if k in body}
+        return {"job": _proav_call("proav.start()", lambda: mgr.start(**kwargs))}
+
+    @r.post("/api/proav/cancel")
+    def proav_cancel(req: Request) -> Any:
+        """End the listen now and keep what it heard -> ``{"cancelled": bool, "job": JOB}``."""
+        mgr = _proav(req)
+        cancelled = bool(_tool_call("proav.cancel()", mgr.cancel))
+        return {"cancelled": cancelled, "job": _tool_call("proav.job()", mgr.job)}
+
+    @r.get("/api/proav/result")
+    def proav_result(req: Request) -> Any:
+        """The last scan's whole RESULT, or ``{"result": null}`` when none has run in this service's lifetime."""
+        mgr = _proav(req)
+        return {"result": _tool_call("proav.last()", mgr.last)}
 
     # -- DHCP server tool ---------------------------------------------------
     @r.get("/api/dhcp/status")
@@ -1363,10 +1570,10 @@ def build_routes(engine: Any, api: Any) -> Router:
         body = req.json_object()
         return _typed_call("portcheck.test()", lambda: checker.test(body.get("port")), "tnt.portcheck")
 
-    # -- packet capture (Tools page) ------------------------------------------------------------------
+    # -- packet capture (its own page) ----------------------------------------------------------------
     def _capture(req: Request) -> Any:
-        """The capture manager for *req*: a browser page of another origin is refused on every route but the status
-        read, then anyone who is not a Windows administrator (failing closed), then 503 without the component."""
+        """The capture manager for *req*: a browser page of another origin is refused on every route but the reads,
+        then anyone who is not a Windows administrator (failing closed), then 503 without the component."""
         if req.method != "GET" or req.params.get("name") is not None:
             # the download too: a page of another origin must not make a browser save a capture
             _quick_tool_origin(req, "Packet capture")
@@ -1377,45 +1584,245 @@ def build_routes(engine: Any, api: Any) -> Router:
                            CAPTURE_ADMIN_REQUIRED_MSG if decision == "denied" else CAPTURE_ADMIN_UNVERIFIED_MSG)
         return _need(engine, "capture", "packet capture")
 
-    @r.get("/api/tools/capture")
+    def _capture_call(what: str, fn: Callable[[], Any]) -> Any:
+        return _typed_call(what, fn, "tnt.capture")
+
+    @r.get("/api/capture")
     def capture_status(req: Request) -> Any:
+        """``STATUS``: what can capture, the open session, the saved files and the limits."""
         mgr = _capture(req)
         return _tool_call("capture.status()", mgr.status)
 
-    @r.post("/api/tools/capture")
+    @r.post("/api/capture/start")
     def capture_start(req: Request) -> Any:
-        """``{"adapter", "seconds"?, "size_mb"?, "full_packets"?, "host"?, "port"?, "protocol"?}`` -> ``{"capture": JOB}``.
-        A key left out takes the service default; a null that is sent is checked like any other value."""
+        """``{"adapter", "max_seconds"?, "max_mb"?}`` -> ``{"session": SESSION}``. A key left out takes the default."""
+        _need_tool(engine, "capture")
         mgr = _capture(req)
         body = req.json_object()
         kwargs = {k: body[k] for k in CAPTURE_START_KEYS if k in body}
         kwargs["adapter"] = body.get("adapter")
-        return {"capture": _typed_call("capture.start()", lambda: mgr.start(**kwargs), "tnt.pktmon", "tnt.capture")}
+        return {"session": _capture_call("capture.start()", lambda: mgr.start(**kwargs))}
 
-    @r.delete("/api/tools/capture")
+    @r.post("/api/capture/stop")
     def capture_stop(req: Request) -> Any:
-        """End the capture early and keep it -> ``{"capture": JOB|null}``."""
+        """End the capture now and keep it -> ``{"session": SESSION|null}``."""
         mgr = _capture(req)
-        return {"capture": _typed_call("capture.stop()", mgr.stop, "tnt.pktmon", "tnt.capture")}
+        return {"session": _capture_call("capture.stop()", mgr.stop)}
 
-    @r.get("/api/tools/capture/files/{name}")
+    @r.post("/api/capture/save")
+    def capture_save(req: Request) -> Any:
+        """Keep the open capture as a saved file -> ``{"session": SESSION, "files": [FILE]}``."""
+        mgr = _capture(req)
+        session = _capture_call("capture.save()", mgr.save)
+        return {"session": session, "files": _tool_call("capture.files()", mgr.files)}
+
+    @r.post("/api/capture/discard")
+    def capture_discard(req: Request) -> Any:
+        """Throw the open capture away (its unsaved file is deleted) -> ``{"session": null}``."""
+        mgr = _capture(req)
+        _capture_call("capture.discard()", mgr.discard)
+        return {"session": None}
+
+    @r.post("/api/capture/open")
+    def capture_open(req: Request) -> Any:
+        """Read a capture into the packet list -> ``{"session": SESSION}``.
+
+        ``{"name"}`` is one of TNT's own saved captures; ``{"path"}`` is the full path of any capture file on this PC
+        (a Wireshark file, one off a switch). A body with neither is 400."""
+        mgr = _capture(req)
+        body = req.json_object()
+        if body.get("path") is not None:
+            path = body.get("path")
+            return {"session": _capture_call("capture.open_path()", lambda: mgr.open_path(path))}
+        if body.get("name") is None:
+            raise ApiError(400, "bad_request", "give a saved capture's name, or the path of a file on this PC")
+        name = body.get("name")
+        return {"session": _capture_call("capture.open_file()", lambda: mgr.open_file(name))}
+
+    @r.get("/api/capture/packets")
+    def capture_packets(req: Request) -> Any:
+        """The packet list: ``?since=&limit=&ip=&mac=&proto=`` (proto repeated or comma separated)."""
+        mgr = _capture(req)
+        q = req.query
+        protos = [p for raw in req.query_all("proto") for p in str(raw).split(",") if p.strip()]
+        return _tool_call("capture.packets()", lambda: mgr.packets(
+            since=q.get("since"), limit=q.get("limit"), ip=q.get("ip"), mac=q.get("mac"), protos=protos))
+
+    @r.get("/api/capture/packets/{no}")
+    def capture_packet(req: Request) -> Any:
+        """One packet: ``{"row", "layers", "hex", "bytes"}`` (the detail tree and the hex dump)."""
+        mgr = _capture(req)
+        return _capture_call("capture.packet()", lambda: mgr.packet(req.params.get("no")))
+
+    @r.get("/api/capture/calls")
+    def capture_calls(req: Request) -> Any:
+        """The SIP calls found in the open capture -> ``{"calls": [CALL]}``."""
+        mgr = _capture(req)
+        return {"calls": _tool_call("capture.calls()", mgr.calls)}
+
+    @r.get("/api/capture/calls/{call}/audio")
+    def capture_call_audio(req: Request) -> Any:
+        """One SIP call rebuilt as a WAV file; 404 when its codec is not one TNT can decode."""
+        mgr = _capture(req)
+        call_id = req.params.get("call", "")
+        wav = _capture_call("capture.call_audio()", lambda: mgr.call_audio(call_id))
+        return FileResponse(io.BytesIO(wav), len(wav), f"TNT-call-{call_id}.wav", "audio/wav")
+
+    @r.get("/api/capture/files/{name}")
     def capture_file(req: Request) -> Any:
         """A saved capture as a download (:class:`FileResponse`, HEAD included); 404 for a name that is not one."""
         mgr = _capture(req)
         name = req.params.get("name", "")
-        fh, size = _typed_call("capture.open_file()", lambda: mgr.open_file(name), "tnt.capture")
+        fh, size = _capture_call("capture.file_download()", lambda: mgr.file_download(name))
         try:
             return FileResponse(fh, size, name)
         except Exception:  # noqa: BLE001 - never leave the file open (it could not be deleted)
             fh.close()
             raise
 
-    @r.delete("/api/tools/capture/files/{name}")
+    @r.delete("/api/capture/files/{name}")
     def capture_file_delete(req: Request) -> Any:
         """Delete a saved capture -> ``{"files": [FILE]}``; 409 while it is being downloaded."""
         mgr = _capture(req)
         name = req.params.get("name", "")
-        return {"files": _typed_call("capture.delete_file()", lambda: mgr.delete_file(name), "tnt.capture")}
+        return {"files": _capture_call("capture.delete_file()", lambda: mgr.delete_file(name))}
+
+    # -- SIP (its own page: the qualifier, the ALG check, STUN and the call flows) ---------------------
+    @r.get("/api/sip/qualifier")
+    def sip_qualifier(req: Request) -> Any:
+        """``?hours=&host=`` -> ``{"rating": QUALIFIER}``, read out of the ping history and the last speed test.
+
+        Nothing is measured here: the answer is as good as the history behind it, and a leg without enough is
+        reported ungraded rather than guessed at."""
+        qual = _need(engine, "sipqual", "the SIP qualifier")
+        hours = min(720.0, max(1.0, req.query_float("hours", SIP_WINDOW_H) or SIP_WINDOW_H))
+        host = (req.query.get("host") or "").strip() or _sip_host(engine)
+        # the gateway address, so a target that pings it by address is read as the LAN leg and not the internet one
+        tracker = getattr(engine, "networks", None)
+        view = _safe_call("networks.current()", tracker.current, None) if tracker is not None else None
+        gateway = view.get("gateway_ip") if isinstance(view, dict) else None
+        return {"rating": _tool_call("sipqual.rating()", lambda: qual.rating(
+            window_h=hours, network_id=_current_network_id(engine), sip_host=host, gateway=gateway))}
+
+    @r.get("/api/sip/alg")
+    def sip_alg(req: Request) -> Any:
+        """The last SIP ALG check -> ``{"result": ALG|null, "running"}``."""
+        alg = _need(engine, "sipalg", "the SIP ALG check")
+        return {"result": alg.last(), "running": bool(alg.running())}
+
+    @r.post("/api/sip/alg")
+    def sip_alg_run(req: Request) -> Any:
+        """``{"host": str, "port": int|null}`` -> ``{"result": ALG, "running": false}``; synchronous, 409 while one
+        runs.  The host is the customer's own PBX, SBC or registrar: the check works by reading back what that
+        server echoes, so it has to be a server that answers this site's SIP."""
+        _need_tool(engine, "sip")
+        _quick_tool_origin(req, "SIP ALG check")
+        alg = _need(engine, "sipalg", "the SIP ALG check")
+        body = req.json_object()
+        host = body.get("host") if body.get("host") not in (None, "") else _sip_host(engine)
+        port = body.get("port") if body.get("port") not in (None, "") else _sip_setting(engine, "port", 5060)
+        if not host:
+            raise ApiError(400, "bad_request", "name your PBX, SBC or registrar - the check reads back what that "
+                                               "server echoes, so there has to be one")
+        return {"result": _typed_call("sipalg.check()", lambda: alg.check(host, port), "tnt.sipalg"),
+                "running": False}
+
+    @r.get("/api/sip/stun")
+    def sip_stun(req: Request) -> Any:
+        """The last STUN test -> ``{"result": STUN|null, "running"}``."""
+        stun = _need(engine, "sipnat", "the STUN test")
+        return {"result": stun.last(), "running": bool(stun.running())}
+
+    @r.post("/api/sip/stun")
+    def sip_stun_run(req: Request) -> Any:
+        """``{"servers": [[host, port], ...]|null}`` -> ``{"result": STUN, "running": false}``; synchronous, 409
+        while one runs.  Absent or null uses the two built-in public servers."""
+        _need_tool(engine, "sip")
+        _quick_tool_origin(req, "STUN test")
+        stun = _need(engine, "sipnat", "the STUN test")
+        servers = req.json_object().get("servers") or _sip_servers(engine)
+        return {"result": _typed_call("sipnat.check()", lambda: stun.check(servers), "tnt.sipnat"),
+                "running": False}
+
+    @r.post("/api/sip/stun/lifetime")
+    def sip_stun_lifetime(req: Request) -> Any:
+        """``{"server": [host, port]|null}`` -> ``{"result": LIFETIME}``.  Slow by nature - it sits idle for up to
+        the whole step list - so it is never part of the quick test and never runs unless this is asked for."""
+        _need_tool(engine, "sip")
+        _quick_tool_origin(req, "NAT binding lifetime test")
+        stun = _need(engine, "sipnat", "the STUN test")
+        server = req.json_object().get("server") or (_sip_servers(engine) or [None])[0]
+        return {"result": _typed_call("sipnat.lifetime()", lambda: stun.lifetime(server), "tnt.sipnat")}
+
+    def _sipflow(req: Request) -> Any:
+        """The call-flow reader for *req*: a browser page of another origin may not make this PC open a file."""
+        if req.method != "GET":
+            _quick_tool_origin(req, "SIP call flows")
+        return _need(engine, "sipflow", "the SIP call flows")
+
+    @r.get("/api/sip/flow")
+    def sip_flow(req: Request) -> Any:
+        """The loaded captures and every call in them -> ``{"flow": FLOW}`` (empty sources without any)."""
+        return {"flow": _tool_call("sipflow.view()", _sipflow(req).view)}
+
+    @r.post("/api/sip/flow")
+    def sip_flow_open(req: Request) -> Any:
+        """``{"path": str, "slot": "a"|"b"}`` -> ``{"flow": FLOW}``.
+
+        Two slots because a call audio problem is usually diagnosed from both sides of the network at once; one
+        slot is the ordinary case and works on its own."""
+        _need_tool(engine, "sip")
+        reader = _sipflow(req)
+        body = req.json_object()
+        path, slot = body.get("path"), (body.get("slot") or "a")
+        _typed_call("sipflow.open()", lambda: reader.open(path, slot), "tnt.sipflow")
+        return {"flow": _tool_call("sipflow.view()", reader.view)}
+
+    @r.delete("/api/sip/flow")
+    def sip_flow_close(req: Request) -> Any:
+        """``?slot=a|b`` closes one capture, no slot closes both -> ``{"flow": FLOW}``."""
+        reader = _sipflow(req)
+        slot = req.query.get("slot")
+        _tool_call("sipflow.close()", lambda: reader.close(slot) if slot else reader.clear())
+        return {"flow": _tool_call("sipflow.view()", reader.view)}
+
+    @r.get("/api/sip/flow/calls/{call}")
+    def sip_flow_call(req: Request) -> Any:
+        """One call merged across the sides it was seen on -> ``{"call": FLOWCALL}``; 404 for an unknown id."""
+        reader = _sipflow(req)
+        call = _tool_call("sipflow.call()", lambda: reader.call(req.params.get("call", "")))
+        if call is None:
+            raise ApiError(404, "not_found", "that call is not in the captures that are loaded")
+        return {"call": call}
+
+    @r.get("/api/sip/flow/packets/{side}/{no}")
+    def sip_flow_headers(req: Request) -> Any:
+        """Every header of the SIP packet a ladder row points at -> ``{"packet": HEADER_VIEW}``.
+
+        Read back out of the file when it is asked for: the ladder carries the packet's number, not its text."""
+        reader = _sipflow(req)
+        side, no = req.params.get("side", ""), req.params.get("no", "")
+        view = _typed_call("sipflow.headers()", lambda: reader.headers(side, no), "tnt.sipflow")
+        if view is None:
+            raise ApiError(404, "not_found", "that packet is not in the captures that are loaded")
+        return {"packet": view}
+
+    @r.get("/api/sip/flow/calls/{call}/audio")
+    def sip_flow_call_audio(req: Request) -> Any:
+        """One call rebuilt as a WAV; ``?side=a|b`` picks the capture, ``?stream=`` one RTP direction on its own -
+        which is how one-way audio is actually confirmed by ear.  404 when there is nothing decodable."""
+        reader = _sipflow(req)
+        call_id, side = req.params.get("call", ""), req.query.get("side")
+        stream = req.query.get("stream")
+        if stream:
+            wav = _typed_call("sipflow.stream_audio()", lambda: reader.stream_audio(stream), "tnt.sipflow")
+            name = f"TNT-stream-{_safe_name(stream)}.wav"
+        else:
+            wav = _typed_call("sipflow.audio()", lambda: reader.audio(call_id, side=side), "tnt.sipflow")
+            name = f"TNT-call-{_safe_name(call_id)}.wav"
+        if not wav:
+            raise ApiError(404, "not_found", "there is no audio in that call TNT can decode")
+        return FileResponse(io.BytesIO(wav), len(wav), name, "audio/wav")
 
     # -- TFTP server (Tools page) ---------------------------------------------------------------------
     @r.get("/api/tftp/status")

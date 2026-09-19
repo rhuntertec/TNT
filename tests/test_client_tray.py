@@ -78,10 +78,13 @@ def _args(**kw):
 
 @pytest.fixture
 def app(tmp_path, monkeypatch):
-    """A ClientApp with no GUI: client.json lives in tmp_path and nothing can exit the test run."""
+    """A ClientApp with no GUI: client.json lives in tmp_path and nothing can exit the test run.
+    The Wi-Fi survey is now off by default; the survey/bridge tests need it on, so enable it in memory
+    (no client.json key is written — the default-off and persistence behaviour is covered by its own tests)."""
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
     a = tray.ClientApp(_args())
     a._hard_exit = lambda code: None
+    a.wifi._enabled = True
     return a
 
 
@@ -856,6 +859,7 @@ def test_wifi_survey_call_from_a_hidden_window_does_not_start_the_session(app, m
     app.bridge.wifi_survey({})
     assert app.wifi.session_started, "the window is on screen"
     hidden_but_active = tray.ClientApp(_args())
+    hidden_but_active.wifi._enabled = True                    # the survey is off by default; enable it for the session-start check
     hidden_but_active.window = _page(SERVICE)
     monkeypatch.setattr(tray, "_window_visible", lambda title=tray.TITLE: False)
     hidden_but_active.bridge.wifi_survey({"active": True})
@@ -907,8 +911,9 @@ def test_wifi_switch_reads_client_json_with_a_bom_and_keeps_other_keys(tmp_path,
     app.window = _page(SERVICE)
     assert app.bridge.wifi_set_enabled(True)["enabled"] is True
     assert tray.load_state() == {"theme": "dark", "wifi_survey_enabled": True}
+    # the survey is off by default: only an explicit JSON true turns it on
     assert [tray.wifi_enabled_setting(s) for s in ({}, {"wifi_survey_enabled": "no"}, {"wifi_survey_enabled": 0},
-                                                   {"wifi_survey_enabled": False}, None)] == [True, True, True, False, True]
+                                                   {"wifi_survey_enabled": False}, {"wifi_survey_enabled": True}, None)] == [False, False, False, False, True, False]
 
 
 def test_wifi_session_starts_the_first_time_the_window_is_shown(tmp_path, monkeypatch):
@@ -916,10 +921,12 @@ def test_wifi_session_starts_the_first_time_the_window_is_shown(tmp_path, monkey
     monkeypatch.setattr(tray, "_create_activate_event", lambda: None)
     monkeypatch.setattr(tray.threading, "Thread", lambda target, name, daemon: SimpleNamespace(start=lambda: None))
     at_sign_in = tray.ClientApp(_args(minimized=True))
+    at_sign_in.wifi._enabled = True                           # the survey is off by default; this test is about the session-start rule
     monkeypatch.setattr(at_sign_in.tray, "start", lambda: None)
     at_sign_in._after_gui_started()
     assert not at_sign_in.wifi.session_started, "TNT.exe waiting in the tray after sign-in: no survey"
     opened = tray.ClientApp(_args())
+    opened.wifi._enabled = True
     monkeypatch.setattr(opened.tray, "start", lambda: None)
     opened._after_gui_started()
     assert opened.wifi.session_started, "the window opened on screen"
@@ -1033,3 +1040,53 @@ def test_client_bundle_and_selfcheck_include_the_wifi_modules():
     assert '"client.wifi_ies", "client.wifi_survey"' in source and "wifi_ies.self_test()" in source
     spec = (ROOT / "installer" / "tnt_client.spec").read_text(encoding="utf-8")
     assert '"client.wifi_ies", "client.wifi_survey"' in spec
+
+
+# --------------------------------------------------------------------------- pick_capture_file (Browse… on the Packet capture page)
+WANTED = "C:" + chr(92) + "Users" + chr(92) + "tester" + chr(92) + "from-the-switch.pcapng"
+
+
+def test_pick_capture_file_returns_the_path_the_dialog_gave(app, monkeypatch):
+    """The Packet capture page's Browse…: an open dialog, and the path goes to the service. Nothing is read here."""
+    calls = []
+
+    class Window:
+        def create_file_dialog(self, dialog, **kw):
+            calls.append((dialog, kw))
+            return [WANTED]
+
+    app.window = Window()
+    picked = app.bridge.pick_capture_file()
+    assert picked == WANTED
+    assert len(calls) == 1
+    _dialog, kw = calls[0]
+    assert kw["allow_multiple"] is False
+    assert any("pcapng" in str(t) for t in kw["file_types"]) and any("*.*" in str(t) for t in kw["file_types"])
+
+
+def test_pick_capture_file_is_none_when_it_is_cancelled_or_there_is_no_window(app):
+    class Cancelled:
+        def create_file_dialog(self, dialog, **kw):
+            return None
+
+    app.window = Cancelled()
+    assert app.bridge.pick_capture_file() is None
+    app.window = None
+    assert app.bridge.pick_capture_file() is None
+
+
+def test_pick_capture_file_never_raises(app):
+    class Broken:
+        def create_file_dialog(self, dialog, **kw):
+            raise RuntimeError("the shell is busy")
+
+    app.window = Broken()
+    assert app.bridge.pick_capture_file() is None
+
+
+def test_pick_capture_file_reads_nothing_itself():
+    """It only ever answers a path: the service is what opens the file, so the client never loads a capture."""
+    import inspect as _inspect
+    src = _inspect.getsource(tray.JsBridge.pick_capture_file)
+    for banned in ("open(", "read_bytes", "read_text", "urlopen", "requests"):
+        assert banned not in src, banned

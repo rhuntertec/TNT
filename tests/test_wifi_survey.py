@@ -1057,6 +1057,22 @@ def test_stale_marking(world, clock):
     assert all(a["stale"] for a in s.survey()["aps"]), "last beacon older than 120 s"
 
 
+def test_access_points_not_heard_in_24h_are_dropped(world, clock):
+    """The list shows only recently found networks: an AP not heard in the last 24 h is dropped, so it does
+    not accumulate every AP ever seen."""
+    start = clock.wall
+    world.entries = [ap_entry(BSSID_A, -50, start), ap_entry(BSSID_B, -60, start)]
+    s = make_survey(world, clock)
+    s.window_shown()
+    s.tick()
+    assert {a["bssid"] for a in s.survey()["aps"]} == {TEXT_A, "02:11:22:33:44:02"}
+    clock.advance(wifi_survey.MAX_AP_AGE_S + 60)                  # 24 h and a minute later
+    world.entries = [ap_entry(BSSID_A, -50, clock.wall)]         # only A is heard now
+    s._last_read_mono = None
+    s.tick()
+    assert {a["bssid"] for a in s.survey()["aps"]} == {TEXT_A}, "B, unheard for over 24 h, is gone"
+
+
 def test_eviction_keeps_the_most_recently_seen(world, clock):
     s = make_survey(world, clock, max_aps=3)
     s.window_shown()

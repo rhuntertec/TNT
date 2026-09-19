@@ -260,3 +260,23 @@ def test_ip_location_is_in_the_readme():
     readme = (ROOT / "README.txt").read_text(encoding="utf-8")
     for s in ("IP Geolocation by DB-IP", "download.db-ip.com", "Reports", "Full Scan"):
         assert s in readme, s
+
+
+def test_the_self_check_imports_every_tnt_module():
+    """`TNTService.exe --selfcheck` is what catches a frozen build that cannot import something (a conda venv
+    missing a DLL, a module PyInstaller did not trace). A hand-kept list drifts — this one had fallen ten modules
+    behind — so the list is every module of the package and this test is what keeps it that way."""
+    from tnt import service
+
+    listed = {m for m in service.SELFCHECK_MODULES if m == "tnt" or m.startswith("tnt.")}
+    have = set()
+    for path in (ROOT / "tnt").rglob("*.py"):
+        parts = list(path.relative_to(ROOT).with_suffix("").parts)
+        if "__pycache__" in parts or parts[-1] == "__main__":
+            continue
+        if parts[-1] == "__init__":
+            parts = parts[:-1]
+        if parts != ["tnt"]:
+            have.add(".".join(parts))
+    assert have - listed == set(), f"not in SELFCHECK_MODULES: {sorted(have - listed)}"
+    assert listed - have == set(), f"in SELFCHECK_MODULES but gone from the package: {sorted(listed - have)}"

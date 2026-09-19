@@ -1,6 +1,7 @@
 /* TNT — views/ipinfo.js
-   The live link map, the NAT, switch port & port forward card (js/netcheck.js), then one card per adapter
-   (internet-facing first), grouped subnets, copy-on-click values. */
+   The live link map, the realtime throughput card (js/throughput.js), the NAT, switch port & port forward
+   card (js/netcheck.js), then one card per adapter (internet-facing first), grouped subnets,
+   copy-on-click values. */
 (function () {
   'use strict';
   const TNT = window.TNT;
@@ -13,6 +14,7 @@
   let mapEls = null, mapUnsub = null, netUnsub = null, lastMap = null;
   let renderedV6 = null;      // the show_ipv6 value the adapter cards were last drawn with
   let nc = null;              // the NAT, switch port & port forward card: made once per mount, every redraw re-appends its element
+  let tp = null;              // the realtime throughput card: the same, and it holds its own half hour of samples
 
   /* ------------------------------------------------------------ IPv6 filter */
   // ui.show_ipv6 (Settings > Appearance, off by default): IPv6 subnet groups, addresses,
@@ -379,6 +381,9 @@
       gridEl.appendChild(buildMapCard());
       const st0 = TNT.app && TNT.app.state && TNT.app.state.status;
       if (st0 && st0.map) updateMap(st0.map);
+      // the live cards come first here too: they have their own data and are worth drawing while
+      // the adapter list loads, rather than appearing a moment later and pushing the page down
+      if (tp) gridEl.appendChild(tp.el);
       if (nc) gridEl.appendChild(nc.el);
       gridEl.appendChild(h('div', { class: 'card' }, TNT.ui.emptyState('Loading adapters…')));
       return;
@@ -397,10 +402,12 @@
     const v6 = showIpv6();
     renderedV6 = v6;
     renderSummary(adapters.length);
-    // the live link map is always the first card, the NAT, switch port & port forward card the second; the adapters follow
+    // the link map is always the first card, throughput the second and the NAT, switch port & port
+    // forward card the third; the adapters follow
     gridEl.appendChild(buildMapCard());
     const st = TNT.app && TNT.app.state && TNT.app.state.status;
     if (st && st.map) updateMap(st.map); else if (lastMap) updateMap(lastMap);
+    if (tp) gridEl.appendChild(tp.el);
     if (nc) gridEl.appendChild(nc.el);
     if (!adapters.length) { gridEl.appendChild(h('div', { class: 'card' }, TNT.ui.emptyState('No network adapters found.'))); return; }
     for (const a of adapters) gridEl.appendChild(adapterCard(a, inet, v6));
@@ -425,7 +432,9 @@
       if (root && (!quiet || !data)) {
         renderedSig = null;
         gridEl.innerHTML = '';
-        // the NAT, switch port & port forward card stays (its results, and a switch-port listen, with it)
+        // the two live cards stay: the adapter list failing says nothing about the counters the
+        // throughput card reads, or about a NAT result and a switch-port listen already in hand
+        if (tp) gridEl.appendChild(tp.el);
         if (nc) gridEl.appendChild(nc.el);
         gridEl.appendChild(TNT.util.h('div', { class: 'card' }, TNT.ui.emptyState('Could not load adapters: ' + err.message)));
       }
@@ -449,7 +458,8 @@
       root.appendChild(head);
       root.appendChild(gridEl);
       data = null; renderedSig = null; loadAgain = false;
-      // the NAT, switch port & port forward card exists before the first render, which puts it right after the link map
+      // both live cards exist before the first render, which is what puts them right after the link map
+      try { tp = TNT.throughput.create(); } catch (e) { console.error('throughput card failed', e); tp = null; }
       try { nc = TNT.netcheck.create(); } catch (e) { console.error('netcheck card failed', e); nc = null; }
       render();
       load();
@@ -464,10 +474,12 @@
       if (state && state.status && state.status.map) updateMap(state.status.map);
       // the NAT card follows status.net.generation (a new network clears its results) and the link map's public address
       if (nc) nc.update(state);
+      if (tp) tp.update(state);
     },
     // this PC changed networks (app.js calls it once a burst of changes settles): read the adapters again
     netChanged() { if (root) load(true); },
     unmount() {
+      if (tp) { try { tp.unmount(); } catch (e) { /* ignore */ } tp = null; }
       if (nc) { try { nc.unmount(); } catch (e) { /* ignore */ } nc = null; }
       if (mapUnsub) { try { mapUnsub(); } catch (e) { /* ignore */ } mapUnsub = null; }
       if (netUnsub) { try { netUnsub(); } catch (e) { /* ignore */ } netUnsub = null; }

@@ -25,6 +25,9 @@
   --purple: #B48CFF;
   --orange: #FFA45C;
   --teal: #4FD1C5;
+  --pink: #FF8FC7;
+  --lime: #A8D84B;
+  --sand: #E3B183;
   --grey: var(--ink-soft);
   --shadow: var(--ink);
   --accent: var(--blue);
@@ -51,6 +54,9 @@
   --purple: #BDA0FF;
   --orange: #FFB070;
   --teal: #67DCD1;
+  --pink: #FF9FD0;
+  --lime: #BCE865;
+  --sand: #F0C79B;
   --shadow: #0F0D1A;
   --outline-25: rgba(243, 238, 255, 0.25);
   --outline-12: rgba(243, 238, 255, 0.12);
@@ -117,7 +123,7 @@ svg.icon { width: 1.25em; height: 1.25em; stroke: currentColor; fill: none; stro
 /* one row at every window width: a long status ("fileserver01.corp… dropping packets") shrinks
    the pill and ellipsizes (the full text is its tooltip) instead of wrapping the LIVE badge and
    the gear onto a second row of the sticky header */
-.topbar-right { display: flex; align-items: center; gap: 12px; flex-wrap: nowrap; justify-content: flex-end; min-width: 0; }
+.topbar-right { display: flex; align-items: center; gap: 12px; flex-wrap: nowrap; justify-content: flex-end; min-width: 0; flex-shrink: 10; }
 .topbar-right > .live-badge, .topbar-right > .btn { flex: none; }
 
 .status-pill {
@@ -148,20 +154,65 @@ svg.icon { width: 1.25em; height: 1.25em; stroke: currentColor; fill: none; stro
 .live-badge.offline { background: color-mix(in srgb, var(--red) 30%, var(--paper)); }
 .live-badge.offline .live-spark { color: var(--ink-soft); }
 .live-badge.connecting .live-spark { color: var(--ink-soft); }
-/* Full Scan, left of the status pill: an ordinary top bar .btn (flex: none) whose fill runs like a progress bar while a
-   scan runs; tabular figures and a minimum width keep "Discovery 57%" from nudging the pill at every percent */
-.topbar-scan { --pct: 0%; min-width: 132px; padding: 0 16px 0 12px; font-variant-numeric: tabular-nums; }
-.topbar-scan.running { background: linear-gradient(90deg, color-mix(in srgb, var(--green) 45%, var(--paper)) var(--pct), var(--paper) var(--pct)); }
-/* IP Release/Renew and Flush DNS, left of Full Scan: ordinary top bar buttons (flex: none). While one runs it is disabled
-   with a yellow tint, its short label ("Renewing…") and a moving icon; when it is done its background flashes green
-   (.flash-ok) or red (.flash-bad) for about 1.5 s, app.js taking the class off again. Below 1200 px they are round icon
-   buttons (the aria-label names them), so the header stays one row (see the responsive section) */
-.topbar-quick { padding: 0 16px 0 12px; }
-.btn.topbar-quick[aria-busy="true"] { opacity: 1; cursor: progress; background: color-mix(in srgb, var(--yellow) 40%, var(--paper)); }
-.topbar-quick[aria-busy="true"] [data-icon="renew"] svg.icon { animation: quick-spin 1.2s linear infinite; }
-.topbar-quick[aria-busy="true"] [data-icon="flush"] svg.icon { animation: pulse 1.2s ease-in-out infinite; }
+/* The quick tools (IP Release/Renew, Flush DNS) live in the Quick Tools row at the top of the Tools page, not in the
+   header. While one runs it is disabled with a yellow tint, its short label ("Renewing…") and a moving icon; when it is
+   done its background flashes green (.flash-ok) or red (.flash-bad) for about 1.5 s, app.js taking the class off again.
+   The row wraps, so more quick tools can be added beside these two without a layout change. */
+.quick-tools { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.quick-tool { padding: 0 16px 0 12px; }
+.btn.quick-tool[aria-busy="true"] { opacity: 1; cursor: progress; background: color-mix(in srgb, var(--yellow) 40%, var(--paper)); }
+.quick-tool[aria-busy="true"] [data-icon="renew"] svg.icon { animation: quick-spin 1.2s linear infinite; }
+.quick-tool[aria-busy="true"] [data-icon="flush"] svg.icon { animation: pulse 1.2s ease-in-out infinite; }
 .btn.flash-ok { animation: flash-ok 1.5s ease-out; }
 .btn.flash-bad { animation: flash-bad 1.5s ease-out; }
+
+/* ---------- the section shortcuts (js/app.js builds them from the tiles) ----------
+   One small square per tile, in the header's own row, in the free space between the wordmark and the
+   status pill. That space is theirs whether they show or not (flex: 1 1 0 takes only what is left
+   over), so nothing in the header moves when they come and go and the row never grows: the squares
+   are the height of the status pill and the logo. The row lives in a clipping box as tall as the
+   header's content, so while the tiles are in sight it sits one box lower (translateY(100 %)) and is
+   clipped away; it rides up out of the bar's bottom edge as the last tile scrolls off, and sinks back
+   when the page returns to the tiles or one of them is clicked. */
+.tile-jumps {
+  flex: 1 1 0; min-width: 0;
+  /* the negative margins put the clipping box's edges on the bar's own: the squares rise out of its
+     bottom edge, and the box is exactly as tall as a square, so the row never grows for them */
+  margin: -8px 0; padding: 8px 0;
+  overflow: hidden;
+  pointer-events: none;             /* while they are down, nothing here is clickable */
+}
+/* up, they ask for the width the nine squares need instead of only the space left over; the status pill is the
+   one thing in the header that can give it up (it ellipsizes, with the full text as its tooltip) and it yields
+   ten times as fast as the row does, so the squares stay whole on any window this app opens at */
+.tile-jumps.on { flex: 0 1 auto; pointer-events: auto; }
+.tile-jumps-row {
+  --jump: 44px;   /* the height of the status pill and the logo beside them */
+  display: flex; align-items: center; gap: 6px; flex-wrap: nowrap; height: var(--jump);
+  overflow-x: auto; scrollbar-width: none;   /* a window too narrow for every square scrolls sideways */
+  /* +8px: the clipping box is the bar's 8 px padding taller than the row, so this clears it completely */
+  transform: translateY(calc(100% + 8px)); visibility: hidden;
+  transition: transform 0.26s cubic-bezier(0.2, 0.8, 0.3, 1), visibility 0s linear 0.26s;
+}
+.tile-jumps-row::-webkit-scrollbar { display: none; }
+/* visibility, not opacity: down there the squares are out of the tab order and off the a11y tree */
+.tile-jumps.on .tile-jumps-row { transform: translateY(0); visibility: visible; transition: transform 0.26s cubic-bezier(0.2, 0.8, 0.3, 1), visibility 0s; }
+/* the whole square is the link: icon over a one-word name, in the tile's own colour. Small type and
+   1 px of side padding because "Discovery" has to fit inside a square this size. */
+.tile-jump {
+  display: flex; flex: none; flex-direction: column; align-items: center; justify-content: center; gap: 2px;
+  width: var(--jump); height: var(--jump); padding: 0 1px;
+  color: var(--ink-on-accent); text-decoration: none; user-select: none;
+  background: color-mix(in srgb, var(--accent) 38%, var(--paper));
+  border: 2px solid var(--ink); border-radius: 12px;
+  font-size: calc(var(--jump) * 0.18); font-weight: 900; line-height: 1; letter-spacing: -0.01em;
+  transition: transform 0.12s ease-out, box-shadow 0.12s ease-out, background 0.2s;
+}
+.tile-jump svg.icon { width: calc(var(--jump) * 0.39); height: calc(var(--jump) * 0.39); vertical-align: 0; }
+.tile-jump-label { max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tile-jump:hover { transform: translateY(-2px); box-shadow: 0 2px 0 var(--shadow); }
+.tile-jump:active { transform: translateY(1px); box-shadow: none; }
+.tile-jump.active { background: color-mix(in srgb, var(--accent) 72%, var(--paper)); }
 
 /* ---------- layout ---------- */
 .page { max-width: 1440px; margin: 0 auto; padding: 24px; display: flex; flex-direction: column; gap: 20px; min-width: 0; }
@@ -225,6 +276,16 @@ svg.icon { width: 1.25em; height: 1.25em; stroke: currentColor; fill: none; stro
 .tile::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 9px; background: var(--accent); border-right: 3px solid var(--ink); }
 .tile:hover { transform: translate(-2px, -2px); box-shadow: 8px 8px 0 var(--shadow); }
 .tile.active { transform: translate(2px, 2px); box-shadow: 3px 3px 0 var(--shadow); background: color-mix(in srgb, var(--accent) 18%, var(--paper)); }
+/* Every tile is half height: 84 px, a smaller head and room for two compact lines. The first four used to be
+   150 px and carried three or four lines each, which is more than the glance a tile is for — the page behind each
+   one says the rest. .tile keeps its 150 px floor for anything that is not .half. */
+.tile.half { min-height: 84px; gap: 4px; padding-top: 8px; padding-bottom: 8px; }
+.tile.half .tile-icon { width: 26px; height: 26px; border-radius: 9px; }
+.tile.half .tile-icon svg { width: 16px; height: 16px; }
+.tile.half .tile-title { font-size: 15px; }
+.tile.half .tile-body { font-size: 13px; gap: 2px; }
+.tile.half .tile-line .num { font-size: 16px; }
+.tile.half .tile-line { flex-wrap: nowrap; white-space: nowrap; overflow: hidden; }
 /* the tight head (--tile-tight: 1): a 30 px icon, an 8 px gap and a 16 px title, so "Network info" (100 px in
    Nunito 900 at 16 px; 119 px at 19 px, which needs a 205 px tile) stays on one line down to a 176 px tile */
 .tile-head { display: flex; align-items: center; gap: calc(10px - 2px * var(--tile-tight)); padding-left: 4px; }
@@ -235,13 +296,10 @@ svg.icon { width: 1.25em; height: 1.25em; stroke: currentColor; fill: none; stro
 /* lines wrap instead of clipping: a badge or a long host name drops to the next line on narrow windows */
 .tile-line { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; row-gap: 2px; min-width: 0; overflow-wrap: anywhere; }
 .tile-line .badge { flex: none; }
-/* the tool names on the Tools tile: two columns once the tile body has room for two of the longest name
-   (102 px, "LAN throughput"), else one; the row gap matches .tile-body's line gap */
-.tile-tools { display: grid; grid-template-columns: repeat(auto-fill, minmax(112px, 1fr)); column-gap: 10px; row-gap: 3px; }
 .tile-line .strong { font-weight: 800; }
 .tile-line .num { font-weight: 900; font-size: 20px; }
 .tile-line code { font-size: 13px; }
-/* first six targets as an aligned 3 x 2 grid of lights */
+/* the first few targets as an aligned row of lights (PING_TILE_MAX columns) */
 .tile-lights { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px 6px; margin-top: 2px; }
 .tile-lights .tl { display: flex; flex-direction: column; align-items: center; gap: 3px; font-size: 11px; color: var(--ink-soft); font-weight: 700; min-width: 0; }
 .tile-lights .tl span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
@@ -321,6 +379,7 @@ input[type="datetime-local"].input { font-family: var(--font); }
   background: color-mix(in srgb, var(--accent) 35%, var(--paper)); color: var(--ink);
   user-select: none;
 }
+.badge.lg { font-size: 14px; padding: 3px 12px; }
 .badge.green { background: color-mix(in srgb, var(--green) 45%, var(--paper)); }
 .badge.yellow { background: color-mix(in srgb, var(--yellow) 55%, var(--paper)); }
 /* dark theme: light ink on half-mixed yellow is 3.1:1; dark ink on a brighter yellow is 6.5:1 (small bold text needs 4.5:1) */
@@ -424,17 +483,25 @@ table.table { border-collapse: collapse; width: 100%; font-size: 15px; }
 .ptile { display: flex; flex-direction: column; gap: 10px; padding: 18px; }
 .ptile:hover { transform: translate(-2px, -2px); box-shadow: 8px 8px 0 var(--shadow); }
 .ptile { transition: transform 0.12s ease-out, box-shadow 0.12s ease-out; }
-.ptile-head { display: flex; align-items: center; gap: 10px; min-width: 0; padding-right: 74px; }   /* room for grip + remove */
+.ptile-head { display: flex; align-items: center; gap: 10px; min-width: 0; padding-right: 130px; }   /* room for the tool cluster */
 .ptile-host { font-size: 18px; font-weight: 900; letter-spacing: -0.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
-.ptile-remove { position: absolute; top: 12px; right: 12px; }
-/* drag handle: the only place a tile can be picked up (text stays selectable elsewhere) */
-.ptile-grip { position: absolute; top: 13px; right: 50px; display: inline-flex; align-items: center; justify-content: center;
-  width: 24px; height: 28px; padding: 0; border: 2px solid var(--ink); border-radius: 8px; background: var(--paper-2); color: var(--ink-soft);
-  cursor: grab; opacity: 0.55; transition: opacity 0.12s, transform 0.12s; touch-action: none; }
-.ptile:hover .ptile-grip, .ptile-grip:focus-visible { opacity: 1; }
-.ptile-grip:hover { color: var(--ink); transform: translateY(-1px); }
+/* top-right tool cluster: drag handle, expand, rename, remove */
+.ptile-tools { position: absolute; top: 12px; right: 12px; display: flex; align-items: center; gap: 5px; }
+.ptile-tool { display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 28px; padding: 0; flex: none;
+  border: 2px solid var(--ink); border-radius: 8px; background: var(--paper-2); color: var(--ink-soft);
+  cursor: pointer; opacity: 0.6; transition: opacity 0.12s, transform 0.12s, color 0.12s; }
+.ptile:hover .ptile-tool, .ptile-tool:focus-visible { opacity: 1; }
+.ptile-tool:hover { color: var(--ink); transform: translateY(-1px); }
+.ptile-tool svg { width: 16px; height: 16px; }
+.ptile-tool.active { opacity: 1; color: var(--ink); background: color-mix(in srgb, var(--green) 30%, var(--paper)); }
+.ptile-remove:hover { color: var(--red); }
+/* the grip is the only place a tile can be picked up (text stays selectable elsewhere) */
+.ptile-grip { cursor: grab; touch-action: none; }
 .ptile-grip:active { cursor: grabbing; }
-.ptile-grip svg { width: 16px; height: 16px; }
+/* inline rename: an input + Clear next to the colour dot, shown while the pencil is active */
+.ptile-name-edit { display: flex; align-items: center; gap: 6px; min-width: 0; flex: 1; }
+.ptile-name-input { flex: 1; min-width: 0; height: 30px; font-size: 15px; font-weight: 800; padding: 2px 8px; }
+.ptile-name-clear { flex: none; padding: 4px 10px; }
 .ptile.dragging { opacity: 0.45; transform: scale(0.97); box-shadow: 2px 2px 0 var(--shadow); }
 .ptile-sub { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 14px; color: var(--ink-soft); }
 .ptile-rtt { display: flex; align-items: baseline; gap: 4px; min-height: 44px; }
@@ -575,6 +642,45 @@ code.copy.stale { color: var(--ink-soft); border-style: dashed; }
 .subnet { display: flex; flex-direction: column; gap: 8px; }
 .subnet-title { display: flex; align-items: center; gap: 8px; font-weight: 800; font-size: 14px; }
 
+/* ---------- network info: realtime throughput ---------- */
+/* one cell of the adapter grid between the live link map and the NAT card (js/throughput.js): the window
+   selector in the card head, then one block per NIC that is moving something - a heading, a canvas chart of
+   receive and send, and the two figure columns (current rate, then the Control Panel's packet and byte
+   totals). Receive is --blue and send is --orange throughout, including the chart, so the key in the figure
+   head is the only legend the chart needs. Tokens only; both themes follow */
+.tp-card { display: flex; flex-direction: column; }
+.tp-card > .card-title { margin-bottom: 6px; flex-wrap: wrap; gap: 8px 10px; }
+.tp-windows { margin-left: auto; }
+.tp-windows .seg button { padding: 0 10px; height: 30px; font-size: 12.5px; }
+.tp-body { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.tp-nic { display: flex; flex-direction: column; gap: 8px; min-width: 0; padding: 10px 0; }
+.tp-nic + .tp-nic { border-top: 2px dashed var(--outline-25); }
+.tp-nic:last-child { padding-bottom: 0; }
+.tp-head { display: flex; align-items: baseline; gap: 4px 10px; flex-wrap: wrap; min-width: 0; }
+.tp-name { font-size: 16px; font-weight: 900; }
+/* the adapter model is the least important thing on the row: it gives way before the name or the link speed */
+.tp-desc { font-size: 12.5px; font-weight: 700; min-width: 0; flex: 1 1 auto; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tp-link { font-size: 12.5px; font-weight: 800; color: var(--ink-soft); flex: none; }
+.tp-chart-wrap { position: relative; min-width: 0; }
+.tp-canvas { display: block; width: 100%; height: 132px; }
+
+.tp-figures { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.tp-figure { display: flex; flex-direction: column; gap: 2px; min-width: 0; padding: 8px 10px; border: 2px solid var(--outline-25); border-radius: 12px; background: var(--paper-2); }
+.tp-figure-head { display: flex; align-items: center; gap: 7px; font-size: 12.5px; font-weight: 800; color: var(--ink-soft); }
+.tp-key { width: 12px; height: 4px; border-radius: 2px; flex: none; background: var(--ink-soft); }
+.tp-rx .tp-key { background: var(--blue); }
+.tp-tx .tp-key { background: var(--orange); }
+.tp-rate { font-size: 21px; font-weight: 900; line-height: 1.15; }
+.tp-counts { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 0 8px; margin: 2px 0 0; font-size: 11.5px; font-weight: 700; }
+.tp-counts dt { color: var(--ink-soft); }
+.tp-counts dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; }
+
+/* a narrow card stacks the two figures rather than squeezing a 12-digit byte total into half of it */
+@media (max-width: 460px) {
+  .tp-figures { grid-template-columns: minmax(0, 1fr); }
+  .tp-windows { margin-left: 0; }
+}
+
 /* ---------- network info: NAT & switch port ---------- */
 /* one cell of the adapter grid right after the live link map (js/netcheck.js): two sections split by a dashed rule, each a
    head row (its label; for NAT the verdict badge, the muted confidence and "Check again"), then its lines, a folded Details box
@@ -635,6 +741,15 @@ code.copy.stale { color: var(--ink-soft); border-style: dashed; }
   animation: modal-in 0.18s ease-out;
 }
 .modal.narrow { width: min(460px, 100%); }
+.modal.wide { width: min(920px, 100%); }
+/* ping tile detail (the expand button): a prominent RTT chart, then the last 5 outages */
+.ptile-detail { display: flex; flex-direction: column; gap: 4px; }
+.ptile-detail-sub { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 14px; color: var(--ink-soft); }
+.ptile-detail-chart-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin: 8px 0; }
+.ptile-detail-chart-head .label { margin: 0; }
+.ptile-detail-chart { height: 300px; }
+.ptile-detail-chart canvas { width: 100%; height: 300px; display: block; }
+.ptile-detail-outages .table-wrap { margin: 0; }
 .modal-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; flex: none; min-width: 0; }
 .modal-head h2 { font-size: 24px; min-width: 0; overflow-wrap: anywhere; }
 .modal-head > .btn { flex: none; }
@@ -647,12 +762,35 @@ code.copy.stale { color: var(--ink-soft); border-style: dashed; }
   margin: -6px -10px; padding: 6px 10px; overflow-wrap: break-word; }
 .modal > .modal-body > * { flex-shrink: 0; }
 .modal-foot { display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; flex-wrap: wrap; flex: none; }
-.setting { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
-.setting .desc { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 200px; }
-.setting .desc .t { font-weight: 800; font-size: 16px; }
+/* Two columns, not space-between: the control column is a fixed width, so every toggle track in the dialog
+   starts at the same x whatever its labels say ("Unloaded Loaded" against "Ask Auto"). */
+.setting { display: grid; grid-template-columns: minmax(0, 1fr) var(--setting-control, 186px); align-items: center; gap: 6px 16px; }
+.setting .desc { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.setting .desc .t { font-weight: 800; font-size: 16px; display: flex; align-items: center; gap: 8px; }
 .setting .desc .s { color: var(--ink-soft); font-size: 13px; font-weight: 700; }
+.setting-control { display: flex; justify-content: flex-end; align-items: center; min-width: 0; }
+.setting-control:empty { display: none; }
+.setting-control > .input, .setting-control > select.input { width: 100%; }
+.setting-control .row.inline-unit { flex-wrap: nowrap; gap: 8px; width: 100%; }
+.setting-control .row.inline-unit .input { min-width: 0; flex: 1 1 auto; }
+/* the toggle's own two columns: a fixed label cell keeps the tracks in line with each other */
+.setting-control .toggle { display: grid; grid-template-columns: auto 1fr; gap: 12px; align-items: center; width: 100%; }
+.setting-control .toggle-labels { justify-content: flex-start; white-space: nowrap; }
 .setting-group { display: flex; flex-direction: column; gap: 14px; }
 .setting-group h3 { display: flex; align-items: center; gap: 8px; font-size: 14px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-soft); }
+.set-intro { margin: -6px 0 0; }
+/* a section of settings that belongs to one main tile: that tile's colour, icon and name, and --accent set on
+   the box so every control inside picks the tile's colour up instead of naming one of its own */
+.setting-group.tile-group { border: 3px solid var(--ink); border-radius: 18px; padding: 14px 16px;
+  background: color-mix(in srgb, var(--accent) 14%, var(--paper)); box-shadow: 3px 3px 0 var(--shadow); }
+.setting-group.tile-group h3 { color: var(--ink); font-size: 15px; }
+.tg-icon { display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; flex: none;
+  border: 2px solid var(--ink); border-radius: 8px; background: color-mix(in srgb, var(--accent) 55%, var(--paper));
+  color: var(--ink-on-accent); }
+.tg-icon svg { width: 14px; height: 14px; }
+/* the tools list: one row a tool, each in its own tile colour so the list reads as the tile row does */
+.setting.tool-row { padding: 9px 11px; border: 3px solid var(--outline-25); border-radius: 14px;
+  background: color-mix(in srgb, var(--accent) 9%, var(--paper)); }
 /* Settings › IP location: the live status line, Retry now and the DB-IP / licence links */
 .geo-status { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; font-size: 13px; font-weight: 700; color: var(--ink-soft); }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; }
@@ -923,28 +1061,101 @@ code.copy.stale { color: var(--ink-soft); border-style: dashed; }
 .dhcp-info.tftp-uploads-note { margin-top: 10px; padding: 8px 12px; font-size: 13px; }
 .tftp-folder { gap: 8px 10px; margin-top: 14px; min-width: 0; }
 .tftp-files-head { margin: 16px 0 8px; }
-.tftp-files .empty, .capture-files .empty { padding: 16px 12px; }
+.tftp-files .empty { padding: 16px 12px; }
 .tftp-transfers, .tftp-history { display: flex; flex-direction: column; gap: 10px; margin-top: 16px; min-width: 0; }
 .tftp-transfers .fuse-label .l { min-width: 0; overflow-wrap: anywhere; }
 .tftp-table td.wrap { min-width: 140px; overflow-wrap: anywhere; }
 .tftp-table .badge { height: 20px; padding: 0 7px; font-size: 11px; }
 .tool-note.tftp-scope { margin: 14px 0 0; }
 
-/* packet capture: the adapter, duration and size, the optional host / port / protocol, then "Full packets" or "First 128 bytes"
-   with Start (or "Stop and save"); a fuse while it runs, the saved captures under the warning about what they hold, or the note
-   that it needs a Windows administrator in place of all of it (js/tools/capture.js) */
-.capture-form { display: flex; flex-direction: column; gap: 12px; }
-.capture-actions { gap: 10px 12px; }
-.capture-actions .seg { flex: none; }
-.capture-actions .seg button:disabled { opacity: 0.55; cursor: not-allowed; }
-.tool-summary.capture-invalid { margin: 10px 0 0; }
-.capture-progress { margin-top: 16px; }
-.capture-files-head { margin-top: 18px; }
-.dhcp-info.capture-warning { margin: 8px 0 12px; }
-.capture-table td.wrap { min-width: 200px; overflow-wrap: anywhere; font-family: var(--mono); font-size: 13.5px; }
-.capture-table td.capture-file-actions { width: auto; white-space: nowrap; }
-.capture-file-actions .btn + .btn { margin-left: 8px; }
-.dhcp-info.capture-admin { margin-top: 0; }
+/* ---------- packet capture (js/views/capture.js) ----------
+   The Capture card (adapter, limits, the Start / Stop / Save / Open / Discard buttons and the status line), then the
+   Packets card: the filter fields and protocol buttons over a tall scroller holding the packet table. A row's protocol
+   cell is a coloured tag, so the list reads at a glance. The packet detail window is a wide modal: the protocol tree
+   over the hex dump. */
+.cap-controls { display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; }
+.cap-controls .field { min-width: 120px; }
+.cap-controls .field.wide { flex: 1 1 220px; }
+.cap-buttons { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-left: auto; }
+.cap-status { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 14px; font-size: 15px; }
+.cap-status.ok { color: var(--ink); }
+.cap-status.bad { color: var(--red); font-weight: 800; }
+.cap-status .spark-icon svg { width: 18px; height: 18px; }
+.dhcp-info.cap-warning { margin: 0; }
+
+.cap-list-card { display: flex; flex-direction: column; min-height: 0; }
+.cap-filter-wrap { display: flex; flex-direction: column; gap: 10px; margin-bottom: 12px; }
+.cap-filters { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.cap-filters .input { width: 190px; flex: none; font-family: var(--mono); font-size: 13.5px; }
+.cap-follow { display: inline-flex; align-items: center; gap: 6px; font-weight: 700; font-size: 14px; cursor: pointer; }
+.cap-protos { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+/* a filter chip: off is paper, on is the accent. Nine of them fit one row at 1440 px and wrap below that */
+.cap-proto {
+  display: inline-flex; align-items: center; gap: 5px; height: 30px; padding: 0 12px;
+  border: 3px solid var(--ink); border-radius: 999px; background: var(--paper);
+  font: inherit; font-size: 13px; font-weight: 800; color: inherit; cursor: pointer; user-select: none;
+}
+.cap-proto svg.icon { width: 14px; height: 14px; }
+.cap-proto:hover { background: var(--paper-2); }
+.cap-proto.on { background: color-mix(in srgb, var(--accent) 45%, var(--paper)); box-shadow: 2px 2px 0 var(--shadow); }
+.cap-calls-btn { margin-left: 6px; }
+
+/* the list itself: a tall scroller with a sticky head, so the page never grows with the capture */
+.cap-scroll { max-height: 56vh; min-height: 220px; overflow: auto; border: 3px solid var(--ink); border-radius: 14px; background: var(--paper-2); }
+/* fixed columns (the widths come from the <colgroup> views/capture.js writes) so a long address or summary never
+   re-measures the table while packets stream in; below min-width the scroller scrolls sideways instead of crushing */
+.cap-table { margin: 0; font-size: 13px; table-layout: fixed; width: 100%; min-width: 1040px; }
+.cap-table thead th { position: sticky; top: 0; z-index: 1; background: var(--paper-2); }
+.cap-table th, .cap-table td { padding: 4px 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cap-table td.mono, .cap-table td.num { font-family: var(--mono); font-size: 12.5px; }
+.cap-table tbody tr { cursor: pointer; }
+.cap-table tbody tr:hover { background: color-mix(in srgb, var(--accent) 16%, var(--paper-2)); }
+.cap-empty { padding: 28px 16px; text-align: center; color: var(--ink-soft); font-weight: 700; }
+.cap-proto-tag { display: inline-block; padding: 1px 8px; border: 2px solid var(--ink); border-radius: 999px; font-size: 11.5px; font-weight: 900; background: var(--paper); }
+.cap-proto-tag.p-voice { background: color-mix(in srgb, var(--pink) 55%, var(--paper)); }
+.cap-proto-tag.p-secure { background: color-mix(in srgb, var(--purple) 45%, var(--paper)); }
+.cap-proto-tag.p-web { background: color-mix(in srgb, var(--blue) 45%, var(--paper)); }
+.cap-proto-tag.p-name { background: color-mix(in srgb, var(--teal) 45%, var(--paper)); }
+.cap-proto-tag.p-icmp { background: color-mix(in srgb, var(--yellow) 55%, var(--paper)); }
+.cap-proto-tag.p-link { background: color-mix(in srgb, var(--orange) 45%, var(--paper)); }
+.cap-proto-tag.p-admin { background: color-mix(in srgb, var(--green) 45%, var(--paper)); }
+
+/* the packet detail window */
+.cap-detail { display: flex; flex-direction: column; gap: 12px; }
+.cap-detail-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.cap-tree { display: flex; flex-direction: column; gap: 6px; max-height: 42vh; overflow: auto; }
+.cap-layer { border: 3px solid var(--ink); border-radius: 12px; background: var(--paper-2); padding: 8px 12px; }
+.cap-layer > summary { cursor: pointer; display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; font-size: 14px; }
+.cap-fields { display: grid; grid-template-columns: minmax(140px, max-content) minmax(0, 1fr); gap: 2px 14px; margin-top: 8px; }
+.cap-field { display: contents; }
+.cap-field-name { color: var(--ink-soft); font-weight: 700; font-size: 13px; }
+.cap-field-value { font-size: 13px; overflow-wrap: anywhere; }
+.cap-hex-head { margin-bottom: -6px; }
+.cap-hex { margin: 0; padding: 12px; max-height: 28vh; overflow: auto; font-size: 12.5px; line-height: 1.45; background: var(--paper-2); border: 3px solid var(--ink); border-radius: 12px; }
+
+/* the SIP calls window: one block per call, each with its own player once the audio has been rebuilt */
+.cap-calls { display: flex; flex-direction: column; gap: 12px; }
+.cap-call { border: 3px solid var(--ink); border-radius: 14px; background: var(--paper-2); padding: 12px 14px; }
+.cap-call-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.cap-call-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); font-size: 13.5px; }
+.cap-call-meta { margin: 4px 0 8px; }
+.cap-call-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.cap-call-player { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.cap-call-player audio { height: 34px; }
+
+/* the "Open a capture" window: any file on this PC by its path (Browse… only inside the TNT window, which has the
+   native picker), then the captures TNT saved itself */
+.cap-open { display: flex; flex-direction: column; gap: 10px; }
+.cap-open-head { font-weight: 900; font-size: 15px; margin-top: 6px; }
+.cap-open-head:first-child { margin-top: 0; }
+.cap-open-from { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.cap-open-from .input { flex: 1 1 320px; min-width: 0; font-size: 13.5px; }
+.cap-open-hint { margin: -4px 0 2px; }
+/* the row's three buttons are a flex row, not inline content: laid out inline they would sit on their text
+   baselines, which staggers a 36 px .btn-sm against a 32 px .btn-round-sm */
+.cap-file-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+.cap-files-table td.actions, .cap-files-table th.actions { width: 1%; white-space: nowrap; padding-right: 4px; }
+.cap-files-table td.wrap { font-family: var(--mono); font-size: 13px; overflow-wrap: anywhere; }
 
 /* saved Wi-Fi networks: the profile table (a plain .table) and its masked key chips */
 .wifi-controls { gap: 10px; margin-bottom: 12px; }
@@ -1187,6 +1398,127 @@ body.egg-shake { animation: egg-shake 0.6s ease-out both; }
 @keyframes egg-word-sub { 0% { transform: translate(-50%, var(--dy, 34px)) scale(0.2); opacity: 0; } 20% { transform: translate(-50%, var(--dy, 34px)) scale(1.1); opacity: 1; } 75% { transform: translate(-50%, var(--dy, 34px)) scale(1); opacity: 1; } 100% { transform: translate(-50%, calc(var(--dy, 34px) - 20px)) scale(1); opacity: 0; } }
 @keyframes egg-shake { 0%, 100% { transform: translate(0, 0); } 10% { transform: translate(var(--egg-amp), calc(var(--egg-amp) * -0.6)); } 25% { transform: translate(calc(var(--egg-amp) * -0.9), var(--egg-amp)); } 40% { transform: translate(calc(var(--egg-amp) * 0.7), calc(var(--egg-amp) * 0.4)); } 55% { transform: translate(calc(var(--egg-amp) * -0.5), calc(var(--egg-amp) * -0.7)); } 70% { transform: translate(calc(var(--egg-amp) * 0.3), calc(var(--egg-amp) * 0.2)); } 85% { transform: translate(calc(var(--egg-amp) * -0.15), 0); } }
 
+/* ---------- SIP (views/sip.js) ---------- */
+.sip-page { display: flex; flex-direction: column; gap: 20px; }
+.sip-card .section-head h2 { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.sip-body { margin-top: 12px; display: flex; flex-direction: column; gap: 12px; }
+
+/* the legs: LAN, internet and, once it is named, the trunk. Each one its own row, because the whole point of
+   splitting them is that one of them is the answer and the others are not. */
+.sip-legs { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+.sip-leg { border: 3px solid var(--ink); border-radius: 16px; background: var(--paper-2); padding: 11px 13px; }
+.sip-leg-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.sip-leg-target { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); }
+.sip-leg-numbers { margin-top: 6px; font-weight: 800; font-size: 15px; }
+
+/* the headline: the three numbers a call is judged by, first and biggest on the page */
+.sip-headline { border: 3px solid var(--ink); border-radius: 18px; padding: 14px 16px; background: var(--paper-2);
+  box-shadow: 3px 3px 0 var(--shadow); }
+.sip-headline.green { background: color-mix(in srgb, var(--green) 18%, var(--paper)); }
+.sip-headline.yellow { background: color-mix(in srgb, var(--yellow) 26%, var(--paper)); }
+.sip-headline.red { background: color-mix(in srgb, var(--red) 16%, var(--paper)); }
+.sip-headline.none { background: var(--paper-2); }
+.sip-hl-row { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.sip-hl { min-width: 0; }
+.sip-hl-value { font-size: 34px; font-weight: 900; line-height: 1.05; letter-spacing: -0.02em; }
+.sip-hl-unit { font-size: 15px; font-weight: 800; margin-left: 4px; color: var(--ink-soft); }
+.sip-hl-what { font-size: 12px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.05em;
+  color: var(--ink-soft); margin-top: 2px; }
+.sip-hl-from { margin-top: 10px; }
+
+.sip-callq { border: 3px dashed var(--outline-25); border-radius: 16px; padding: 10px 13px;
+  display: flex; flex-direction: column; gap: 4px; }
+.sip-checks { gap: 6px 8px; }
+.sip-checks .badge { text-transform: none; letter-spacing: 0; font-size: 13px; }
+
+.sip-findings { display: flex; flex-direction: column; gap: 10px; }
+.sip-finding { border: 3px solid var(--ink); border-radius: 16px; padding: 11px 13px; background: var(--paper-2); }
+.sip-finding.bad { background: color-mix(in srgb, var(--red) 16%, var(--paper)); }
+.sip-finding.warn { background: color-mix(in srgb, var(--yellow) 26%, var(--paper)); }
+.sip-finding.good { background: color-mix(in srgb, var(--green) 18%, var(--paper)); }
+.sip-finding-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.sip-finding-detail { margin-top: 6px; font-size: 14.5px; line-height: 1.45; }
+.sip-finding-advice { margin-top: 7px; display: flex; gap: 7px; font-size: 14px; line-height: 1.45; color: var(--ink-soft); }
+.sip-finding-advice svg { width: 16px; height: 16px; flex: none; margin-top: 2px; }
+
+.sip-probes, .sip-changes, .sip-stun-servers { display: flex; flex-direction: column; gap: 8px; }
+.sip-probe, .sip-stun-server { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 14px; }
+.sip-stun-server code { font-family: var(--mono); font-size: 13px; }
+.sip-change { border: 3px solid var(--ink); border-radius: 14px; padding: 9px 12px;
+  background: color-mix(in srgb, var(--red) 12%, var(--paper)); }
+.sip-change-line { display: flex; align-items: baseline; gap: 8px; }
+.sip-change-line code { font-family: var(--mono); font-size: 13px; word-break: break-all; }
+.sip-change-line code.bad { font-weight: 900; }
+.sip-life-steps { gap: 6px; }
+
+.sip-slot { margin-bottom: 12px; }
+.sip-slot-label { font-weight: 800; font-size: 13px; text-transform: uppercase; letter-spacing: 0.03em;
+  color: var(--ink-soft); margin-bottom: 5px; }
+.sip-slot-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.sip-slot-row .input { flex: 1 1 320px; min-width: 0; font-size: 13.5px; }
+.sip-slot-hint { margin-top: -4px; }
+.sip-note { display: flex; gap: 7px; align-items: flex-start; }
+.sip-note svg { width: 15px; height: 15px; flex: none; margin-top: 2px; }
+.sip-loaded { margin-top: 5px; font-family: var(--mono); }
+.sip-skew { display: flex; gap: 8px; align-items: flex-start; font-size: 14px; }
+.sip-skew svg { width: 16px; height: 16px; flex: none; margin-top: 2px; }
+
+/* the calls list: a button, because every row opens its flow */
+.sip-calls { display: flex; flex-direction: column; gap: 10px; }
+.sip-call { text-align: left; border: 3px solid var(--ink); border-radius: 16px; background: var(--paper-2);
+  padding: 11px 13px; font: inherit; color: inherit; cursor: pointer; box-shadow: 3px 3px 0 var(--shadow); }
+.sip-call:hover { background: color-mix(in srgb, var(--sand) 18%, var(--paper)); }
+.sip-call:active { transform: translate(2px, 2px); box-shadow: 1px 1px 0 var(--shadow); }
+.sip-call-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.sip-call-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: var(--mono); font-size: 13.5px; }
+.sip-call-meta { margin-top: 4px; }
+.sip-call-worst { margin-top: 6px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 14px; }
+
+/* the ladder: one row a message, oldest first, every row a button onto its own headers */
+.sip-flow-modal { display: flex; flex-direction: column; gap: 16px; }
+.sip-ladder { display: flex; flex-direction: column; gap: 3px; }
+.sip-ladder-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; text-align: left;
+  border: 2px solid var(--outline-25); border-left: 6px solid var(--ink-soft); border-radius: 10px;
+  background: var(--paper); padding: 6px 10px; font: inherit; color: inherit; cursor: pointer; font-size: 13.5px; }
+.sip-ladder-row:hover:not(:disabled) { background: var(--paper-2); border-color: var(--ink); }
+.sip-ladder-row:disabled { cursor: default; opacity: 0.75; }
+.sip-ladder-row.req { border-left-color: var(--blue); }
+.sip-ladder-row.prog { border-left-color: var(--yellow); }
+.sip-ladder-row.ok { border-left-color: var(--green); }
+.sip-ladder-row.redirect { border-left-color: var(--orange); }
+.sip-ladder-row.fail { border-left-color: var(--red); background: color-mix(in srgb, var(--red) 10%, var(--paper)); }
+.sip-ladder-row.end { border-left-color: var(--ink-soft); }
+.sip-ladder-time { flex: none; width: 58px; font-family: var(--mono); }
+.sip-ladder-side { flex: none; font-weight: 900; font-size: 11px; border: 2px solid var(--ink); border-radius: 6px;
+  padding: 0 5px; background: var(--paper-2); }
+.sip-ladder-from, .sip-ladder-to { font-family: var(--mono); font-size: 12.5px; color: var(--ink-soft); }
+.sip-ladder-arrow { color: var(--ink-soft); }
+.sip-ladder-label { margin-left: auto; }
+
+.sip-streams { display: flex; flex-direction: column; gap: 10px; }
+.sip-stream { border: 3px solid var(--ink); border-radius: 14px; background: var(--paper-2); padding: 10px 12px; }
+.sip-stream-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.sip-stream-head code { font-family: var(--mono); font-size: 12.5px; }
+.sip-stream-actions { margin-top: 8px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.sip-stream-player audio { height: 34px; vertical-align: middle; }
+
+/* one packet's headers: every header in the order it was sent, repeats and all */
+.sip-packet { display: flex; flex-direction: column; gap: 12px; }
+.sip-packet-start { font-family: var(--mono); font-size: 14px; font-weight: 900; word-break: break-all; }
+.sip-headers { display: grid; grid-template-columns: minmax(110px, auto) minmax(0, 1fr); gap: 3px 12px; }
+.sip-header { display: contents; }
+.sip-header-name { font-weight: 800; font-size: 13px; }
+.sip-header-value { font-family: var(--mono); font-size: 12.5px; word-break: break-all; }
+.sip-packet-body pre { margin: 6px 0 0; padding: 10px 12px; border: 2px solid var(--outline-25); border-radius: 12px;
+  background: var(--paper-2); font-family: var(--mono); font-size: 12.5px; white-space: pre-wrap; word-break: break-all; }
+
+@media (max-width: 700px) {
+  .sip-ladder-label { margin-left: 0; }
+  .sip-headers { grid-template-columns: minmax(0, 1fr); gap: 1px 0; }
+  .sip-header { display: block; margin-bottom: 6px; }
+}
+
 /* ---------- responsive ---------- */
 /* The tile grid (see .tiles). The rules count the tiles: ".tile:first-child:nth-last-child(-n + 7)" is the
    first tile of a row of at most seven and "... ~ .tile" the others. `flex: 1 1 0` shares one row equally,
@@ -1223,6 +1555,7 @@ body.egg-shake { animation: egg-shake 0.6s ease-out both; }
   .tiles > .tile:first-child:nth-last-child(n + 5), .tiles > .tile:first-child:nth-last-child(n + 5) ~ .tile { --tile-tight: 1; }
 }
 @media (max-width: 900px) {
+  .tile-jumps-row { --jump: 40px; gap: 4px; }
   .grid-2 { grid-template-columns: minmax(0, 1fr); }
   .diag-grid { grid-template-columns: minmax(0, 1fr); }
   .adapter-grid { grid-template-columns: minmax(0, 1fr); }
@@ -1232,8 +1565,13 @@ body.egg-shake { animation: egg-shake 0.6s ease-out both; }
   .brand-caption { display: none; }
 }
 @media (max-width: 700px) {
+  /* the settings rows stack: a 186 px control column beside the text is too tight to read at phone width */
+  .setting { grid-template-columns: minmax(0, 1fr); }
+  .setting-control { justify-content: flex-start; }
+  .setting-control .toggle { width: auto; }
   .page { padding: 16px; gap: 16px; }
   .topbar { padding: 8px 16px; }
+  .tile-jumps-row { --jump: 38px; gap: 4px; }
   /* rows of two; the last tile of an odd count keeps the width of the others */
   .tiles { --tile-gap: 14px; }
   .tiles > .tile { --tile-cols: 2; }
@@ -1543,15 +1881,73 @@ a.pill.port-link:focus-visible { outline: 3px solid var(--accent); outline-offse
   .rpt-cmp-bpick { flex-wrap: wrap; }
   .rpt-cmp-bpick .rpt-cmp-filter { flex: 1 1 100%; }
 }
-/* the quick tools as round icon buttons below 1200 px (their aria-label names them): with their labels the status pill would
-   be left too little room, without them the header stays one row down to 800 px */
-@media (max-width: 1199.98px) {
-  .topbar-quick { width: 44px; padding: 0; }
-  .topbar-quick .quick-label { display: none; }
-}
-@media (max-width: 900px) {
-  .topbar-scan { min-width: 0; padding: 0 12px; }
-}
 @media (max-width: 700px) {
   .rpt .rpt-search { width: 100%; }
+}
+
+
+/* ---------- Pro AV (js/views/proav.js) ----------
+   The page is one scan's worth of listening, laid out worst-news-first: the findings, then the clock, then the
+   diagram, then the tables. The diagram is drawn as SVG in the page's own colours, so it themes with everything
+   else and prints as it looks. */
+.pav-progress { margin-top: 14px; }
+.pav-bar { height: 14px; border: 3px solid var(--ink); border-radius: 999px; background: var(--paper-2); overflow: hidden; }
+.pav-bar-fill { height: 100%; width: 0; background: var(--accent); transition: width 0.35s ease-out; }
+.pav-progress-text { margin-top: 7px; font-size: 13px; font-weight: 800; color: var(--ink-soft); }
+
+.pav-findings { display: flex; flex-direction: column; gap: 12px; }
+.pav-finding { border: 3px solid var(--ink); border-radius: 16px; padding: 12px 14px; background: var(--paper-2); }
+.pav-finding.bad { background: color-mix(in srgb, var(--red) 16%, var(--paper)); }
+.pav-finding.warn { background: color-mix(in srgb, var(--yellow) 26%, var(--paper)); }
+.pav-finding.good { background: color-mix(in srgb, var(--green) 18%, var(--paper)); }
+.pav-finding-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.pav-finding-title { font-weight: 900; font-size: 16px; }
+.pav-finding-detail { margin-top: 7px; font-size: 14.5px; line-height: 1.45; }
+.pav-finding-advice { margin-top: 8px; font-size: 14px; line-height: 1.45; color: var(--ink-soft); }
+.pav-advice-label { display: inline-block; margin-right: 7px; padding: 0 7px; border: 2px solid var(--ink); border-radius: 999px; font-size: 11px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.05em; background: var(--paper); color: var(--ink); }
+.pav-evidence { margin-top: 9px; }
+.pav-evidence > summary { cursor: pointer; font-size: 13px; font-weight: 800; color: var(--ink-soft); }
+.pav-evidence .table { margin-top: 8px; font-size: 13px; }
+.pav-evidence .table th, .pav-evidence .table td { padding: 5px 9px; }
+
+.pav-kv { row-gap: 9px; }
+.pav-kv .v.ok { color: color-mix(in srgb, var(--green) 65%, var(--ink)); font-weight: 800; }
+.pav-kv .v.warn { color: color-mix(in srgb, var(--yellow) 55%, var(--ink)); font-weight: 800; }
+.pav-kv .v.bad { color: var(--red); font-weight: 800; }
+
+.pav-plot-scroll { overflow-x: auto; padding: 4px 0 8px; }
+.pav-plot { display: block; }
+.pav-edge { fill: none; stroke: var(--outline-25); stroke-width: 2.5; }
+.pav-edge-label { fill: var(--ink-soft); font: 800 11px var(--font); }
+.pav-node rect { fill: var(--paper-2); stroke: var(--ink); stroke-width: 3; }
+.pav-node { cursor: pointer; }
+.pav-node:focus { outline: none; }
+.pav-node:focus rect, .pav-node.on rect { stroke-width: 4; filter: drop-shadow(0 3px 0 var(--shadow)); }
+.pav-node-label { fill: var(--ink); font: 900 14px var(--font); }
+.pav-node-sub { fill: var(--ink-soft); font: 700 11px var(--mono); }
+.pav-node-kind { fill: var(--ink-soft); font: 900 9px var(--font); text-transform: uppercase; letter-spacing: 0.06em; }
+.pav-node.kind-grandmaster rect { fill: color-mix(in srgb, var(--green) 34%, var(--paper)); }
+.pav-node.kind-boundary rect { fill: color-mix(in srgb, var(--blue) 30%, var(--paper)); }
+.pav-node.kind-transparent rect { fill: color-mix(in srgb, var(--teal) 28%, var(--paper)); }
+.pav-node.kind-self rect { fill: color-mix(in srgb, var(--lime) 40%, var(--paper)); stroke-dasharray: 7 5; }
+.pav-node.kind-talker rect { fill: color-mix(in srgb, var(--orange) 30%, var(--paper)); }
+.pav-node.kind-stream rect { fill: color-mix(in srgb, var(--purple) 28%, var(--paper)); }
+.pav-node.kind-listener rect { fill: color-mix(in srgb, var(--pink) 28%, var(--paper)); }
+.pav-node.lvl-warn rect { stroke: color-mix(in srgb, var(--yellow) 70%, var(--ink)); }
+.pav-node.lvl-bad rect { stroke: var(--red); }
+.pav-node.lvl-good rect { stroke: color-mix(in srgb, var(--green) 70%, var(--ink)); }
+.pav-plot-note { margin: 6px 0 0; font-size: 13px; line-height: 1.5; color: var(--ink-soft); }
+.pav-plot-note.strong { margin-top: 10px; padding-top: 10px; border-top: 2px dashed var(--outline-25); font-weight: 800; }
+.pav-node-detail { margin-top: 8px; padding: 10px 12px; border: 3px solid var(--ink); border-radius: 14px; background: var(--paper-2); font-size: 14px; }
+.pav-node-detail-text { margin-top: 6px; color: var(--ink-soft); line-height: 1.45; }
+
+.pav-services { margin-top: 5px; display: flex; flex-wrap: wrap; gap: 3px; }
+.pav-services .pill { background: color-mix(in srgb, var(--accent) 26%, var(--paper)); font-size: 11.5px; }
+.pav-gone td { opacity: 0.55; }
+.pav-listen > summary { cursor: pointer; list-style: none; }
+.pav-listen > summary::-webkit-details-marker { display: none; }
+
+@media (max-width: 700px) {
+  .pav-finding-title { font-size: 15px; }
+  .pav-plot-scroll { margin: 0 -6px; }
 }

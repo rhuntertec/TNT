@@ -138,11 +138,48 @@ DEFAULTS: Dict[str, Any] = {
         "ping_check": True,         # ping a candidate address before offering it
         "scan_wait_s": 8,           # how long the "other DHCP server" probe waits for offers
     },
+    "tools": {                      # Settings > Tools: the main tools a site may never use, switched off here.
+        # A tool that is off has no tile, no page, and takes no automated action of its own: the speed scheduler
+        # does not schedule, a Full Scan skips that section, and the routes that would make this PC do something
+        # refuse. The other five (Network info, Ping, Outages, Tools, Reports) are the monitoring TNT exists to
+        # do and have no switch.
+        "speed": True,
+        "discovery": True,
+        "wifi": True,
+        "capture": True,
+        "proav": True,
+        "sip": True,
+    },
+    "sip": {                        # the SIP page (tnt.sipqual, tnt.sipalg, tnt.sipnat)
+        "host": "",                 # the customer's PBX, SBC or registrar: graded as its own leg and the ALG check's target
+        "port": 5060,               # the port that host answers SIP on
+        "window_h": 24,             # how much ping history the qualifier grades
+        "stun": ["stun.l.google.com:19302", "stun.cloudflare.com:3478"],   # two, because the comparison needs two
+    },
     "tftp": {                       # Tools > TFTP server (on/off and uploads are NOT persisted: both off after every start)
         "adapter": "",              # adapter name to serve on; "" = auto (first physical Ethernet, else the internet NIC)
         "max_upload_mb": 4096,      # largest file a device may upload while uploads are on
     },
 }
+
+#: The main tools Settings can switch off, in tile order.  Everything else is always on.
+TOOLS: Tuple[str, ...] = ("speed", "discovery", "wifi", "capture", "proav", "sip")
+
+
+def tool_on(config: Any, name: str) -> bool:
+    """Whether a main tool is switched on (``tools.<name>``).
+
+    Anything unreadable means on.  A tool that disappeared because a settings read failed would be a far worse
+    failure than one that stayed - the tech would be looking for a missing page, not a broken setting."""
+    if name not in TOOLS:
+        return True
+    try:
+        value = config.get("tools." + name, True) if config is not None else True
+    except Exception:                       # noqa: BLE001
+        log.debug("could not read tools.%s", name, exc_info=True)
+        return True
+    return value is not False
+
 
 # (path, min, max) clamps for numeric settings
 _CLAMPS = {
@@ -167,6 +204,8 @@ _CLAMPS = {
     "speedtest.connections": (1, 16),
     "speedtest.timeout_s": (10, 600),
     "speedtest.warn_below_pct": (1, 100),
+    "sip.port": (1, 65535),
+    "sip.window_h": (1, 720),
     "discovery.ping_timeout_ms": (50, 10000),
     "discovery.ping_attempts": (1, 5),
     "discovery.port_timeout_ms": (50, 10000),
@@ -285,7 +324,8 @@ def validate(cfg: Dict[str, Any]) -> Dict[str, Any]:
             _set_path(out, dotted, _get_path(DEFAULTS, dotted))
     # booleans
     for dotted in ("ping.loaded", "speedtest.enabled", "discovery.resolve_hostnames", "dhcp.ping_check", "ui.show_ipv6", "lan.enabled",
-                   "geoip.enabled", "update.enabled", "update.auto_install"):
+                   "geoip.enabled", "update.enabled", "update.auto_install",
+                   *("tools." + name for name in TOOLS)):
         _set_path(out, dotted, bool(_get_path(out, dotted)))
     # ports list
     ports = _get_path(out, "discovery.ports")
