@@ -117,6 +117,8 @@
     health: () => api.get('/health'),
     status: () => api.get('/status'),
     netinfo: () => api.get('/netinfo'),
+    // Faults: the passive watch's findings. The live feed is the faults.state event.
+    faults: () => api.get('/faults'),
     // Realtime throughput: the backlog for one window. The live feed is the throughput.sample event.
     throughput: (windowS) => api.get('/throughput?window_s=' + encodeURIComponent(windowS)),
     // IP location (DB-IP Lite): the data's state, a lookup made on this PC only, and Retry now
@@ -481,7 +483,7 @@
     'hello', 'ping.sample', 'ping.targets', 'outage.start', 'outage.end',
     'speedtest.start', 'speedtest.progress', 'speedtest.done',
     'discovery.progress', 'discovery.done', 'settings.changed', 'monitoring.paused',
-    'dhcp.state', 'dhcp.lease', 'dhcp.scan', 'map.sample', 'throughput.sample', 'geoip.state',
+    'dhcp.state', 'dhcp.lease', 'dhcp.scan', 'map.sample', 'throughput.sample', 'faults.state', 'geoip.state',
     'trace.start', 'trace.hop', 'trace.done',
     'lan.peers', 'lan.state', 'lan.throughput.progress', 'lan.throughput.done',
     'net.changed',

@@ -28,6 +28,9 @@
   --pink: #FF8FC7;
   --lime: #A8D84B;
   --sand: #E3B183;
+  /* the twelfth tile (Faults). A deeper, earthier warm than --red or --orange, so a tile
+     that is about things being broken does not shout the way a red badge does */
+  --rust: #D9785C;
   --grey: var(--ink-soft);
   --shadow: var(--ink);
   --accent: var(--blue);
@@ -57,6 +60,7 @@
   --pink: #FF9FD0;
   --lime: #BCE865;
   --sand: #F0C79B;
+  --rust: #E89075;
   --shadow: #0F0D1A;
   --outline-25: rgba(243, 238, 255, 0.25);
   --outline-12: rgba(243, 238, 255, 0.12);
@@ -650,6 +654,45 @@ code.copy.stale { color: var(--ink-soft); border-style: dashed; }
 .adapter-tp.off { cursor: default; opacity: 0.55; }
 .adapter-tp:hover { color: var(--ink); }
 .subnet-title { display: flex; align-items: center; gap: 8px; font-weight: 800; font-size: 14px; }
+
+/* ---------- faults (the passive watch) ---------- */
+/* the findings list first, worst first, in the same level-tinted cards the SIP and Pro AV pages use,
+   then one table of what every adapter has actually done. Two number columns are deliberately kept
+   apart: what happened since TNT started watching, and the lifetime figure, which on a machine that
+   has been up a month is a fact about last month. Tokens only; both themes follow */
+.fa-findings { display: flex; flex-direction: column; gap: 10px; margin: 14px 0 18px; }
+.fa-find { border: 3px solid var(--ink); border-radius: 16px; padding: 11px 13px; background: var(--paper-2); }
+.fa-find.red { background: color-mix(in srgb, var(--red) 16%, var(--paper)); }
+.fa-find.yellow { background: color-mix(in srgb, var(--yellow) 26%, var(--paper)); }
+.fa-find.green { background: color-mix(in srgb, var(--green) 18%, var(--paper)); }
+.fa-find-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.fa-find-title { font-weight: 900; font-size: 16px; }
+.fa-find-detail { margin: 6px 0 0; font-size: 14.5px; line-height: 1.5; }
+.fa-advice { margin-top: 8px; display: flex; gap: 8px; align-items: flex-start; font-size: 14px;
+  line-height: 1.45; color: var(--ink-soft); }
+.fa-advice .pill { flex: none; background: color-mix(in srgb, var(--rust) 35%, var(--paper)); }
+
+.fa-counters { display: flex; flex-direction: column; gap: 10px; }
+.fa-table-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.fa-table-head h3 { margin: 0; font-size: 17px; font-weight: 900; }
+.fa-table { width: 100%; }
+.fa-table td, .fa-table th { white-space: nowrap; }
+.fa-table td:first-child { white-space: normal; min-width: 0; }
+.fa-nic { font-weight: 800; }
+/* the adapter model gives way before its name and its numbers */
+.fa-nic-desc { display: block; font-size: 12px; font-weight: 700; max-width: 22ch;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* a row that has actually seen something, so the eye lands on it before reading any number */
+.fa-row-bad { background: color-mix(in srgb, var(--red) 10%, transparent); }
+.fa-row-warn { background: color-mix(in srgb, var(--yellow) 14%, transparent); }
+.fa-hot { font-weight: 900; color: var(--red); }
+.fa-warm { font-weight: 900; }
+.fa-note { margin: 2px 0 0; line-height: 1.5; }
+
+@media (max-width: 700px) {
+  /* the lifetime column is the first thing to go: it is context, not the answer */
+  .fa-table th:last-child, .fa-table td:last-child { display: none; }
+}
 
 /* ---------- network info: realtime throughput ---------- */
 /* one cell of the adapter grid between the live link map and the NAT card (js/throughput.js): the window

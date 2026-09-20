@@ -49,6 +49,7 @@
     // three broadcast arcs over a dot: the WiFi tile and the saved Wi-Fi networks card
     wifi: '<svg ' + S + '><path d="M2.4 8.4a14 14 0 0 1 19.2 0"/><path d="M5.6 11.9a9.4 9.4 0 0 1 12.8 0"/><path d="M8.8 15.4a4.8 4.8 0 0 1 6.4 0"/><circle cx="12" cy="19.1" r="1.3" fill="currentColor" stroke="none"/></svg>',
     // two overlapping channel shapes standing on a baseline: the WiFi page's spectrum charts
+    fault: '<svg ' + S + '><path d="M2.6 12h5.2"/><path d="M16.2 12h5.2"/><path d="M12.9 6.4 10 12h4l-2.9 5.6"/></svg>',
     activity: '<svg ' + S + '><path d="M2.6 13.4h4L9 7.2l3.4 10 2.6-5.2h6.4"/></svg>',
     spectrum: '<svg ' + S + '><path d="M2.6 20.2h18.8"/><path d="M4 20.2 6.6 7.4h4.6l2.6 12.8"/><path d="M11.2 20.2 13.6 12.6h4.2l2.4 7.6"/></svg>',
     // crosshair target: the last hop of a traceroute
@@ -423,8 +424,8 @@
     live: 'connecting', apiOk: true, now: nowS(), view: null,
   };
   TNT.state = state;
-  const ACCENT = { ipinfo: 'var(--blue)', ping: 'var(--green)', outages: 'var(--yellow)', speed: 'var(--purple)', discovery: 'var(--orange)', tools: 'var(--red)', wifi: 'var(--teal)', reports: 'var(--grey)', capture: 'var(--pink)', proav: 'var(--lime)', sip: 'var(--sand)' };
-  const VIEW_NAMES = ['ipinfo', 'ping', 'outages', 'speed', 'discovery', 'wifi', 'tools', 'reports', 'capture', 'proav', 'sip'];   // the tile order of index.html
+  const ACCENT = { ipinfo: 'var(--blue)', ping: 'var(--green)', outages: 'var(--yellow)', speed: 'var(--purple)', discovery: 'var(--orange)', tools: 'var(--red)', wifi: 'var(--teal)', reports: 'var(--grey)', capture: 'var(--pink)', proav: 'var(--lime)', sip: 'var(--sand)', faults: 'var(--rust)' };
+  const VIEW_NAMES = ['ipinfo', 'ping', 'outages', 'speed', 'discovery', 'wifi', 'tools', 'reports', 'capture', 'proav', 'sip', 'faults'];   // the tile order of index.html
   //: the tiles under the four full-height ones, half height with a two-line body (.tile.half in css/tnt.css)
   //: the main tools Settings can switch off, in tile order (tnt.config.TOOLS). A tool that is off has no tile
   //: and no page, and its service side takes no automated action either — the switch is one setting, not two.
@@ -456,7 +457,7 @@
   function liveViews() { return VIEW_NAMES.filter(toolOn); }
 
   //: every tile is half height now — the four that used to be tall said more than a glance needs
-  const HALF_TILES = ['ipinfo', 'ping', 'outages', 'speed', 'discovery', 'wifi', 'tools', 'reports', 'capture', 'proav', 'sip'];
+  const HALF_TILES = ['ipinfo', 'ping', 'outages', 'speed', 'discovery', 'wifi', 'tools', 'reports', 'capture', 'proav', 'sip', 'faults'];
 
   /* ================================================================ theme */
   function setTheme(theme, opts) {
@@ -1061,6 +1062,34 @@
             : (s.sip_host ? '<span class="tile-ellipsis muted">' + esc(s.sip_host) + '</span>' : 'Qualify the line for calls'),
             bits.length ? '' : 'muted');
         }
+      }
+      if (el.dataset.html !== html) { el.innerHTML = html; el.dataset.html = html; }
+    }
+
+    /* Faults: the worst level as a badge, then the one line the watcher chose. The badge counts
+       rather than names a level, because "2 faults" is what a tech needs off a glance and "bad" is
+       not. A clean tile says how long it has been watching, so "no faults" carries its own weight:
+       nothing found in two hours means more than nothing found in ten seconds. */
+    if (tileEls.faults) {
+      const el = tileEls.faults;
+      const f = st && st.faults;
+      let html;
+      if (!st) html = line('Loading…', 'muted');
+      else if (!f || f.available === false) html = line('<span class="badge grey">off</span>') +
+        line(esc((f && f.reason) || 'The fault watch is not running'), 'muted');
+      else {
+        const bad = f.bad || 0, warn = f.warn || 0;
+        const badge = bad ? '<span class="badge red">' + fmtNum(bad) + (bad === 1 ? ' fault' : ' faults') + '</span>'
+          : warn ? '<span class="badge yellow">' + fmtNum(warn) + ' to check</span>'
+            : f.level === 'good' ? '<span class="badge green">clean</span>'
+              : '<span class="badge grey">watching</span>';
+        const extra = bad && warn ? ' <span class="muted">+' + fmtNum(warn) + ' to check</span>' : '';
+        // a duration, not a clock time: "clean for 2h 14m" is the claim, and how long it has held
+        // is most of what makes it worth anything
+        const watched = f.watched_s ? ' <span class="muted">for ' + esc(fmtDuration(f.watched_s)) + '</span>' : '';
+        html = line(badge + extra + (bad || warn ? '' : watched));
+        html += line('<span class="tile-ellipsis">' + esc(f.headline || '—') + '</span>',
+          bad || warn ? '' : 'muted', f.headline || '');
       }
       if (el.dataset.html !== html) { el.innerHTML = html; el.dataset.html = html; }
     }

@@ -737,6 +737,38 @@ def test_throughput_route_needs_the_monitor_then_hands_over_its_view(server, eng
     assert status == 200 and data["window_s"] == tp_mod.DEFAULT_WINDOW_S
 
 
+
+def test_faults_route_needs_the_watcher_then_hands_over_its_view(server, engine):
+    """No start route and nothing to gate: the watch is always on and sends nothing, so there is
+    no work a caller could trigger."""
+    from tnt import faults as fault_mod
+
+    status, data = call_json(server, "GET", "/api/faults")
+    assert status == 503 and data["error"]["code"] == "unavailable"
+    status, data = call_json(server, "GET", "/api/status")
+    assert status == 200 and data["faults"] is None
+
+    class FakeWatcher:
+        def view(self) -> Dict[str, Any]:
+            return {"ts": 1.0, "watching_since": 0.5, "watched_s": 0.5, "level": "good",
+                    "findings": [], "nics": [], "arp": {}, "note": None}
+
+        def tile(self) -> Dict[str, Any]:
+            return {"available": True, "reason": None, "level": "good", "bad": 0, "warn": 0,
+                    "headline": "No faults found", "watched_s": 0.5, "ts": 1.0}
+
+    engine.faults = FakeWatcher()
+    status, data = call_json(server, "GET", "/api/faults")
+    assert status == 200 and set(data) == set(fault_mod.VIEW_KEYS)
+    status, data = call_json(server, "GET", "/api/status")
+    assert status == 200 and set(data["faults"]) == set(fault_mod.TILE_KEYS)
+    # a tile() that blows up must not take /api/status down with it
+    engine.faults = type("Boom", (), {"tile": lambda self: (_ for _ in ()).throw(OSError("nope")),
+                                      "view": FakeWatcher.view})()
+    status, data = call_json(server, "GET", "/api/status")
+    assert status == 200 and data["faults"] is None
+
+
 def test_reports_routes_need_the_report_manager(server):
     """The fake engine has no ``reports``: every /api/reports route is 503 and /api/status carries null.
     Only the Full Scan's Wi-Fi post may exceed the 1 MB body cap (tests/test_reports.py sends one)."""

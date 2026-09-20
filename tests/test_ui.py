@@ -38,12 +38,14 @@ JS_FILES = [
     "js/views/ipinfo.js", "js/views/ping.js",
     "js/views/outages.js", "js/views/speed.js", "js/views/discovery.js", "js/views/tools.js", "js/views/wifi.js",
     "js/views/reports.js", "js/views/capture.js", "js/views/proav.js", "js/views/sip.js",
+    "js/views/faults.js",
     "js/egg.js", "js/app.js",
 ]
-VIEW_NAMES = ["ipinfo", "ping", "outages", "speed", "discovery", "wifi", "tools", "reports", "capture", "proav"]
+VIEW_NAMES = ["ipinfo", "ping", "outages", "speed", "discovery", "wifi", "tools", "reports", "capture", "proav",
+              "faults"]
 # the tiles of index.html, in order: the four full-height ones, then the six that carry `class="tile half"`
 TILE_NAMES = ["ipinfo", "ping", "outages", "speed", "discovery", "wifi", "tools", "reports", "capture", "proav",
-              "sip"]
+              "sip", "faults"]
 # every tile is half height now: the first four used to be 150 px and carried three or four lines
 HALF_TILES = list(TILE_NAMES)
 MOCK_BRIDGE = ROOT / "tools" / "mock_wifi_bridge.js"
@@ -1233,12 +1235,15 @@ def test_wifi_helpers_with_node(tmp_path):
 def test_wifi_tile_view_and_accent():
     html = _read("index.html")
     tiles = re.findall(r'<a class="tile( half)?" data-view="([a-z]+)" href="#\2" style="--accent: var\(--([a-z]+)\)">', html)
-    # the four full-height tiles, then the seven half-height ones: WiFi before Tools, Reports, then Packet
-    # capture, Pro AV and SIP. SIP's --sand is the eleventh accent: the palette's ten were all spent.
+    # the tile order of index.html, each with its own accent. SIP's --sand was the eleventh and spent
+    # the original palette; Faults' --rust was added for the twelfth.
     assert [(name, accent) for _, name, accent in tiles] == [
         ("ipinfo", "blue"), ("ping", "green"), ("outages", "yellow"), ("speed", "purple"), ("discovery", "orange"),
         ("wifi", "teal"), ("tools", "red"), ("reports", "grey"), ("capture", "pink"), ("proav", "lime"),
-        ("sip", "sand")]
+        ("sip", "sand"), ("faults", "rust")]
+    # no two tiles share an accent: two the same colour stop being tellable apart at a glance
+    accents = [accent for _, _, accent in tiles]
+    assert len(accents) == len(set(accents)), accents
     assert [name for half, name, _ in tiles if half] == HALF_TILES
     assert 'data-icon="wifi"></span><span class="tile-title">WiFi</span>' in html and 'id="tile-wifi"' in html
     # the chart helpers load after charts.js (they extend its base class), the view with the others
@@ -1246,7 +1251,8 @@ def test_wifi_tile_view_and_accent():
     # the tiles are plain markup in index.html, in this order: there is no saved tile order anywhere
     # that could leave the new tile out (the only reorderable tiles are the Ping page's targets)
     app = _read("js/app.js")
-    assert "wifi: 'var(--teal)'" in app and "'discovery', 'wifi', 'tools', 'reports', 'capture', 'proav', 'sip'];" in app
+    assert "wifi: 'var(--teal)'" in app and "faults: 'var(--rust)'" in app
+    assert "'discovery', 'wifi', 'tools', 'reports', 'capture', 'proav', 'sip', 'faults'];" in app
     # app.js names the half-height tiles too (the markup carries the class): the two lists must not drift apart
     assert "const HALF_TILES = " + repr(HALF_TILES).replace('"', "'") + ";" in app
     assert "tileEls.wifi" in app and "tileSummary(ws.last, ws.bridgeState(), ws.error)" in app
@@ -3461,6 +3467,60 @@ def test_the_mock_hides_an_adapter_the_settings_exclude(mock):
         _req(mock.port, "PUT", "/api/settings", {"throughput": {"excluded": []}})
 
 
+
+def test_the_mocks_fault_watch_matches_the_services(mock):
+    """The page is written against one shape: a drift here works on the dev server and not on a
+    real machine, which is the one bug the dev server exists to prevent."""
+    from tnt import faults as svc
+
+    mod = mock.mod
+    assert mod.FAULT_LEVELS == svc.FINDING_LEVELS
+    assert mod.FAULT_FINDING_KEYS == svc.FINDING_KEYS and mod.FAULT_NIC_KEYS == svc.NIC_KEYS
+    assert mod.FAULT_VIEW_KEYS == svc.VIEW_KEYS and mod.FAULT_TILE_KEYS == svc.TILE_KEYS
+    assert mod.FAULT_MIN_WATCH_S == svc.MIN_WATCH_S
+    # the two copied helpers must agree word for word, or the page reads differently in each
+    for seconds in (0, 1, 45, 89, 90, 200, 3600, 5400, 7000):
+        assert mod._fault_duration(seconds) == svc._duration(seconds), seconds
+    for findings in ([], [{"level": "good"}], [{"level": "warn"}, {"level": "bad"}]):
+        assert mod._fault_worst(findings) == svc.worst_level(findings), findings
+
+
+def test_the_mock_serves_the_fault_watch_and_its_tile(mock):
+    from tnt import faults as svc
+
+    mock.state.faults_since = time.time() - 900       # a quarter of an hour in
+    # no ticker thread runs in the tests, so drive the traffic by hand: without frames there is no
+    # ratio to quote and the watch has nothing it is willing to judge
+    now = time.time()
+    for i in range(40):
+        mock.state.throughput_tick(now - 39 + i)
+    st, _, data = _req(mock.port, "GET", "/api/faults")
+    assert st == 200 and set(data) == set(svc.VIEW_KEYS)
+    assert data["level"] in svc.FINDING_LEVELS and data["note"] is None
+    assert data["findings"], "the fake site has a bad patch lead; it should be saying so"
+    for f in data["findings"]:
+        assert set(f) == set(svc.FINDING_KEYS)
+        assert f["id"] in svc.FINDING_IDS and f["level"] in svc.FINDING_LEVELS
+    for n in data["nics"]:
+        assert set(n) == set(svc.NIC_KEYS)
+        # the lifetime figure is always at least what happened since we started watching
+        assert n["rx_errors"] >= n["new_rx_errors"] and n["rx_discards"] >= n["new_rx_discards"]
+    # the errors finding leads, because it is the one that sends a tech to the cabling
+    assert data["findings"][0]["id"] == "fault.errors" and data["level"] == "bad"
+
+    st, _, status = _req(mock.port, "GET", "/api/status")
+    assert st == 200 and set(status["faults"]) == set(svc.TILE_KEYS)
+    assert status["faults"]["level"] == "bad" and status["faults"]["bad"] >= 1
+    assert status["faults"]["headline"] == data["findings"][0]["title"]
+
+
+def test_a_freshly_started_watch_says_it_is_watching_rather_than_that_all_is_well(mock):
+    mock.state.faults_since = time.time()
+    st, _, data = _req(mock.port, "GET", "/api/faults")
+    assert st == 200 and [f["id"] for f in data["findings"]] == ["fault.watching"]
+    assert data["level"] == "info"
+
+
 def test_the_throughput_sample_event_reaches_the_stream(mock):
     """The card's only live feed: its rows are the view's rows without the series."""
     conn = http.client.HTTPConnection("127.0.0.1", mock.port, timeout=5)
@@ -3771,11 +3831,12 @@ def test_tile_grid_keeps_equal_widths_in_a_browser(browser_page, mock, monkeypat
     m = re.search(r'<pre id="probe">(.*?)</pre>', dom, re.S)
     assert m and m.group(1) != "pending", "the probe page did not finish"
     res = json.loads(m.group(1))
-    expect = {  # window width: (tiles per row with the eleven tiles, with a twelfth)
-        1920: ([4, 4, 3], [4, 4, 4]), 1600: ([4, 4, 3], [4, 4, 4]), 1440: ([4, 4, 3], [4, 4, 4]), 1366: ([4, 4, 3], [4, 4, 4]),
-        1024: ([4, 4, 3], [4, 4, 4]), 980: ([4, 4, 3], [4, 4, 4]), 960: ([4, 4, 3], [4, 4, 4]), 900: ([4, 4, 3], [4, 4, 4]),
-        800: ([3, 3, 3, 2], [3, 3, 3, 3]), 740: ([3, 3, 3, 2], [3, 3, 3, 3]), 720: ([3, 3, 3, 2], [3, 3, 3, 3]),
-        700: ([2, 2, 2, 2, 2, 1], [2, 2, 2, 2, 2, 2]),
+    expect = {  # window width: (tiles per row with the twelve tiles, with a thirteenth)
+        1920: ([4, 4, 4], [4, 4, 4, 1]), 1600: ([4, 4, 4], [4, 4, 4, 1]), 1440: ([4, 4, 4], [4, 4, 4, 1]),
+        1366: ([4, 4, 4], [4, 4, 4, 1]), 1024: ([4, 4, 4], [4, 4, 4, 1]), 980: ([4, 4, 4], [4, 4, 4, 1]),
+        960: ([4, 4, 4], [4, 4, 4, 1]), 900: ([4, 4, 4], [4, 4, 4, 1]),
+        800: ([3, 3, 3, 3], [3, 3, 3, 3, 1]), 740: ([3, 3, 3, 3], [3, 3, 3, 3, 1]), 720: ([3, 3, 3, 3], [3, 3, 3, 3, 1]),
+        700: ([2, 2, 2, 2, 2, 2], [2, 2, 2, 2, 2, 2, 1]),
     }
     for w, (real_rows, extra_rows) in expect.items():
         for key, rows in (("real", real_rows), ("extra", extra_rows)):
@@ -4546,7 +4607,7 @@ def test_top_bar_stays_one_row_in_a_browser(browser_page, mock, monkeypatch):
 # ---------------------------------------------------------------------------
 #: the one word under each icon, in tile order
 JUMP_LABELS = ["Network", "Ping", "Outages", "Speed", "Discovery", "WiFi", "Tools", "Reports", "Capture", "ProAV",
-               "SIP"]
+               "SIP", "Faults"]
 
 
 def test_tile_shortcut_squares_source():
@@ -4899,7 +4960,7 @@ def test_reports_tile_full_scan_button_and_wiring():
     # Full Scan is started from the Reports page's own button now; the header keeps the status pill, LIVE and the gear
     assert "btn-full-scan" not in html and "full-scan-label" not in html and "topbar-scan" not in html
     tiles = re.findall(r'<a class="tile(?: half)?" data-view="([a-z]+)"', html)
-    assert tiles == TILE_NAMES and tiles[-3:] == ["capture", "proav", "sip"]
+    assert tiles == TILE_NAMES and tiles[-4:] == ["capture", "proav", "sip", "faults"]
     assert '<a class="tile half" data-view="reports" href="#reports" style="--accent: var(--grey)">' in html
     assert '<span class="tile-icon" data-icon="report"></span><span class="tile-title">Reports</span>' in html
     assert html.index("js/reportsui.js") < html.index("js/views/ipinfo.js") and html.index("js/views/reports.js") < html.index("js/app.js")

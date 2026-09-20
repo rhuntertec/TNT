@@ -29,11 +29,11 @@ UI = ROOT / "ui"
 # ---------------------------------------------------------------------------
 def test_the_tile_sits_to_the_right_of_packet_capture():
     html = _read("index.html")
-    assert TILE_NAMES[-2] == "proav"
+    assert TILE_NAMES[-3] == "proav"
     assert ('<a class="tile half" data-view="proav" href="#proav" style="--accent: var(--lime)">' in html)
     assert '<span class="tile-icon" data-icon="proav"></span><span class="tile-title">Pro AV</span>' in html
     assert '<div class="tile-body" id="tile-proav">' in html
-    # it comes after Packet capture, and its view loads after that one (SIP is now the last tile)
+    # it comes after Packet capture, and its view loads after that one (SIP and Faults follow it)
     assert html.index('data-view="capture"') < html.index('data-view="proav"') < html.index('data-view="sip"')
     assert html.index("js/views/capture.js") < html.index("js/views/proav.js") < html.index("js/app.js")
 

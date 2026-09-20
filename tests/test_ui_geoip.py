@@ -75,7 +75,7 @@ def test_ip_location_markup_and_css():
 
     api = _read("js/api.js")
     for s in ("geoip: () => api.get('/geoip')", "geoipLookup: (ip) => api.get('/geoip/lookup?ip=' + encodeURIComponent(ip))",
-              "geoipCheck: () => api.post('/geoip/check')", "'dhcp.state', 'dhcp.lease', 'dhcp.scan', 'map.sample', 'throughput.sample', 'geoip.state',"):
+              "geoipCheck: () => api.post('/geoip/check')", "'dhcp.state', 'dhcp.lease', 'dhcp.scan', 'map.sample', 'throughput.sample', 'faults.state', 'geoip.state',"):
         assert s in api, s
 
     css = _read("css/tnt.css")

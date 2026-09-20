@@ -68,12 +68,13 @@ def _node(tmp_path: Path, body: str, files: List[str], payload: Any = None) -> A
 # ---------------------------------------------------------------------------
 def test_the_tile_is_the_eleventh_and_sits_after_pro_av():
     html = _read("index.html")
-    assert TILE_NAMES[-1] == "sip" and len(TILE_NAMES) == 11
+    assert TILE_NAMES[10] == "sip" and TILE_NAMES[-1] == "faults"
     assert '<a class="tile half" data-view="sip" href="#sip" style="--accent: var(--sand)">' in html
     assert '<span class="tile-icon" data-icon="sip"></span><span class="tile-title">SIP</span>' in html
     assert '<div class="tile-body" id="tile-sip">' in html
     assert html.index('data-view="proav"') < html.index('data-view="sip"')
     assert html.index("js/views/proav.js") < html.index("js/views/sip.js") < html.index("js/app.js")
+    assert html.index('data-view="sip"') < html.index('data-view="faults"')
 
 
 def test_app_js_knows_the_eleventh_tile():
@@ -85,15 +86,19 @@ def test_app_js_knows_the_eleventh_tile():
 
 
 def test_the_sand_accent_is_defined_in_both_themes_and_is_nobody_elses():
-    """The palette's ten accents were all spent, so SIP needed an eleventh hue rather than a second use of one."""
+    """The palette's ten accents were all spent, so SIP needed an eleventh hue rather than a second
+    use of one - and Faults a twelfth after it. Every tile's accent is still its own."""
     css = _read("css/tnt.css")
     light = re.search(r":root\s*\{(.*?)\}", css, re.S).group(1)
     assert re.search(r"--sand:\s*#[0-9A-Fa-f]{6};", light)
     assert len(re.findall(r"--sand:\s*#[0-9A-Fa-f]{6};", css)) >= 2, "the dark theme redefines it too"
     app = _read("js/app.js")
     accents = re.findall(r"\w+: 'var\(--(\w+)\)'", re.search(r"const ACCENT = \{(.*?)\};", app, re.S).group(1))
-    assert len(accents) == len(set(accents)) == 11, accents
-    assert accents[-1] == "sand"
+    assert len(accents) == len(set(accents)) == 12, accents
+    assert accents[10] == "sand" and accents[-1] == "rust"
+    # the twelfth is defined the same way: a hue of its own, in both themes
+    assert re.search(r"--rust:\s*#[0-9A-Fa-f]{6};", light)
+    assert len(re.findall(r"--rust:\s*#[0-9A-Fa-f]{6};", css)) >= 2, "the dark theme redefines it too"
 
 
 def test_the_page_has_its_own_styles():

@@ -1994,7 +1994,7 @@ def test_shared_ui_wiring_keeps_the_contract():
     at = api.index("const KNOWN_EVENTS = [")
     events = api[at:api.index("];", at)]
     lines = [ln.strip() for ln in events.splitlines()[1:] if ln.strip()]
-    assert "'dhcp.state', 'dhcp.lease', 'dhcp.scan', 'map.sample', 'throughput.sample', 'geoip.state'," in lines, "the pinned line is unchanged"
+    assert "'dhcp.state', 'dhcp.lease', 'dhcp.scan', 'map.sample', 'throughput.sample', 'faults.state', 'geoip.state'," in lines, "the pinned line is unchanged"
     report = lines.index("'report.progress', 'report.saved', 'report.deleted', 'report.updated',")
     assert lines[report + 1:] == ["'netcheck.switch',", "'tftp.state', 'tftp.transfer',", "'capture.state', 'capture.sip',"], lines[report:]
     known = set(re.findall(r"'([\w.]+)'", events))

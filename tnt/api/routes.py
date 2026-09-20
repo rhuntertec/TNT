@@ -138,6 +138,13 @@ Contract gaps resolved here (documented deviations):
   and ``"changed_ts"`` to the snapshot.  Without a watcher (``engine.netwatch`` missing or
   ``None``) generation is 0, ``changed_ts`` and ``summary`` null, ``networks`` empty and the
   gateway / adapter name come from ``netinfo_summary()``.
+* Faults (``engine.faults``, :mod:`tnt.faults`): ``GET /api/faults`` is the passive watch's view -
+  ``{"ts","watching_since","watched_s","level","findings":[FINDING...],"nics":[...],"arp","note"}``,
+  503 without the component.  ``GET /api/status`` carries ``"faults"`` (TILE:
+  ``{"available","reason","level","bad","warn","headline","watched_s","ts"}``, null without it).  The
+  live feed is the ``faults.state`` event, published only when the **level** changes - a green tile
+  has nothing to say once a second.  Nothing here is a start route: the watch is always on and sends
+  nothing, so there is no work for a caller to trigger and nothing to gate.
 * Realtime throughput (``engine.throughput``, :mod:`tnt.throughput`): ``GET /api/throughput?window_s=``
   is the card's payload - ``{"ts","window_s","step_s","history_s","windows","nics":[NIC...],"note"}``, one
   NIC per interface that moved something inside the window (plus the internet-facing one, always).  An
@@ -1008,6 +1015,8 @@ def build_routes(engine: Any, api: Any) -> Router:
                 "last_run": disc.get("last_run"),
             },
             "netinfo": net,
+            "faults": _safe_call("faults.tile()", engine.faults.tile, None)
+                      if getattr(engine, "faults", None) is not None else None,
             "net": {
                 "generation": int((watch or {}).get("generation") or 0),
                 "changed_ts": (watch or {}).get("changed_ts"),
@@ -1035,6 +1044,11 @@ def build_routes(engine: Any, api: Any) -> Router:
             snap["generation"] = int(watch.get("generation") or 0)
             snap["changed_ts"] = watch.get("changed_ts")
         return snap
+
+    # -- faults: the passive watch (Faults tile) -------------------------------
+    @r.get("/api/faults")
+    def faults(req: Request) -> Any:
+        return _need(engine, "faults", "the fault watch").view()
 
     # -- realtime throughput (Network info) -----------------------------------
     @r.get("/api/throughput")

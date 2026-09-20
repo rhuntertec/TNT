@@ -103,6 +103,11 @@ MTU_UNKNOWN = 0xFFFFFFFF
 MAX_ADAPTER_ADDRESS_LENGTH = 8
 MAX_DHCPV6_DUID_LENGTH = 130
 
+#: Adapter types that are a tunnel rather than a link to a network: a VPN client, Tailscale,
+#: WireGuard.  They are addressed as host routes with a gateway outside them and they take the
+#: default route while connected, both of which are correct and neither of which is a warning.
+TUNNEL_IF_TYPES: Tuple[int, ...] = (53, 131)
+
 IF_TYPE_NAMES: Dict[int, str] = {
     1: "Other",
     6: "Ethernet",
@@ -813,9 +818,15 @@ def adapter_warnings(adapter: Adapter, adapters: Optional[Sequence[Adapter]] = N
         nets: List[ipaddress.IPv4Network] = []
         for x in adapter.ipv4:
             try:
-                nets.append(ipaddress.IPv4Network(x.network, strict=False))
+                net = ipaddress.IPv4Network(x.network, strict=False)
             except ValueError:
                 continue
+            # A /31 or /32 is a host route: there is no subnet for a gateway to be inside, which is
+            # exactly how a VPN tunnel is addressed (Mullvad, Tailscale, WireGuard all do it).  Asking
+            # whether its gateway is "outside its subnet" is a question with no sensible answer, and
+            # answering it yellow made every VPN user's adapter card look misconfigured.
+            if net.prefixlen < 31:
+                nets.append(net)
         if nets:
             for gw in adapter.gateways:
                 if _version(gw) != 4:
@@ -827,9 +838,11 @@ def adapter_warnings(adapter: Adapter, adapters: Optional[Sequence[Adapter]] = N
         if usable and adapter.ipv4_gateway and not adapter.dns:
             out.append({"code": "no_dns", "message": "No DNS servers: host names will not resolve"})
         if adapters is not None and internet_index is not None and adapter.index == internet_index \
-                and adapter.ipv4_gateway:
+                and adapter.ipv4_gateway and adapter.if_type not in TUNNEL_IF_TYPES:
+            # tunnels excluded on both sides: a connected VPN takes the default route by design, and
+            # flagging that would mean every machine with Tailscale or a corporate VPN is "wrong"
             others = [a for a in adapters if a is not adapter and a.index != adapter.index and a.is_up
-                      and not a.is_loopback and a.ipv4_gateway]
+                      and not a.is_loopback and a.ipv4_gateway and a.if_type not in TUNNEL_IF_TYPES]
             if others:
                 other = others[0]
                 out.append({"code": "multiple_default_gateways",

@@ -114,7 +114,13 @@ IF_MAX_PHYS_ADDRESS_LENGTH = 32
 
 
 class Counters(NamedTuple):
-    """One interface's totals at one instant.  Byte and packet counts are cumulative."""
+    """One interface's totals at one instant.  Every count is cumulative, since the adapter came up.
+
+    The error and discard counts are what :mod:`tnt.faults` reads.  They are two different things and
+    are kept apart on purpose: an **error** is a frame that arrived damaged (a bad FCS - cabling, a
+    connector, a duplex mismatch), a **discard** is a frame that was fine and got dropped anyway
+    (no buffer - congestion).  Rolling them together would send a tech to the wrong place.
+    """
 
     luid: int
     index: int
@@ -126,6 +132,10 @@ class Counters(NamedTuple):
     tx_bytes: int
     rx_packets: int
     tx_packets: int
+    rx_errors: int = 0
+    tx_errors: int = 0
+    rx_discards: int = 0
+    tx_discards: int = 0
 
 
 # =========================================================================================
@@ -257,6 +267,10 @@ def read_counters() -> List[Counters]:
                 tx_bytes=int(row.OutOctets),
                 rx_packets=int(row.InUcastPkts) + int(row.InNUcastPkts),
                 tx_packets=int(row.OutUcastPkts) + int(row.OutNUcastPkts),
+                rx_errors=int(row.InErrors),
+                tx_errors=int(row.OutErrors),
+                rx_discards=int(row.InDiscards),
+                tx_discards=int(row.OutDiscards),
             ))
     finally:
         dll.FreeMibTable(ptr)

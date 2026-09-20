@@ -204,6 +204,7 @@ class Engine:
         self.pinger: Any = None
         self.linkmap: Any = None
         self.throughput: Any = None
+        self.faults: Any = None
         self.geoip: Any = None
         self.update: Any = None
         self.raw_log: Any = None
@@ -307,6 +308,7 @@ class Engine:
         self._start_ping_manager()
         self._start_linkmap()
         self._start_throughput()
+        self._start_faults()
         self._start_geoip()
         self._start_update()
         self._start_natcheck()
@@ -385,6 +387,8 @@ class Engine:
             self._bounded("linkmap", self.linkmap.stop, deadline, 2.0)
         if getattr(self, "throughput", None) is not None:
             self._bounded("throughput", self.throughput.stop, deadline, 1.0)
+        if getattr(self, "faults", None) is not None:
+            self._bounded("faults", self.faults.stop, deadline, 1.0)
         if getattr(self, "geoip", None) is not None:
             self._bounded("geoip", self.geoip.stop, deadline, 1.0)
         if getattr(self, "update", None) is not None:
@@ -665,6 +669,18 @@ class Engine:
         except Exception as exc:  # noqa: BLE001
             self.throughput = None
             self._fail("throughput", exc)
+
+    def _start_faults(self) -> None:
+        """The always-on passive watch behind the Faults tile: counters, addresses, the ARP table."""
+        try:
+            from .faults import FaultWatcher
+
+            fw = FaultWatcher(self.bus)
+            fw.start()
+            self.faults = fw
+        except Exception as exc:  # noqa: BLE001
+            self.faults = None
+            self._fail("faults", exc)
 
     def _start_geoip(self) -> None:
         """IP location + ISP data (DB-IP Lite): loads what is installed, downloads on its own thread."""
