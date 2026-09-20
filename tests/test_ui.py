@@ -41,11 +41,12 @@ JS_FILES = [
     "js/views/faults.js",
     "js/egg.js", "js/app.js",
 ]
-VIEW_NAMES = ["ipinfo", "ping", "outages", "speed", "discovery", "wifi", "tools", "reports", "capture", "proav",
-              "faults"]
+VIEW_NAMES = ["ipinfo", "ping", "outages", "speed", "discovery", "capture", "faults", "wifi", "sip", "proav",
+              "tools", "reports"]
 # the tiles of index.html, in order: the four full-height ones, then the six that carry `class="tile half"`
-TILE_NAMES = ["ipinfo", "ping", "outages", "speed", "discovery", "wifi", "tools", "reports", "capture", "proav",
-              "sip", "faults"]
+# the tile order of index.html: the order the owner asked for, not a grouping the code derives
+TILE_NAMES = ["ipinfo", "ping", "outages", "speed", "discovery", "capture", "faults", "wifi", "sip", "proav",
+              "tools", "reports"]
 # every tile is half height now: the first four used to be 150 px and carried three or four lines
 HALF_TILES = list(TILE_NAMES)
 MOCK_BRIDGE = ROOT / "tools" / "mock_wifi_bridge.js"
@@ -206,7 +207,7 @@ def test_tools_view_markup_tile_and_danger_modal():
     assert 'class="tile half" data-view="tools" href="#tools" style="--accent: var(--red)"' in html
     assert 'data-icon="tools"' in html and 'id="tile-tools"' in html
     app = _read("js/app.js")
-    assert "tools: 'var(--red)'" in app and "'discovery', 'wifi', 'tools'" in app
+    assert "tools: 'var(--red)'" in app and "'sip', 'proav', 'tools', 'reports'];" in app
     assert "tools:" in app and "warning:" in app and "dhcp:" in app  # icons
     # the Tools tile: the DHCP server's state, then the other tools by name as plain text
     assert "tileEls.tools" in app and "DHCP client" in app and "Tools for the field" not in app
@@ -1237,10 +1238,8 @@ def test_wifi_tile_view_and_accent():
     tiles = re.findall(r'<a class="tile( half)?" data-view="([a-z]+)" href="#\2" style="--accent: var\(--([a-z]+)\)">', html)
     # the tile order of index.html, each with its own accent. SIP's --sand was the eleventh and spent
     # the original palette; Faults' --rust was added for the twelfth.
-    assert [(name, accent) for _, name, accent in tiles] == [
-        ("ipinfo", "blue"), ("ping", "green"), ("outages", "yellow"), ("speed", "purple"), ("discovery", "orange"),
-        ("wifi", "teal"), ("tools", "red"), ("reports", "grey"), ("capture", "pink"), ("proav", "lime"),
-        ("sip", "sand"), ("faults", "rust")]
+    assert [(name, accent) for _, name, accent in tiles] == list(zip(TILE_NAMES, [
+        "blue", "green", "yellow", "purple", "orange", "pink", "rust", "teal", "sand", "lime", "red", "grey"]))
     # no two tiles share an accent: two the same colour stop being tellable apart at a glance
     accents = [accent for _, _, accent in tiles]
     assert len(accents) == len(set(accents)), accents
@@ -1252,7 +1251,7 @@ def test_wifi_tile_view_and_accent():
     # that could leave the new tile out (the only reorderable tiles are the Ping page's targets)
     app = _read("js/app.js")
     assert "wifi: 'var(--teal)'" in app and "faults: 'var(--rust)'" in app
-    assert "'discovery', 'wifi', 'tools', 'reports', 'capture', 'proav', 'sip', 'faults'];" in app
+    assert "'discovery', 'capture', 'faults', 'wifi', 'sip', 'proav', 'tools', 'reports'];" in app
     # app.js names the half-height tiles too (the markup carries the class): the two lists must not drift apart
     assert "const HALF_TILES = " + repr(HALF_TILES).replace('"', "'") + ";" in app
     assert "tileEls.wifi" in app and "tileSummary(ws.last, ws.bridgeState(), ws.error)" in app
@@ -4606,8 +4605,8 @@ def test_top_bar_stays_one_row_in_a_browser(browser_page, mock, monkeypatch):
 # the tile shortcuts: the small squares that ride up into the header row once the tiles are scrolled away
 # ---------------------------------------------------------------------------
 #: the one word under each icon, in tile order
-JUMP_LABELS = ["Network", "Ping", "Outages", "Speed", "Discovery", "WiFi", "Tools", "Reports", "Capture", "ProAV",
-               "SIP", "Faults"]
+JUMP_LABELS = ["Network", "Ping", "Outages", "Speed", "Discovery", "Capture", "Faults", "WiFi", "SIP", "ProAV",
+               "Tools", "Reports"]
 
 
 def test_tile_shortcut_squares_source():
@@ -4960,7 +4959,7 @@ def test_reports_tile_full_scan_button_and_wiring():
     # Full Scan is started from the Reports page's own button now; the header keeps the status pill, LIVE and the gear
     assert "btn-full-scan" not in html and "full-scan-label" not in html and "topbar-scan" not in html
     tiles = re.findall(r'<a class="tile(?: half)?" data-view="([a-z]+)"', html)
-    assert tiles == TILE_NAMES and tiles[-4:] == ["capture", "proav", "sip", "faults"]
+    assert tiles == TILE_NAMES and tiles[-2:] == ["tools", "reports"]
     assert '<a class="tile half" data-view="reports" href="#reports" style="--accent: var(--grey)">' in html
     assert '<span class="tile-icon" data-icon="report"></span><span class="tile-title">Reports</span>' in html
     assert html.index("js/reportsui.js") < html.index("js/views/ipinfo.js") and html.index("js/views/reports.js") < html.index("js/app.js")

@@ -66,15 +66,16 @@ def _node(tmp_path: Path, body: str, files: List[str], payload: Any = None) -> A
 # ---------------------------------------------------------------------------
 # markup, registries and CSS
 # ---------------------------------------------------------------------------
-def test_the_tile_is_the_eleventh_and_sits_after_pro_av():
+def test_the_tile_sits_between_wifi_and_pro_av():
     html = _read("index.html")
-    assert TILE_NAMES[10] == "sip" and TILE_NAMES[-1] == "faults"
+    assert TILE_NAMES[TILE_NAMES.index("sip") - 1] == "wifi"
+    assert TILE_NAMES[TILE_NAMES.index("sip") + 1] == "proav"
     assert '<a class="tile half" data-view="sip" href="#sip" style="--accent: var(--sand)">' in html
     assert '<span class="tile-icon" data-icon="sip"></span><span class="tile-title">SIP</span>' in html
     assert '<div class="tile-body" id="tile-sip">' in html
-    assert html.index('data-view="proav"') < html.index('data-view="sip"')
+    assert html.index('data-view="wifi"') < html.index('data-view="sip"') < html.index('data-view="proav"')
+    # the scripts load in dependency order, which is not the tile order and never was
     assert html.index("js/views/proav.js") < html.index("js/views/sip.js") < html.index("js/app.js")
-    assert html.index('data-view="sip"') < html.index('data-view="faults"')
 
 
 def test_app_js_knows_the_eleventh_tile():
@@ -93,9 +94,13 @@ def test_the_sand_accent_is_defined_in_both_themes_and_is_nobody_elses():
     assert re.search(r"--sand:\s*#[0-9A-Fa-f]{6};", light)
     assert len(re.findall(r"--sand:\s*#[0-9A-Fa-f]{6};", css)) >= 2, "the dark theme redefines it too"
     app = _read("js/app.js")
-    accents = re.findall(r"\w+: 'var\(--(\w+)\)'", re.search(r"const ACCENT = \{(.*?)\};", app, re.S).group(1))
-    assert len(accents) == len(set(accents)) == 12, accents
-    assert accents[10] == "sand" and accents[-1] == "rust"
+    # ACCENT is keyed by view name and written in its own order, which is not the tile order:
+    # assert what it maps, not where each entry happens to sit
+    pairs = re.findall(r"(\w+): 'var\(--(\w+)\)'", re.search(r"const ACCENT = \{(.*?)\};", app, re.S).group(1))
+    accent = dict(pairs)
+    assert sorted(accent) == sorted(TILE_NAMES), sorted(accent)
+    assert len(accent) == len(set(accent.values())) == 12, accent
+    assert accent["sip"] == "sand" and accent["faults"] == "rust"
     # the twelfth is defined the same way: a hue of its own, in both themes
     assert re.search(r"--rust:\s*#[0-9A-Fa-f]{6};", light)
     assert len(re.findall(r"--rust:\s*#[0-9A-Fa-f]{6};", css)) >= 2, "the dark theme redefines it too"
