@@ -262,6 +262,31 @@ def test_ip_location_is_in_the_readme():
         assert s in readme, s
 
 
+
+def test_the_readme_download_block_names_the_version_being_shipped():
+    """The front page of the public repository carries a download link, and a direct link to a
+    versioned installer goes stale the moment the version moves.  This is what stops it: run
+    ``python tools/set_release_links.py`` and the block is rewritten from ``tnt.__version__``.
+
+    The big link beside it points at ``/releases/latest``, which cannot go stale at all - so even a
+    release that somehow skipped this still leaves a working download on the page.
+    """
+    import subprocess
+    import sys
+
+    from tnt import __version__
+
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "<!-- download: rewritten by tools/set_release_links.py -->" in readme
+    head = readme[:readme.index("<!-- /download -->")]
+    assert head.index("# TNT") < head.index("Download TNT for Windows"), "it belongs at the top"
+    assert f"TNT-Setup-{__version__}.exe" in head, f"the block does not name {__version__}"
+    assert "/releases/latest" in head, "the link that cannot go stale"
+
+    r = subprocess.run([sys.executable, str(ROOT / "tools" / "set_release_links.py"), "--check"],
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+
 def test_the_self_check_imports_every_tnt_module():
     """`TNTService.exe --selfcheck` is what catches a frozen build that cannot import something (a conda venv
     missing a DLL, a module PyInstaller did not trace). A hand-kept list drifts — this one had fallen ten modules

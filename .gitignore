@@ -21,6 +21,7 @@ PORTS.json
 # >>> public export: files that stay private (never commit them here) >>>
 # Added by the export from the private source repository; these names stay there.
 *.md
+!README.md
 PORTS.json
 .claude/
 .publish-denylist.txt
