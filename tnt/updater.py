@@ -35,6 +35,7 @@ STATUS (exactly :data:`STATUS_KEYS`): ``{"enabled", "state", "current_version", 
 from __future__ import annotations
 
 import http.client
+import base64
 import json
 import logging
 import os
@@ -60,6 +61,9 @@ LATEST_URL = f"{GITHUB_API}/repos/{REPO}/releases/latest"
 RELEASES_URL = f"{GITHUB_API}/repos/{REPO}/releases?per_page=20"
 USER_AGENT = f"TNT/{__version__} (+https://github.com/{REPO})"
 INSTALLER_ARGS = ("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART")
+#: The installer writes its log beside itself in the staging folder.  Without this a silent
+#: install that failed left no record anywhere of why, which is no way to support a field tool.
+INSTALL_LOG_NAME = "install.log"
 
 SETUP_ASSET_RE = re.compile(r"^TNT-Setup-.*\.exe$", re.IGNORECASE)
 CHECKSUM_NAMES = ("sha256sums", "sha256sums.txt")   # a shared checksum list (fallback to "<setup>.sha256")
@@ -228,11 +232,72 @@ def parse_checksum(text: object, setup_name: str) -> Optional[str]:
     return bare
 
 
-def relaunch_command(exe: str, delay_s: int = 20) -> List[str]:
-    """The detached ``cmd.exe`` helper the client arms before an update: wait, then start TNT again.
-    ``cmd.exe`` (not ``TNT.exe``) so the installer's ``taskkill /IM TNT.exe`` cannot kill the waiter."""
-    delay = max(1, int(delay_s))
-    return ["cmd.exe", "/c", f"ping -n {delay + 1} 127.0.0.1 >nul & start \"\" \"{exe}\""]
+#: The post-install waiter's limits.  The timeout is generous because it has to cover the whole
+#: download as well as the install: on a site connection a 32 MB installer is minutes, not seconds.
+RELAUNCH_TIMEOUT_S = 300
+RELAUNCH_POLL_S = 2
+#: A breath after the installer lets go of the exe, before opening it.
+RELAUNCH_SETTLE_S = 2
+
+#: The waiter, as PowerShell.  It watches the client exe's timestamp rather than sleeping a fixed
+#: time: that is the one signal that says the installer has actually replaced it.  Everything the
+#: caller varies is substituted in, then the whole thing is base64'd into -EncodedCommand, which
+#: sidesteps every quoting rule between here and the shell.
+#:
+#: It reads the *baseline* timestamp itself rather than being handed one.  A tick count computed
+#: here from ``st_mtime`` and one read there from ``LastWriteTimeUtc`` are two different stacks'
+#: answers to the same question, and a float second cannot hold 100 ns precision - the two would
+#: disagree on some files, the waiter would decide the exe had already been replaced, and it would
+#: fire on its first poll.  Reading it in one place makes that impossible.  Nothing can have
+#: replaced the exe in the moment between arming and this line: the download has not started.
+_RELAUNCH_PS = """
+$e = @EXE@
+$was = @WAS@
+if (-not $was) { try { $was = (Get-Item -LiteralPath $e).LastWriteTimeUtc.Ticks.ToString() } catch { } }
+$deadline = (Get-Date).AddSeconds(@TIMEOUT@)
+while ((Get-Date) -lt $deadline) {
+  Start-Sleep -Seconds @POLL@
+  $now = $null
+  try { $now = (Get-Item -LiteralPath $e).LastWriteTimeUtc.Ticks.ToString() } catch { }
+  if ($was -and $now -and $now -ne $was -and -not (Get-Process -Name 'TNT-Setup*' -ErrorAction SilentlyContinue)) { break }
+}
+Start-Sleep -Seconds @SETTLE@
+if (-not (Get-Process -Name 'TNT' -ErrorAction SilentlyContinue)) {
+  if (Test-Path -LiteralPath $e) { Start-Process -FilePath $e }
+}
+"""
+
+
+def _ps_literal(text: str) -> str:
+    """*text* as a single-quoted PowerShell string (the only escape inside one is a doubled quote)."""
+    return "'" + str(text).replace("'", "''") + "'"
+
+
+def relaunch_command(exe: str, stamp: str = "", timeout_s: int = RELAUNCH_TIMEOUT_S) -> List[str]:
+    """The detached helper the client arms before an update: wait for the installer, then reopen TNT.
+
+    **Not** ``TNT.exe``, because the installer's ``taskkill /IM TNT.exe`` in ``PrepareToInstall``
+    would kill the waiter along with the window it is meant to bring back.
+
+    It used to be ``ping -n 31 127.0.0.1`` - a thirty-second sleep - which is only long enough when
+    the download is fast.  On a slower connection the sleep ran out during the download, the waiter
+    started the client, opened TNT, and then the installer killed it with nothing left to try again:
+    the update succeeded and the application disappeared.  So this waits on the thing that actually
+    matters, the client exe being replaced, and keeps a timeout only so that an update which fails
+    outright still gives the user their window back.
+
+    *stamp* is the baseline timestamp to watch for a change from; "" (the default, and what the
+    client passes) means the waiter reads it on its own first line.  The tests hand one in.
+    """
+    script = (_RELAUNCH_PS
+              .replace("@EXE@", _ps_literal(exe))
+              .replace("@WAS@", _ps_literal(stamp))      # "" -> the script reads it itself
+              .replace("@TIMEOUT@", str(max(10, int(timeout_s))))
+              .replace("@POLL@", str(RELAUNCH_POLL_S))
+              .replace("@SETTLE@", str(RELAUNCH_SETTLE_S)))
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    return ["powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden",
+            "-EncodedCommand", encoded]
 
 
 def friendly_error(exc: BaseException, host: str) -> str:
@@ -365,13 +430,19 @@ def _abort_response(resp: Any) -> None:
             pass
 
 
+def installer_args(exe: str) -> List[str]:
+    """The silent-install switches, plus a log written next to the staged installer."""
+    folder = os.path.dirname(exe) or "."
+    return [*INSTALLER_ARGS, "/LOG=" + os.path.join(folder, INSTALL_LOG_NAME)]
+
+
 def _default_installer_launch(exe: str) -> None:
     """Launch the installer detached so it outlives the service it is about to stop."""
     flags = 0
     if os.name == "nt":
         flags = (getattr(subprocess, "DETACHED_PROCESS", 0)
                  | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
-    subprocess.Popen([exe, *INSTALLER_ARGS], cwd=os.path.dirname(exe) or None, close_fds=True,
+    subprocess.Popen([exe, *installer_args(exe)], cwd=os.path.dirname(exe) or None, close_fds=True,
                      creationflags=flags, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL)
 

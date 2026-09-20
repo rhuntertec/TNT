@@ -9,10 +9,13 @@ import os
 
 import pytest
 
+import base64
+
 from tnt import config as cfgmod
 from tnt import updater
-from tnt.updater import (UpdateManager, display_version, is_newer, parse_version, parse_checksum,
-                         pick_checksum_asset, pick_setup_asset, relaunch_command, select_release)
+from tnt.updater import (INSTALLER_ARGS, UpdateManager, display_version, installer_args, is_newer,
+                         parse_version, parse_checksum, pick_checksum_asset, pick_setup_asset,
+                         relaunch_command, select_release)
 
 SETUP = "TNT-Setup-1.16.0.exe"
 ASSETS = [{"name": SETUP, "size": 42, "browser_download_url": "https://dl/x/s.exe"},
@@ -145,9 +148,59 @@ class TestAssetsAndChecksum:
         assert parse_checksum(("cd" * 32) + "  other.exe", SETUP) is None
         assert parse_checksum("not a hash", SETUP) is None
 
-    def test_relaunch_command_uses_cmd_not_tnt(self):
-        cmd = relaunch_command(r"C:\Program Files\TNT\TNT.exe", 5)
-        assert cmd[0] == "cmd.exe" and "TNT.exe" in cmd[-1] and "start" in cmd[-1]
+    def test_the_relaunch_helper_is_not_tnt_itself(self):
+        """The installer's PrepareToInstall runs ``taskkill /IM TNT.exe /F``.  A waiter that was
+        TNT.exe would be killed along with the window it exists to bring back."""
+        cmd = relaunch_command(r"C:\Program Files\TNT\TNT.exe")
+        assert "tnt.exe" not in cmd[0].lower()
+        assert cmd[0].lower().endswith("powershell.exe")
+
+    def test_the_relaunch_helper_waits_for_the_installer_not_a_fixed_delay(self):
+        """The bug this replaces: the waiter slept a flat 30 s from the moment of the click, which
+        is before the download even starts.  On a connection slower than about 1.5 MB/s the sleep
+        ran out mid-download, the waiter opened TNT, the installer then killed it, and nothing was
+        left to try again - the update succeeded and the application vanished.  Reproduced on a real
+        machine before this changed.
+        """
+        script = _relaunch_script(relaunch_command(r"C:\Program Files\TNT\TNT.exe"))
+        assert "ping" not in script, "a fixed sleep is exactly what went wrong"
+        # it waits on the exe being replaced, which is the thing that actually says "installer done"
+        assert "LastWriteTimeUtc" in script and "$now -ne $was" in script
+        # and it will not start a second window over a client that is somehow still alive
+        assert "Get-Process -Name 'TNT'" in script and "Start-Process" in script
+
+    def test_the_relaunch_helper_reads_its_own_baseline(self):
+        """A tick count computed in Python and one read in PowerShell are two stacks' answers to the
+        same question, and a float second cannot hold 100 ns.  If they disagreed the waiter would
+        think the exe had already been replaced and fire on its first poll - worse than the bug."""
+        script = _relaunch_script(relaunch_command(r"C:\Program Files\TNT\TNT.exe"))
+        assert "$was = ''" in script and "if (-not $was)" in script
+        assert script.count("LastWriteTimeUtc") == 2, "the baseline and the comparison, both read there"
+
+    def test_the_relaunch_helper_gives_up_eventually_and_opens_the_window_anyway(self):
+        """An update that fails outright must still leave the user their application."""
+        script = _relaunch_script(relaunch_command(r"C:\Program Files\TNT\TNT.exe", timeout_s=42))
+        assert "AddSeconds(42)" in script
+        start_at = script.index("Start-Process")
+        assert script.index("while (") < script.index("$deadline)") < start_at, \
+            "the launch is after the loop, so a timeout still reaches it"
+
+    def test_a_path_with_a_quote_in_it_cannot_break_out_of_the_script(self):
+        odd = "C:\\weird's dir\\TNT.exe"
+        script = _relaunch_script(relaunch_command(odd))
+        assert "'C:\\weird''s dir\\TNT.exe'" in script, script[:200]
+
+    def test_the_installer_writes_a_log_next_to_itself(self):
+        """A silent install that failed used to leave no record anywhere of why."""
+        args = installer_args(r"C:\ProgramData\TNT\update\TNT-Setup-9.9.9.exe")
+        assert args[:3] == list(INSTALLER_ARGS)
+        assert args[-1] == r"/LOG=C:\ProgramData\TNT\update\install.log"
+
+
+def _relaunch_script(cmd):
+    """The PowerShell the relaunch helper will run, decoded back out of -EncodedCommand."""
+    assert "-EncodedCommand" in cmd, cmd
+    return base64.b64decode(cmd[cmd.index("-EncodedCommand") + 1]).decode("utf-16-le")
 
 
 # --------------------------------------------------------------------------- fakes

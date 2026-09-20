@@ -2919,7 +2919,12 @@ def test_update_ui_wiring():
     assert "api.updateInstall()" in app and "api.updateCheck()" in app
     assert "window.pywebview.api" in app and "arm_relaunch" in app    # arm the client relaunch before installing
     tray = (ROOT / "client" / "tray.py").read_text(encoding="utf-8")
-    assert "def arm_relaunch(self)" in tray and "cmd.exe" in tray and 'start ""' in tray
+    # the waiter is built in one place (tnt.updater.relaunch_command) and spawned with no console:
+    # DETACHED_PROCESS used to hand it a window of its own, which is the black box of pings people
+    # saw during an update
+    assert "def arm_relaunch(self)" in tray and "from tnt.updater import relaunch_command" in tray
+    assert "CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP" in tray
+    assert "ping -n" not in tray, "the fixed-delay relaunch is gone"
 
 
 #: every key tnt.lanpeers.LanPeers.peers_view() carries (the mock must mirror it exactly)

@@ -1078,6 +1078,9 @@ ERROR_ACCESS_DENIED = 5
 STILL_ACTIVE = 259
 DETACHED_PROCESS = 0x00000008
 CREATE_NEW_PROCESS_GROUP = 0x00000200
+#: A detached console program gets a console window of its own; this is the flag that gives it
+#: none at all, which is what a background helper wants.
+CREATE_NO_WINDOW = 0x08000000
 #: At most RELAUNCH_MAX self-relaunches per RELAUNCH_WINDOW_S (kept in client.json across
 #: the relaunched processes), so a browser that dies on every start cannot loop forever.
 RELAUNCH_WINDOW_S = 600.0
@@ -1400,9 +1403,15 @@ class JsBridge:
             return False
 
     def arm_relaunch(self) -> bool:
-        """Before an update install: start a detached ``cmd.exe`` that waits, then starts TNT again once the
-        installer (run by the service) has replaced this exe. ``cmd.exe`` — not ``TNT.exe`` — survives the
-        installer's ``taskkill /IM TNT.exe``. A no-op unless this is the frozen client."""
+        """Before an update install: start a detached helper that waits for the installer to replace
+        this exe and then opens it again.  The installer runs ``/VERYSILENT``, and the ``[Run]`` entry
+        that would reopen TNT is ``skipifsilent``, so during an update this is the *only* thing that
+        brings the window back.
+
+        The command comes from :func:`tnt.updater.relaunch_command` - one definition, shared - and is
+        spawned with ``CREATE_NO_WINDOW``.  It used to use ``DETACHED_PROCESS``, which for a console
+        program makes Windows hand it a console of its own: that was the black window full of pings
+        people saw during an update.  A no-op unless this is the frozen client."""
         try:
             if not getattr(sys, "frozen", False):
                 return False
@@ -1411,10 +1420,11 @@ class JsBridge:
                 return False
             import subprocess
 
-            # ping is a portable delay: wait ~30 s for the installer to finish, then reopen the window
-            cmd = ["cmd.exe", "/c", 'ping -n 31 127.0.0.1 >nul & start "" "%s"' % exe]
-            subprocess.Popen(cmd, close_fds=True,
-                             creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+            from tnt.updater import relaunch_command
+
+            cmd = relaunch_command(exe)
+            flags = (CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP) if os.name == "nt" else 0
+            subprocess.Popen(cmd, close_fds=True, creationflags=flags,
                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             log.info("update: armed a client relaunch to follow the installer")
             return True
