@@ -4,9 +4,28 @@ For TTL 1, 2, 3, ... the :class:`Tracer` sends *probes* echo requests to the tar
 that TTL through the shared :class:`tnt.icmp.IcmpPinger`.  A router that drops the packet
 answers "TTL expired in transit" (status 11013) and ``PingResult.responder`` is its
 address; the destination itself answers with ``ok`` and ``responder == target``.  The trace
-ends at the hop where the destination answered (``complete``), after
-:data:`SILENT_HOPS_LIMIT` consecutive hops that nobody answered, after a router reported
+ends at the hop where the destination answered (``complete``), after a router reported
 the destination unreachable, at ``max_hops`` or when ``cancel`` is set.
+
+Silent hops do not end it: many cores and cloud edges never send "TTL expired", and the
+destination can answer several hops beyond them, so like Windows ``tracert`` the trace goes
+on to ``max_hops``.  (It used to give up after five silent hops and report "no reply after
+hop 3" for a destination that answered at hop 10.)  To keep the time bounded, once
+:data:`SILENT_HOPS_LIMIT` hops in a row have been silent each further hop is sent one probe,
+and the rest of its probes only if that one is answered; at the defaults a trace in which
+nothing answers takes 5 x 3 + 25 x 1 probes x 1.5 s = 60 s.  When the trace ends in such a
+silent run the error still says so: ``"no reply after hop N"`` (N the last hop that
+answered) or ``"no reply from any of the M hops"``.  The accepted cost: a hop that loses only its
+one probe there is recorded as silent, so a destination that drops that echo is found one hop
+later (still ``complete``), as tracert shows it when every probe of a hop is lost.
+
+The probing as a whole also has a time limit, :data:`TRACE_PROBE_BUDGET_S`: the Tools page
+waits 120 s for its answer, and slower settings it accepts (64 hops at a 2 s timeout, silent
+after hop 1) would otherwise probe for about 150 s, so the page would report a timeout while
+the service carried on.  No probe is started that could not finish inside the limit; a trace
+that reaches it ends with ``"no reply after hop N; stopped at hop T, the 100 s time limit for
+a trace"`` (or ``"no reply from any of the T hops tried; ..."`` / ``"destination not reached
+by hop T; ..."``).
 
 Every answered hop is classified (``kind`` / ``label``): ``gateway`` (the machine's default
 gateway), ``lan`` (RFC 1918, link-local, loopback or CGNAT 100.64/10 and not the
@@ -67,8 +86,9 @@ PROBES_LIMIT = 5
 TIMEOUT_MS_MIN = 100
 TIMEOUT_MS_MAX = 10_000
 PROBE_SIZE = 32
-SILENT_HOPS_LIMIT = 5          # give up after this many consecutive unanswered hops
+SILENT_HOPS_LIMIT = 5          # after this many unanswered hops in a row, one probe per hop until one answers
 REVERSE_DNS_DEADLINE_S = 4.0   # overall cap on the hop-name lookups at the end of a trace
+TRACE_PROBE_BUDGET_S = 100.0  # probing time limit: with the DNS cap and grace it stays inside the client's 120 s
 WAIT_GRACE_S = 10.0            # added to the worst-case probe time when waiting for the worker
 THREAD_NAME = "tnt-ping-trace"
 STATUS_OK = 0
@@ -183,6 +203,7 @@ class _Job:
         self.result: Optional[Dict[str, Any]] = None
         self.partial: Optional[Dict[str, Any]] = None   # header + hops while running
         self.exc: Optional[BaseException] = None
+        self.probe_deadline: Optional[float] = None     # monotonic time the probing must end by (TRACE_PROBE_BUDGET_S)
 
     def stop_requested(self) -> bool:
         return self.abandon.is_set() or (self.cancel is not None and self.cancel.is_set())
@@ -203,8 +224,10 @@ class Tracer:
                  reverse: Optional[Callable[[str], Optional[str]]] = None,
                  gateway_fn: Optional[Callable[[], Optional[str]]] = None,
                  local_fn: Optional[Callable[[], Optional[str]]] = None,
-                 geo: Optional[Callable[[], Any]] = None) -> None:
+                 geo: Optional[Callable[[], Any]] = None,
+                 monotonic: Callable[[], float] = time.monotonic) -> None:
         self.pinger = pinger
+        self._monotonic = monotonic  # times the probing against TRACE_PROBE_BUDGET_S (a test passes a fake)
         self._bus = bus
         self._clock = clock
         self._resolver = resolver
@@ -321,7 +344,8 @@ class Tracer:
 
         ``ValueError`` for a bad argument or a host that does not resolve,
         ``RuntimeError`` when a trace is already running.  Blocks the caller for the
-        duration of the trace (worst case ``max_hops * probes * timeout_ms``).
+        duration of the trace (worst case ``max_hops * probes * timeout_ms``, capped at
+        :data:`TRACE_PROBE_BUDGET_S`, plus the reverse-DNS cap).
         """
         text = str(host or "").strip()
         if text.startswith("[") and text.endswith("]"):
@@ -350,7 +374,8 @@ class Tracer:
                 self._running = False
             raise
 
-        budget = max_hops * probes * timeout_ms / 1000.0 + REVERSE_DNS_DEADLINE_S + WAIT_GRACE_S
+        budget = (min(max_hops * probes * timeout_ms / 1000.0, TRACE_PROBE_BUDGET_S)
+                  + REVERSE_DNS_DEADLINE_S + WAIT_GRACE_S)
         worker.join(budget)
         if worker.is_alive():
             job.abandon.set()
@@ -415,12 +440,25 @@ class Tracer:
         error: Optional[str] = None
         silent = 0
         last_answered_ttl = 0
+        job.probe_deadline = self._monotonic() + TRACE_PROBE_BUDGET_S
         try:
             for ttl in range(1, job.max_hops + 1):
                 if job.stop_requested():
                     error = "cancelled"
                     break
-                hop, reached, reply_error = self._probe_hop(job, ttl, start_lookup)
+                if not self._probe_fits(job):
+                    # out of time: say where replies stopped, and that the limit (not the network) ended it
+                    tried = ttl - 1
+                    limit = f"the {TRACE_PROBE_BUDGET_S:.0f} s time limit for a trace"
+                    if not last_answered_ttl:
+                        error = f"no reply from any of the {tried} hops tried; stopped at {limit}"
+                    elif silent:
+                        error = f"no reply after hop {last_answered_ttl}; stopped at hop {tried}, {limit}"
+                    else:
+                        error = f"destination not reached by hop {tried}; stopped at {limit}"
+                    break
+                hop, reached, reply_error = self._probe_hop(job, ttl, start_lookup,
+                                                            quiet=silent >= SILENT_HOPS_LIMIT)
                 hop["kind"], hop["label"] = classify_hop(hop["ip"], result["gateway"], reached)
                 lk = lookups.get(hop["ip"]) if hop["ip"] else None
                 if lk is not None and lk.done.is_set():
@@ -433,11 +471,8 @@ class Tracer:
                     complete = True
                     break
                 if hop["ip"] is None:
+                    # no break: the destination may still answer beyond a core that sends no "TTL expired"
                     silent += 1
-                    if silent >= SILENT_HOPS_LIMIT:
-                        error = (f"no reply after hop {last_answered_ttl}" if last_answered_ttl
-                                 else f"no reply from the first {silent} hops")
-                        break
                     continue
                 silent = 0
                 last_answered_ttl = ttl
@@ -449,7 +484,12 @@ class Tracer:
                     error = "cancelled"
                     break
             else:
-                error = f"destination not reached within {job.max_hops} hops"
+                if silent >= SILENT_HOPS_LIMIT:
+                    # the tail really is silent: say where the replies stopped
+                    error = (f"no reply after hop {last_answered_ttl}" if last_answered_ttl
+                             else f"no reply from any of the {job.max_hops} hops")
+                else:
+                    error = f"destination not reached within {job.max_hops} hops"
         except Exception as exc:  # noqa: BLE001 - never lose the hops collected so far
             log.exception("traceroute to %s failed", job.host)
             error = f"traceroute failed: {exc}"
@@ -482,9 +522,17 @@ class Tracer:
                  "complete" if complete else "incomplete", f" - {error}" if error else "")
         return result
 
-    def _probe_hop(self, job: _Job, ttl: int,
-                   on_responder: Callable[[str], None]) -> Tuple[Dict[str, Any], bool, Optional[str]]:
-        """Send the probes for one TTL. Returns ``(hop, destination_reached, reply_error)``."""
+    def _probe_fits(self, job: _Job) -> bool:
+        """Whether one more probe, waited out to its full timeout, still ends inside the probing time limit."""
+        return job.probe_deadline is None or self._monotonic() + job.timeout_ms / 1000.0 <= job.probe_deadline
+
+    def _probe_hop(self, job: _Job, ttl: int, on_responder: Callable[[str], None],
+                   quiet: bool = False) -> Tuple[Dict[str, Any], bool, Optional[str]]:
+        """Send the probes for one TTL. Returns ``(hop, destination_reached, reply_error)``.
+
+        *quiet* (deep in a silent run): stop after the first probe when it was not answered, so a
+        long silent tail costs one timeout per hop; a hop that answers still gets all its probes.
+        """
         rtts: List[Optional[float]] = []
         responders: List[str] = []
         first_ip: Optional[str] = None
@@ -494,6 +542,10 @@ class Tracer:
         for i in range(job.probes):
             if i and job.stop_requested():
                 break
+            if i and quiet and not responders:
+                break
+            if i and not self._probe_fits(job):
+                break          # the hop keeps the probes it was sent; the trace loop then ends on the time limit
             t0 = time.perf_counter()
             try:
                 r = self.pinger.ping(job.target_ip, size=PROBE_SIZE, timeout_ms=job.timeout_ms, ttl=ttl)

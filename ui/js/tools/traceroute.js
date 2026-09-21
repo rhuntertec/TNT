@@ -184,8 +184,11 @@
         pc.ip ? copyCode(pc.ip) : h('div', { class: 'tr-host' }, '—'),
         pc.hostname ? h('div', { class: 'tr-host', title: pc.hostname }, pc.hostname) : null);
     }
+    // probes a hop was sent: deep in a silent run the service sends one (the rest only if it is answered)
+    function sentProbes(hop, probes) { return Array.isArray(hop.rtts) && hop.rtts.length ? hop.rtts.length : probes; }
     function hopNode(hop, probes) {
       const { copyCode, fmtMs } = TNT.util;
+      probes = sentProbes(hop, probes);
       const silent = !hop.ip;
       const cls = rttClass(hop.avg_ms);
       const tips = [hopLabel(hop)];
@@ -240,7 +243,7 @@
               l.src ? h('span', { class: 'tr-loc-src muted', 'aria-hidden': 'true' }, l.src) : null,
               h('span', { class: 'sr-only' }, '. ' + l.title)); })(),
           num(hop.min_ms), h('td', { class: 'num strong ' + rttClass(hop.avg_ms) }, hop.avg_ms == null ? '—' : fmtMs(hop.avg_ms)), num(hop.max_ms),
-          h('td', { class: 'num' + (hop.loss ? ' strong red' : '') }, (hop.loss || 0) + '/' + probes),
+          h('td', { class: 'num' + (hop.loss ? ' strong red' : '') }, (hop.loss || 0) + '/' + sentProbes(hop, probes)),
           h('td', null, h('span', { class: 'badge ' + (hop.ip ? (KIND_BADGE[hop.kind] || 'grey') : 'grey') }, hopLabel(hop))));
         els.tbody.appendChild(tr);
       }

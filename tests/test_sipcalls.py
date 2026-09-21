@@ -640,7 +640,8 @@ def test_reordered_and_duplicated_rtp_rebuild_in_timestamp_order():
     for index, (seq, timestamp, payload) in enumerate(arrivals):
         tracker.add_rtp(packet(seq, timestamp, payload), 101.0 + index * 0.02, ALICE, ALICE_RTP, BOB, BOB_RTP)
     [stream] = tracker.calls()[0]["streams"]
-    assert (stream["packets"], stream["lost"], stream["out_of_order"]) == (5, 1, 1)
+    # 102 was late, not lost: it fills the hole 103 left, so nothing is lost and it is the one out-of-order packet
+    assert (stream["packets"], stream["lost"], stream["out_of_order"]) == (5, 0, 1)
     assert wav_data(tracker.audio(stream["id"])) == ulaw_to_pcm16(b"".join(pieces))
 
 

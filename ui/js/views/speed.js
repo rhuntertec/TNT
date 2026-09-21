@@ -112,6 +112,10 @@
       els.meta.appendChild(h('span', { class: 'muted', title: fmtDateTime(last.ts) }, relTime(last.ts, now)));
       if (last.packet_loss_pct) els.meta.appendChild(h('span', { class: 'badge yellow' }, 'loss ' + TNT.util.fmtPct(last.packet_loss_pct)));
       els.failed.hidden = true;
+      // an ok test can still carry a note: "upload not measured: ..." (a dash alone reads as "not tried") or a stall
+      const note = last.error ? String(last.error) : '';
+      els.note.hidden = !note;
+      els.note.textContent = note ? note.charAt(0).toUpperCase() + note.slice(1) : '';
     } else if (last) {
       els.down.textContent = '—'; els.up.textContent = '—'; els.lat.textContent = '—'; els.jit.textContent = '—';
       els.meta.innerHTML = '';
@@ -119,10 +123,12 @@
       els.meta.appendChild(h('span', { class: 'muted' }, relTime(last.ts, now)));
       els.failed.hidden = false;
       els.failed.textContent = 'Last test failed: ' + (last.error || 'unknown error');
+      els.note.hidden = true;
     } else {
       els.meta.innerHTML = '';
       els.meta.appendChild(h('span', { class: 'muted' }, 'No speed test yet'));
       els.failed.hidden = true;
+      els.note.hidden = true;
     }
     const nextText = sp.running ? 'Running now' : sp.enabled === false ? 'Automatic tests are off' : 'Next test ' + untilText(sp.next_run_ts, now) + ' · every ' + (sp.interval_min || '?') + ' min';
     els.next.textContent = nextText;
@@ -189,17 +195,17 @@
         ],
         marks: failed.map((x) => ({ ts: x.ts, label: 'Test failed', detail: x.error || '' })),
       });
+      // the tooltip is HTML: the backend and server names come from the result, so they go in as text
       historyChart.formatTip = (t) => {
         const x = byTs.get(t);
-        const { fmtDateTime, fmtMbps, fmtMs } = TNT.util;
+        const { fmtDateTime, fmtMbps, fmtMs, esc } = TNT.util;
         if (!x) return fmtDateTime(t);
         return '<div class="t">' + fmtDateTime(t) + '</div>↓ ' + fmtMbps(x.download_mbps) + ' Mbps · ↑ ' + fmtMbps(x.upload_mbps) + ' Mbps' +
-          '<div class="muted">' + fmtMs(x.latency_ms) + ' ms latency · ' + (x.backend || '') + (x.server ? ' · ' + x.server : '') + '</div>';
+          '<div class="muted">' + fmtMs(x.latency_ms) + ' ms latency · ' + esc(x.backend || '') + (x.server ? ' · ' + esc(x.server) : '') + '</div>';
       };
       const n = ok.length;
-      const avgD = n ? ok.reduce((a, x) => a + (x.download_mbps || 0), 0) / n : null;
-      const avgU = n ? ok.reduce((a, x) => a + (x.upload_mbps || 0), 0) / n : null;
-      els.histSummary.textContent = n ? n + ' tests · avg ↓ ' + TNT.util.fmtMbps(avgD) + ' ↑ ' + TNT.util.fmtMbps(avgU) + ' Mbps' + (failed.length ? ' · ' + failed.length + ' failed' : '') : 'No tests in this range';
+      // the same averages as the chart's lines: an upload that could not be measured is left out, not counted as 0
+      els.histSummary.textContent = n ? n + ' tests · avg ↓ ' + TNT.util.fmtMbps(avgDown) + ' ↑ ' + TNT.util.fmtMbps(avgUp) + ' Mbps' + (failed.length ? ' · ' + failed.length + ' failed' : '') : 'No tests in this range';
     } catch (err) {
       if (root) TNT.ui.toast('Could not load history: ' + err.message, 'error');
     }
@@ -210,7 +216,7 @@
     try {
       const p = await TNT.api.speedPatterns(7);
       if (!root) return;
-      const { h, fmtMbps, fmtMs, fmtDateTime, pad2 } = TNT.util;
+      const { h, fmtMbps, fmtMs, fmtDateTime, pad2, esc } = TNT.util;
       els.kpis.innerHTML = '';
       const kpi = (label, value, sub) => h('div', { class: 'kpi' }, h('span', { class: 'label' }, label), h('span', { class: 'value sm' }, value), sub ? h('span', { class: 'sub' }, sub) : null);
       els.kpis.appendChild(kpi('Median ↓', fmtMbps(p.median_down) + ' Mbps', 'avg ' + fmtMbps(p.avg_down)));
@@ -222,7 +228,8 @@
       const bars = (p.by_hour || []).map((b) => ({
         label: pad2(b.hour) + ':00',
         value: b.avg_down,
-        tip: '<div class="t">' + pad2(b.hour) + ':00 – ' + pad2((b.hour + 1) % 24) + ':00</div>↓ ' + fmtMbps(b.avg_down) + ' Mbps · ↑ ' + fmtMbps(b.avg_up) + ' Mbps<div class="muted">' + fmtMs(b.avg_latency) + ' ms · ' + (b.count || 0) + ' tests</div>',
+        // HTML again: the numbers are formatted here, but the hour and the count are the service's, so they go in as text
+        tip: '<div class="t">' + esc(pad2(b.hour)) + ':00 – ' + esc(pad2((b.hour + 1) % 24)) + ':00</div>↓ ' + fmtMbps(b.avg_down) + ' Mbps · ↑ ' + fmtMbps(b.avg_up) + ' Mbps<div class="muted">' + fmtMs(b.avg_latency) + ' ms · ' + esc(b.count || 0) + ' tests</div>',
         color: p.median_down && b.avg_down != null && b.avg_down < p.median_down * 0.75 ? TNT.charts.colors().orange : undefined,
       }));
       hourChart.setData({ bars, unit: 'Mbps ↓', reference: p.median_down || null, labelEvery: 3 });
@@ -254,11 +261,13 @@
         h('div', { class: 'kpi' }, h('span', { class: 'label' }, 'Jitter'), h('span', null, els.jit, h('span', { class: 'unit' }, 'ms'))));
       els.meta = h('div', { class: 'row', style: { gap: '10px', marginTop: '12px' } });
       els.failed = h('div', { class: 'ongoing strong small', hidden: true });
+      // an ok test's note (its error): what could not be measured or trusted, e.g. an upload nothing acknowledged
+      els.note = h('div', { class: 'muted small speed-note', hidden: true });
       els.next = h('div', { class: 'muted small', style: { marginTop: '6px' } }, '');
       els.fuse = TNT.ui.fuse();
       els.fuse.hidden = true;
       els.fuse.style.marginTop = '14px';
-      const latestCard = h('div', { class: 'card' }, h('div', { class: 'card-title' }, 'Latest result'), hero, els.meta, els.failed, els.next, els.fuse);
+      const latestCard = h('div', { class: 'card' }, h('div', { class: 'card-title' }, 'Latest result'), hero, els.meta, els.failed, els.note, els.next, els.fuse);
       // latency under load: the grade of the last speed test, filled by renderLatest
       els.qChip = h('span', { class: 'grade-chip grey' }, '—');
       els.qBody = h('div', { class: 'quality-body' });

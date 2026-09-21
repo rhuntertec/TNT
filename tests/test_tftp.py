@@ -1017,7 +1017,8 @@ def test_network_change_stops_the_server_on_a_helper_thread(make):
     # a NIC that disappears
     adapters[0] = nic()
     assert ctx.srv.start()["error"] is None
-    adapters.clear()
+    # the laptop's Wi-Fi stays listed: an enumeration that answers with nothing at all is a failed read, not a removal
+    adapters[:] = [nic(name="Wi-Fi", index=22, if_type=71, ips=(("198.51.100.7", 24),), mac="02:00:5e:10:00:02")]
     ctx.srv._stop_for_network = original
     ctx.srv.on_network_change({})
     assert wait_for(lambda: ctx.srv.summary()["error"] == "stopped: Ethernet is no longer present")

@@ -22,6 +22,11 @@ Send a Binding Request **from one local socket to two different STUN servers** a
 That comparison needs no special server support at all, which is why it is the check this module leads with: any
 two plain STUN servers do it.
 
+**No NAT at all** is a stronger claim and needs more than the port. Most NATs keep the source port when it is free
+(netfilter masquerade on OpenWrt, UniFi and EdgeOS, MikroTik, Cisco IOS overload), so the servers seeing this socket's
+own port proves nothing on its own; they must also have seen the address this PC sends to them from, which a UDP
+``connect()`` route lookup gives without sending anything. When that address is not known, no-NAT is not claimed.
+
 What this deliberately does not claim
 --------------------------------------
 **Filtering behaviour** - the old "full cone / restricted / port restricted" taxonomy - needs the server to answer
@@ -213,7 +218,7 @@ _LEVELS = ("bad", "warn", "info", "good")
 class StunChecker:
     """Asks two STUN servers what they see, and says what that means for voice.
 
-    Module-level seams tests monkeypatch: ``_open_socket`` and ``_sleep``."""
+    Module-level seams tests monkeypatch: ``_open_socket``, ``_source_address`` and ``_sleep``."""
 
     def __init__(self, *, timeout_s: float = DEFAULT_TIMEOUT_S, clock: Any = None) -> None:
         self._timeout = max(0.5, min(30.0, float(timeout_s)))
@@ -276,7 +281,11 @@ class StunChecker:
                     sock.close()
                 except OSError:
                     pass
-        return self._verdict(rows, used_port, local_port, bound)
+        # The address this PC sends to each server from. The socket is bound to every interface, so its own name
+        # says 0.0.0.0; a route lookup per server says which address the packets really left with.
+        local_ips = {found for found in (_source_address(row["host"], row["port"]) for row in rows
+                                         if row["answered"]) if found}
+        return self._verdict(rows, used_port, local_port, bound, local_ips=local_ips)
 
     def _ask(self, sock: Any, host: str, port: int) -> Dict[str, Any]:
         row: Dict[str, Any] = {"host": host, "port": port, "answered": False, "mapped_ip": None,
@@ -307,7 +316,7 @@ class StunChecker:
         return row
 
     def _verdict(self, rows: List[Dict[str, Any]], used_port: Optional[int], wanted_port: int,
-                 bound: bool) -> Dict[str, Any]:
+                 bound: bool, *, local_ips: Optional[Iterable[str]] = None) -> Dict[str, Any]:
         answered = [row for row in rows if row["answered"]]
         findings: List[Dict[str, Any]] = []
         public = answered[0]["mapped_ip"] if answered else None
@@ -333,14 +342,14 @@ class StunChecker:
                 "mapping behaviour is not: telling an endpoint-independent NAT from a symmetric one needs two "
                 "different servers to compare.",
                 "Try again, or set a second STUN server the site can reach."))
-        elif public and _no_nat(public, used_port, ports, addresses):
+        elif public and _no_nat(public, used_port, ports, addresses, local_ips):
             # checked before the endpoint-independent case, which it would otherwise match: "nothing is translating"
             # is a different and more reassuring statement than "the translation is well behaved"
             mapping = "none"
             findings.append(_finding(
                 "nat.none", "good", "This PC is not behind NAT",
-                f"Both servers saw {public} with the same port this socket is bound to. Nothing is translating, "
-                "so nothing can mistranslate.", None))
+                f"Both servers saw {public} - this PC's own address - with the same port this socket is bound "
+                "to. Nothing is translating, so nothing can mistranslate.", None))
         elif len(addresses) == 1 and len(ports) == 1:
             mapping = "endpoint-independent"
             findings.append(_finding(
@@ -458,9 +467,17 @@ class StunChecker:
                 "findings": sorted(findings, key=lambda f: _LEVELS.index(f["level"]))}
 
 
-def _no_nat(public: str, local_port: Optional[int], ports: Iterable[Any], addresses: Iterable[Any]) -> bool:
-    """True when the address the servers saw is this socket's own, which means nothing translated it."""
+def _no_nat(public: str, local_port: Optional[int], ports: Iterable[Any], addresses: Iterable[Any],
+            local_ips: Optional[Iterable[str]] = None) -> bool:
+    """True when the address and the port the servers saw are this socket's own, which means nothing translated it.
+
+    The port alone is not evidence: Linux netfilter masquerade (OpenWrt, UniFi, EdgeOS), MikroTik and Cisco IOS
+    overload all keep the source port when it is free, which for a fresh ephemeral port it nearly always is. So the
+    address has to be the one this PC sent from too - and when that is not known, no-NAT is not claimed."""
     if local_port is None or len(set(ports)) != 1 or len(set(addresses)) != 1:
+        return False
+    mine = {str(ip) for ip in (local_ips or ()) if ip}
+    if public not in mine:
         return False
     return next(iter(set(ports))) == local_port and _is_routable(public)
 
@@ -505,6 +522,22 @@ def _open_socket(local_port: int) -> Tuple[Any, int, bool]:
     except OSError:
         sock.close()
         raise
+
+
+def _source_address(host: str, port: int) -> Optional[str]:
+    """The IPv4 address this PC would send to *host* from, or None.
+
+    A UDP ``connect()`` sends no packet: it is a route lookup, the same one :mod:`tnt.sipalg` uses to learn the
+    address it puts in its test INVITE."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect((host, int(port)))
+        found = str(probe.getsockname()[0])
+    except (OSError, ValueError, TypeError, OverflowError):
+        return None
+    finally:
+        probe.close()
+    return None if found in ("", "0.0.0.0") else found
 
 
 def _sleep(seconds: float) -> None:

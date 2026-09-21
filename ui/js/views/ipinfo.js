@@ -319,6 +319,7 @@
      badge in the card head and the plain-language message in a callout under it. */
   const WARNINGS = {
     apipa: ['yellow', 'self-assigned IP'],       // no DHCP server answered (DHCP itself is on)
+    apipa_ipv6: ['yellow', 'IPv4 self-assigned'],   // the same, but IPv6 works: the adapter is not unaddressed
     duplicate_address: ['red', 'duplicate IP'],
     gateway_outside_subnet: ['red', 'gateway off subnet'],
     no_dns: ['yellow', 'no DNS'],

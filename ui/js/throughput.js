@@ -91,13 +91,28 @@
 
   /** The window average of one column of samples — the value each dashed rule is drawn at.
    *  Computed from the points that are actually on the chart, so the rule always agrees with
-   *  the line it is drawn over even when the service has been up for less than the window. */
-  function average(samples, column, windowS, now) {
-    const rows = (samples || []).filter((s) => s[0] >= now - windowS);
+   *  the line it is drawn over even when the service has been up for less than the window.
+   *
+   *  Weighted by time, not by row: on the 30-minute window the backlog comes in 3-second buckets
+   *  (tnt.throughput.step_for) and the live samples after it one a second, and each second in the
+   *  window must count once. A row's step is its own sixth column (the card writes the backlog's
+   *  step_s there), else `stepS`, else one second. A row stands for the seconds up to the next
+   *  row, never more than its step (a longer hole is a hole, not time at the rate before it); the
+   *  newest row for one second, or up to its step if `now` is further on. When every row is one
+   *  second, every row weighs the same and this is the plain mean. */
+  function average(samples, column, windowS, now, stepS) {
+    const rows = (samples || []).filter((s) => s[0] >= now - windowS).sort((a, b) => a[0] - b[0]);
     if (!rows.length) return 0;
-    let sum = 0;
-    for (const s of rows) sum += Number(s[column]) || 0;
-    return sum / rows.length;
+    const fallback = Math.max(1, Number(stepS) || 1);
+    let sum = 0, secs = 0;
+    for (let i = 0; i < rows.length; i++) {
+      const step = Math.max(1, Number(rows[i][5]) || fallback);
+      const until = i + 1 < rows.length ? rows[i + 1][0] : now + 1;
+      const w = Math.max(1, Math.min(step, until - rows[i][0]));
+      sum += (Number(rows[i][column]) || 0) * w;
+      secs += w;
+    }
+    return sum / secs;
   }
 
   /** Merge one throughput.sample row into a NIC's series, newest last, half an hour deep.
@@ -119,11 +134,38 @@
     return series;
   }
 
+  /** Merge the rows a NIC held into its freshly fetched backlog, and return the backlog.
+   *  The backlog is the service's own account of every second from its first row up to `upto`
+   *  (the reply's ts), already averaged into `step`-second buckets on the 30-minute window. A held
+   *  row inside that span says the same seconds again, at another size: left in, a bucket sat
+   *  beside live rows for the seconds it stands for, the line stepped between them and the average
+   *  took the bucket for one second of three. So a held row inside the span gives way. A held row
+   *  after it (one that arrived while the GET was in flight) is newer than anything fetched and
+   *  stays. With no ts the span ends where the last bucket does. */
+  function mergeBacklog(fresh, held, step, upto) {
+    step = Math.max(1, Number(step) || 1);
+    const from = fresh.length ? fresh[0][0] : Infinity;
+    const end = Number.isFinite(Number(upto)) && upto !== null
+      ? Number(upto) : (fresh.length ? fresh[fresh.length - 1][0] + step - 1 : -Infinity);
+    for (const s of held || []) {
+      if (s[0] >= from && s[0] <= end) continue;
+      // a held bucket of another size after the span still stands for seconds the fresh rows do not
+      push(fresh, s);
+    }
+    return fresh;
+  }
+
   function create() {
     const { h } = TNT.util;
     const id = 'tp' + (++seq);
     let winS = savedWindow();
-    let nics = new Map();              // id -> { meta, samples: [[ts, rx, tx, rxp, txp], ...] }
+    // id -> { meta, samples: [[ts, rx, tx, rxp, txp, stepS?], ...] }. A backlog row carries the
+    // seconds it stands for (GET /api/throughput's step_s: 3 on the 30-minute window) so the chart
+    // knows a 3 s spacing there is the data, not a hole, and the average weighs it by its seconds.
+    // A live row is one second and carries nothing. The step belongs to the row, not the card: a
+    // card-wide step went stale when a window changed and its backlog GET failed, and held the
+    // live seconds after a 30-minute backlog to the buckets' looser tolerance.
+    let nics = new Map();
     let blocks = new Map();            // id -> { el, chart, ... } for the NICs on screen
     let order = [];                    // the ids on screen, in the order they are drawn
     let bodyEl = null;
@@ -161,15 +203,17 @@
         const data = await TNT.api.throughput(winS);
         if (dead) return;
         const next = new Map();
+        const step = Math.max(1, Number(data && data.step_s) || 1);
         for (const n of (data && data.nics) || []) {
-          next.set(n.id, { meta: n, samples: (n.samples || []).map((s) => s.slice()) });
+          const rows = (n.samples || []).map((s) => (step > 1 ? s.slice(0, 5).concat([step]) : s.slice(0, 5)));
+          next.set(n.id, { meta: n, samples: rows });
         }
         // a NIC we are holding that the backlog does not mention is idle, not gone: its own
         // samples stay, because the service only leaves one out when it moved nothing
         for (const [key, held] of nics) {
           const fresh = next.get(key);
           if (!fresh) next.set(key, held);
-          else for (const s of held.samples) push(fresh.samples, s);
+          else mergeBacklog(fresh.samples, held.samples, step, data && data.ts);
         }
         nics = next;
         note = (data && data.note) || null;
@@ -303,9 +347,9 @@
         b.cells.rx.bytes.textContent = countText(n.rx_bytes);
         b.cells.tx.bytes.textContent = countText(n.tx_bytes);
         b.chart.setSeries({
-          rx: n.samples.map((s) => [s[0], s[1]]),
-          tx: n.samples.map((s) => [s[0], s[2]]),
-          now, windowS: winS, stepS: 1, windowLabel: spec[2],
+          rx: n.samples.map((s) => (s[5] ? [s[0], s[1], s[5]] : [s[0], s[1]])),
+          tx: n.samples.map((s) => (s[5] ? [s[0], s[2], s[5]] : [s[0], s[2]])),
+          now, windowS: winS, windowLabel: spec[2],
           avgRx: average(n.samples, 1, winS, now),
           avgTx: average(n.samples, 2, winS, now),
         });
@@ -328,5 +372,5 @@
     };
   }
 
-  TNT.throughput = { create, rateText, countText, linkText, shown, average, push, windowSpec, WINDOWS, HISTORY_S };
+  TNT.throughput = { create, rateText, countText, linkText, shown, average, push, mergeBacklog, windowSpec, WINDOWS, HISTORY_S };
 })();

@@ -3105,9 +3105,10 @@ def test_mock_network_switch(mock):
                             "summary": ev["summary"], "networks": ["100.101.22.7/32", "172.29.64.0/20", "192.168.50.0/24"],
                             "network_id": mock.state.net_id}
         assert s["net"]["network_id"] != s0["net"]["network_id"], "another router: another network (tnt.networks)"
-        # tnt.engine.Engine.netinfo_summary's shape: the bare address and its network (the tile shows "192.168.50.23/24")
+        # tnt.engine.Engine.netinfo_summary's shape: the bare address and its network (the tile shows "192.168.50.23/24"),
+        # and the global IPv6 address the tile shows instead when IPv4 is self-assigned while IPv6 works
         nic = s["netinfo"]["internet_nic"]
-        assert set(nic) == {"index", "name", "description", "type_name", "ipv4", "network", "gateway", "mac", "warnings"}
+        assert set(nic) == {"index", "name", "description", "type_name", "ipv4", "network", "ipv6", "gateway", "mac", "warnings"}
         assert s["netinfo"]["local_nic"] is None
         assert (nic["name"], nic["ipv4"], nic["network"], nic["gateway"]) == ("Wi-Fi", "192.168.50.23", "192.168.50.0/24", "192.168.50.1")
         gw = next(t for t in s["targets"] if t["host"] == "gateway")

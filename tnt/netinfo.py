@@ -11,7 +11,8 @@ Public API (see the contract for the dict shapes):
 * :class:`IpAddr`, :class:`Adapter` dataclasses; ``Adapter.to_dict()`` adds ``"subnets"``.
 * :func:`get_adapters`, :func:`get_internet_nic`, :func:`get_default_gateway`,
   :func:`local_networks`, :func:`classify_ip`, :func:`subnet_groups`,
-  :func:`netinfo_snapshot`.
+  :func:`netinfo_snapshot`, :func:`prefers_ipv4` (which address family a host name should be
+  resolved to: IPv6 first only on an IPv6-only host).
 
 Contract gaps filled here (documented as required):
 
@@ -66,12 +67,12 @@ import threading
 import time
 from ctypes import POINTER, Structure, c_int, c_ubyte, c_ulong, c_ulonglong, c_ushort, c_void_p
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 log = logging.getLogger(__name__)
 
 __all__ = [
-    "IpAddr", "Adapter", "get_adapters", "get_internet_nic", "get_default_gateway", "default_gateway_for",
+    "IpAddr", "Adapter", "get_adapters", "get_internet_nic", "get_default_gateway", "default_gateway_for", "prefers_ipv4",
     "local_networks", "classify_ip", "subnet_groups", "adapter_warnings", "netinfo_snapshot",
     "IF_TYPE_NAMES", "OPER_STATUS_NAMES",
 ]
@@ -98,6 +99,7 @@ IP_DAD_STATE_DEPRECATED = 3
 IP_DAD_STATE_PREFERRED = 4
 IP_SUFFIX_ORIGIN_MANUAL = 1               # IP_SUFFIX_ORIGIN: a fixed address somebody typed in ...
 IP_SUFFIX_ORIGIN_DHCP = 3                 # ... or one a DHCP(v6) server assigned
+IP_SUFFIX_ORIGIN_RANDOM = 5               # an RFC 4941 temporary IPv6 address Windows rotates
 SPEED_UNKNOWN = 0xFFFFFFFFFFFFFFFF
 MTU_UNKNOWN = 0xFFFFFFFF
 MAX_ADAPTER_ADDRESS_LENGTH = 8
@@ -107,6 +109,13 @@ MAX_DHCPV6_DUID_LENGTH = 130
 #: WireGuard.  They are addressed as host routes with a gateway outside them and they take the
 #: default route while connected, both of which are correct and neither of which is a warning.
 TUNNEL_IF_TYPES: Tuple[int, ...] = (53, 131)
+#: Many VPN clients install an Ethernet miniport (IfType 6) rather than a tunnel type, so the type
+#: alone misses them: these words in the adapter's description mark one (AnyConnect, GlobalProtect,
+#: FortiClient, NetExtender, Zscaler, TAP-Windows, OpenVPN, WireGuard, ZeroTier, ...).  Deliberately
+#: not "virtual": a Hyper-V switch's host adapter says it, and it carries the real LAN.
+_VPN_MARKERS = ("vpn", "tap-windows", "wintun", "wireguard", "openvpn", "anyconnect", "pangp", "globalprotect",
+                "fortinet", "forticlient", "juniper", "pulse secure", "ivanti", "zscaler", "netextender",
+                "zerotier", "tunnel")
 
 IF_TYPE_NAMES: Dict[int, str] = {
     1: "Other",
@@ -211,6 +220,12 @@ class Adapter:
             if _version(gw) == 4:
                 return gw
         return None
+
+    @property
+    def global_ipv6(self) -> Optional[str]:
+        """The preferred global (or unique-local) IPv6 address, a stable one before an RFC 4941
+        temporary one; ``None`` without one.  Not in :meth:`to_dict` (``ipv6`` lists them all)."""
+        return _global_ipv6(self)
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -631,6 +646,53 @@ def get_default_gateway(adapters: Optional[Sequence[Adapter]] = None) -> Optiona
         return None
 
 
+def prefers_ipv4(adapters: Optional[Sequence[Adapter]] = None,
+                 route_probe: Optional[Callable[[], Optional[str]]] = None) -> bool:
+    """Whether a host name should be resolved to its IPv4 (A) address first.
+
+    False only on an IPv6-only host: no up adapter has a usable routable IPv4 address (preferred, or
+    still tentative, and not 169.254.x.x) together with an IPv4 default gateway, no IPv4 route exists
+    at all, and some up adapter has an IPv6 route (:func:`_has_ipv6_route`).  There an A record leads
+    nowhere - the echo has no route and misses every second - while the AAAA (native or
+    DNS64-synthesised) is how every browser reaches the name.  Dual-stack and IPv4-only hosts keep the
+    IPv4-first answer TNT has always used.
+
+    A tentative address counts because ``net.changed`` fires while DAD is still running on a PC that
+    has just joined a dual-stack network, and a name re-resolved then would otherwise sit on its AAAA
+    until the next re-resolve.  The route probe (``route_probe``, by default :func:`_route_source_ip`:
+    a UDP connect, nothing is sent) covers IPv4 that routes through an adapter listed without an IPv4
+    gateway - a PPP/WWAN link, a full-tunnel VPN, Windows 11 CLAT (192.0.0.x) - and is asked only
+    when the adapters alone would say "IPv6 only".  An explicit ``adapters`` list describes some host,
+    not necessarily this one, so this PC's own route is probed only for the live adapters (or when a
+    ``route_probe`` is passed).
+
+    Reads the one-second adapter cache (no native call of its own when it is warm) and never raises:
+    True, the old behaviour, whenever it cannot tell."""
+    try:
+        live = adapters is None
+        pool = get_adapters(include_down=True, include_loopback=False) if live else list(adapters)
+        up = [a for a in pool if a.is_up and not a.is_loopback]
+        usable = (IP_DAD_STATE_PREFERRED, IP_DAD_STATE_TENTATIVE)
+        for a in up:
+            if a.ipv4_gateway and any(int(x.dad_state) in usable and not _is_apipa(x.address) for x in a.ipv4):
+                return True
+        if not any(_has_ipv6_route(a) for a in up):
+            return True
+        probe = route_probe if route_probe is not None else (_route_source_ip if live else None)
+        if probe is not None:
+            try:
+                source = probe()
+            except Exception:  # noqa: BLE001 - the probe cannot tell; the adapters already did
+                log.debug("IPv4 route probe failed", exc_info=True)
+                source = None
+            if source and not _is_apipa(str(source)):
+                return True
+        return False
+    except Exception:  # noqa: BLE001 - contract: never raise
+        log.debug("prefers_ipv4 could not tell; keeping IPv4 first", exc_info=True)
+        return True
+
+
 def local_networks(adapters: Optional[Sequence[Adapter]] = None) -> List[IPNetwork]:
     """Networks of every adapter address, excluding link-local and loopback (de-duplicated)."""
     pool = list(adapters) if adapters is not None else get_adapters(include_down=True, include_loopback=False)
@@ -764,18 +826,52 @@ def _is_apipa(address: str) -> bool:
         return False
 
 
+def _global_ipv6(adapter: Adapter) -> Optional[str]:
+    """The adapter's preferred global (or unique-local) IPv6 address, the stable one before an
+    RFC 4941 temporary one that Windows rotates; ``None`` without one.  Never raises."""
+    found: List[Any] = []
+    for x in getattr(adapter, "ipv6", None) or []:
+        try:
+            addr = ipaddress.IPv6Address(str(x.address).split("%", 1)[0])
+        except (AttributeError, ValueError):
+            continue
+        if getattr(x, "preferred", False) and not (addr.is_link_local or addr.is_loopback or addr.is_multicast
+                                                   or addr.is_unspecified):
+            found.append(x)
+    found.sort(key=lambda x: 1 if getattr(x, "suffix_origin", 0) == IP_SUFFIX_ORIGIN_RANDOM else 0)
+    return str(found[0].address) if found else None
+
+
 def _has_ipv6_route(adapter: Adapter) -> bool:
     """A preferred global (or unique-local) IPv6 address and an IPv6 gateway on *adapter*."""
     if not any(_version(g) == 6 for g in adapter.gateways):
         return False
-    for x in adapter.ipv6:
+    return _global_ipv6(adapter) is not None
+
+
+def _is_tunnel(adapter: Adapter) -> bool:
+    """A VPN or other tunnel: a tunnel IfType (:data:`TUNNEL_IF_TYPES`), or a VPN client's Ethernet
+    miniport named by its description (:data:`_VPN_MARKERS`)."""
+    if adapter.if_type in TUNNEL_IF_TYPES:
+        return True
+    text = (adapter.description or "").lower()
+    return any(marker in text for marker in _VPN_MARKERS)
+
+
+def _subnet_with(adapter: Adapter, address: str) -> Optional[ipaddress.IPv4Network]:
+    """The adapter's IPv4 subnet (not a /31-/32 host route) that contains *address*, if any."""
+    try:
+        target = ipaddress.IPv4Address(address)
+    except ValueError:
+        return None
+    for x in adapter.ipv4:
         try:
-            addr = ipaddress.IPv6Address(str(x.address).split("%", 1)[0])
+            net = ipaddress.IPv4Network(x.network, strict=False)
         except ValueError:
             continue
-        if x.preferred and not (addr.is_link_local or addr.is_loopback or addr.is_multicast or addr.is_unspecified):
-            return True
-    return False
+        if net.prefixlen < 31 and target in net:
+            return net
+    return None
 
 
 def adapter_warnings(adapter: Adapter, adapters: Optional[Sequence[Adapter]] = None,
@@ -786,15 +882,19 @@ def adapter_warnings(adapter: Adapter, adapters: Optional[Sequence[Adapter]] = N
 
     * ``apipa`` - every usable IPv4 address is self-assigned (169.254.x.x): no DHCP server answered.
       Only on a DHCP adapter without a duplicate IPv4 address: a static or duplicate address that
-      Windows replaced with 169.254.x.x is the ``duplicate_address`` problem, not a DHCP one.  When
-      the adapter has a global IPv6 address and an IPv6 gateway the message says that the network
-      may be IPv6-only
+      Windows replaced with 169.254.x.x is the ``duplicate_address`` problem, not a DHCP one
+    * ``apipa_ipv6`` - the same, on an adapter with a global IPv6 address and an IPv6 gateway: IPv6
+      works (the network may be IPv6-only), so the adapter has a usable address and this is its own
+      code, graded apart from the case where nothing works
     * ``duplicate_address`` - duplicate-address detection found another device on an address
     * ``gateway_outside_subnet`` - an IPv4 gateway lies in none of the adapter's IPv4 subnets
-      (typical of a mistyped static address or mask; Windows accepts it)
+      (typical of a mistyped static address or mask; Windows accepts it).  A /31 or /32 counts as a
+      subnet only on a physical LAN adapter: on a tunnel it is how the tunnel is addressed
     * ``no_dns`` - a usable IPv4 address and a gateway but no DNS server
     * ``multiple_default_gateways`` - informational, needs *adapters* and only on the internet
-      NIC (*internet_index*): another up adapter has an IPv4 default gateway as well
+      NIC (*internet_index*): another up adapter has an IPv4 default gateway as well; the message
+      compares the two gateway addresses - a different router, or the same address on the same
+      subnet (most likely the same router), or the same address on another subnet
 
     Pure (no native call); never raises.
     """
@@ -805,27 +905,34 @@ def adapter_warnings(adapter: Adapter, adapters: Optional[Sequence[Adapter]] = N
         usable = [x for x in adapter.ipv4 if x.preferred]
         duplicate_v4 = any(int(x.dad_state) == IP_DAD_STATE_DUPLICATE for x in adapter.ipv4)
         if usable and all(_is_apipa(x.address) for x in usable) and adapter.dhcp_enabled and not duplicate_v4:
-            message = f"Self-assigned address {usable[0].address}: no DHCP server answered"
             if _has_ipv6_route(adapter):
-                message += " (IPv6 works: this network may be IPv6-only)"
-            out.append({"code": "apipa", "message": message})
+                out.append({"code": "apipa_ipv6",
+                            "message": f"Self-assigned IPv4 address {usable[0].address}: no DHCP server answered, "
+                                       "but IPv6 works (this network may be IPv6-only)"})
+            else:
+                out.append({"code": "apipa",
+                            "message": f"Self-assigned address {usable[0].address}: no DHCP server answered"})
         seen: set = set()
         for x in list(adapter.ipv4) + list(adapter.ipv6):
             if int(x.dad_state) == IP_DAD_STATE_DUPLICATE and x.address not in seen:
                 seen.add(x.address)
                 out.append({"code": "duplicate_address",
                             "message": f"{x.address} is already used by another device on this network"})
+        # A /31 or /32 is a host route: there is no subnet for a gateway to be inside, which is exactly
+        # how a VPN tunnel is addressed (Mullvad, Tailscale, WireGuard, and the Ethernet-miniport
+        # clients too).  Asking whether its gateway is "outside its subnet" has no sensible answer
+        # there, and answering it made every VPN user's adapter card look misconfigured.  On a
+        # physical LAN adapter, though, a host mask with a gateway is the typo this warning exists for
+        # (255.255.255.255 typed for 255.255.255.0): the PC reaches the router by ARP and half works,
+        # and nothing else on the LAN answers.  So only tunnels and virtual adapters are exempt.
+        host_route_expected = _is_tunnel(adapter) or not adapter.is_physical
         nets: List[ipaddress.IPv4Network] = []
         for x in adapter.ipv4:
             try:
                 net = ipaddress.IPv4Network(x.network, strict=False)
             except ValueError:
                 continue
-            # A /31 or /32 is a host route: there is no subnet for a gateway to be inside, which is
-            # exactly how a VPN tunnel is addressed (Mullvad, Tailscale, WireGuard all do it).  Asking
-            # whether its gateway is "outside its subnet" is a question with no sensible answer, and
-            # answering it yellow made every VPN user's adapter card look misconfigured.
-            if net.prefixlen < 31:
+            if net.prefixlen < 31 or not host_route_expected:
                 nets.append(net)
         if nets:
             for gw in adapter.gateways:
@@ -838,15 +945,27 @@ def adapter_warnings(adapter: Adapter, adapters: Optional[Sequence[Adapter]] = N
         if usable and adapter.ipv4_gateway and not adapter.dns:
             out.append({"code": "no_dns", "message": "No DNS servers: host names will not resolve"})
         if adapters is not None and internet_index is not None and adapter.index == internet_index \
-                and adapter.ipv4_gateway and adapter.if_type not in TUNNEL_IF_TYPES:
+                and adapter.ipv4_gateway and not _is_tunnel(adapter):
             # tunnels excluded on both sides: a connected VPN takes the default route by design, and
             # flagging that would mean every machine with Tailscale or a corporate VPN is "wrong"
             others = [a for a in adapters if a is not adapter and a.index != adapter.index and a.is_up
-                      and not a.is_loopback and a.ipv4_gateway and a.if_type not in TUNNEL_IF_TYPES]
+                      and not a.is_loopback and a.ipv4_gateway and not _is_tunnel(a)]
             if others:
                 other = others[0]
+                gw, other_gw = adapter.ipv4_gateway, str(other.ipv4_gateway)
+                mine = _subnet_with(adapter, gw)
+                if other_gw != gw:
+                    router = f"a different router ({other_gw})"
+                elif mine is not None and mine == _subnet_with(other, gw):
+                    # The docked laptop with Wi-Fi left on: one router reached two ways.  "Most likely",
+                    # because an address cannot prove it: a bench router at its factory address on one
+                    # NIC beside an office network numbered the same way looks exactly like this, and
+                    # telling them apart needs the two routers' MACs, which this pure function has not.
+                    router = f"the same address on the same subnet ({gw}), most likely the same router"
+                else:
+                    router = f"the same address ({gw}) on another subnet, so possibly another router"
                 out.append({"code": "multiple_default_gateways",
-                            "message": f"{other.name} also has a default gateway ({other.ipv4_gateway}); "
+                            "message": f"{other.name} also has a default gateway: {router}; "
                                        "Windows sends traffic through the one with the lowest metric"})
     except Exception:  # noqa: BLE001
         log.exception("adapter warnings for %s failed", getattr(adapter, "name", "?"))

@@ -20,7 +20,12 @@ Two services, both LAN-reachable (the only ones TNT exposes beyond 127.0.0.1):
   A listener on ``0.0.0.0:7132`` (``SO_REUSEADDR``: the dev console on 7135 and the
   installed service may run at once) records every peer by its stable id; peers not heard
   from for :data:`PEER_TTL_S` expire.  ``lan.peers`` is published only when the set of
-  peers or a peer's address/name/port changes, never per beacon.
+  peers or a peer's address/name/port changes, never per beacon.  Ids are free text, so a
+  host sending beacons with fresh ids (a fuzzer, a hostile box) must not grow the table or
+  flood every window: one source address holds at most :data:`MAX_PEERS_PER_IP` ids and the
+  table at most :data:`MAX_PEERS` (the stalest id goes first), and at most
+  :data:`PUBLISH_BURST` ``lan.peers`` go out per :data:`PUBLISH_WINDOW_S`; a change beyond
+  that is sent with the table as it then is at the listener's next tick.
 * **Throughput server (TCP 7133).**  One test at a time; a second connection while busy
   gets ``BUSY`` and is closed.  The protocol is deliberately tiny and never runs anything:
   the client sends a 16-byte header ``b"TNTT"`` + version ``1`` + mode (``b"U"`` client
@@ -78,8 +83,9 @@ __all__ = [
     "BEACON_PORT", "THROUGHPUT_PORT", "BEACON_INTERVAL_S", "PEER_TTL_S", "BEACON_MAX_BYTES", "PEER_ID_META",
     "BEACON_FIREWALL_RULE", "THROUGHPUT_FIREWALL_RULE", "MAGIC_REQUEST", "MAGIC_REPLY", "PROTO_VERSION",
     "MODE_UPLOAD", "MODE_DOWNLOAD", "HEADER_LEN", "TRAILER_LEN", "MIN_SECONDS", "MAX_SECONDS", "DEFAULT_SECONDS",
-    "CHUNK", "SOCKET_TIMEOUT_S", "encode_beacon", "decode_beacon", "build_header", "parse_header",
-    "build_trailer", "parse_trailer", "beacon_sources", "ThroughputError", "LanPeers",
+    "CHUNK", "SOCKET_TIMEOUT_S", "MAX_PEERS", "MAX_PEERS_PER_IP", "PUBLISH_BURST", "PUBLISH_WINDOW_S",
+    "encode_beacon", "decode_beacon", "build_header", "parse_header", "build_trailer", "parse_trailer",
+    "beacon_sources", "ThroughputError", "LanPeers",
 ]
 
 # --- ports / timing -------------------------------------------------------------------------
@@ -89,6 +95,14 @@ THROUGHPUT_PORT = 7133
 BEACON_INTERVAL_S = 5.0
 #: A peer whose last beacon is older than this is dropped (4 missed beacons).
 PEER_TTL_S = 20.0
+#: The peer table's hard size, and how many ids one source address may hold (the service and a dev console on one PC
+#: are two).  A new id beyond either limit pushes out the stalest id (of that address, or of the whole table).
+MAX_PEERS = 256
+MAX_PEERS_PER_IP = 4
+#: At most this many ``lan.peers`` events per window; a change beyond that goes out at the listener's next tick
+#: after the window, with the table as it is then (a beacon flood cannot make every window rebuild the table).
+PUBLISH_BURST = 8
+PUBLISH_WINDOW_S = 1.0
 BEACON_MAX_BYTES = 512
 PEER_ID_META = "lan.peer_id"
 BEACON_FIREWALL_RULE = "TNT LAN discovery (UDP 7132 in)"
@@ -387,6 +401,9 @@ class LanPeers:
         self._listening = False
         self._errors: Dict[str, str] = {}       # component -> problem (listener, server, firewall)
         self._peers: Dict[str, Dict[str, Any]] = {}
+        self._publish_clock: Callable[[], float] = time.monotonic   # the lan.peers rate limit's clock (a test seam)
+        self._publish_times: List[float] = []   # when the recent lan.peers went out (at most PUBLISH_BURST)
+        self._peers_dirty = False               # a change is waiting for the rate limit
         self._listen_sock: Any = None
         self._server_sock: Any = None
         self._beacon_bound_port = self._beacon_port
@@ -560,7 +577,24 @@ class LanPeers:
             log.exception("publish %s failed", event_type)
 
     def _publish_peers(self) -> None:
+        """``lan.peers`` with the whole table, unless :data:`PUBLISH_BURST` went out in the last
+        :data:`PUBLISH_WINDOW_S`: then the change waits for :meth:`_flush_peers` (the listener's next tick)."""
+        now = float(self._publish_clock())
+        with self._lock:
+            recent = [t for t in self._publish_times if 0.0 <= now - t < PUBLISH_WINDOW_S]
+            if len(recent) >= PUBLISH_BURST:
+                self._publish_times = recent
+                self._peers_dirty = True
+                return
+            recent.append(now)
+            self._publish_times = recent
+            self._peers_dirty = False
         self._publish("lan.peers", {"peers": self._peer_rows()})
+
+    def _flush_peers(self) -> None:
+        """Send a change the rate limit held back, once the window allows it."""
+        if self._peers_dirty:
+            self._publish_peers()
 
     # -- beacon --------------------------------------------------------------------------
     def beacon_bytes(self, ts: Optional[float] = None) -> bytes:
@@ -612,6 +646,7 @@ class LanPeers:
             try:
                 if self._rematch_pending:
                     self.refresh_peer_adapters()
+                self._flush_peers()             # a held-back lan.peers, should the listener not be running
                 self.send_beacon()
             except Exception:  # noqa: BLE001 - the beacon thread must never die
                 log.exception("beacon loop error")
@@ -637,18 +672,44 @@ class LanPeers:
             "id": beacon["id"], "hostname": beacon["hostname"] or None, "ip": ip, "version": beacon["version"] or None,
             "port": beacon["port"], "last_seen_ts": now, "adapter": self._adapter_for(ip),
         }
+        evicted: List[str] = []
         with self._lock:
             old = self._peers.get(rec["id"])
+            if old is None:
+                evicted = self._make_room(ip)
             self._peers[rec["id"]] = rec
             changed = old is None or any(old.get(k) != rec[k] for k in ("ip", "hostname", "port", "version"))
+        if evicted:
+            log.debug("LAN peers: room for %s from %s made by dropping %s", rec["id"], ip, ", ".join(evicted))
         if changed:
             log.info("LAN peer %s %s (%s) %s", rec["hostname"] or rec["id"], ip, rec["version"], "found" if old is None else "changed")
             self._publish_peers()
         return dict(rec)
 
+    def _make_room(self, ip: str) -> List[str]:
+        """Before a new id is added (under the lock): drop the stalest ids of *ip* beyond
+        :data:`MAX_PEERS_PER_IP` - 1, then the stalest of the table beyond :data:`MAX_PEERS` - 1.
+        Returns the dropped ids."""
+        def stalest(recs: List[Tuple[str, Dict[str, Any]]], keep: int) -> List[str]:
+            if len(recs) <= keep:
+                return []
+            recs.sort(key=lambda item: float(item[1].get("last_seen_ts") or 0.0))
+            return [pid for pid, _r in recs[:len(recs) - keep]]
+
+        dropped = stalest([(pid, r) for pid, r in self._peers.items() if r.get("ip") == ip], MAX_PEERS_PER_IP - 1)
+        for pid in dropped:
+            self._peers.pop(pid, None)
+        if len(self._peers) >= MAX_PEERS:
+            more = stalest(list(self._peers.items()), MAX_PEERS - 1)
+            for pid in more:
+                self._peers.pop(pid, None)
+            dropped += more
+        return dropped
+
     def expire_peers(self, now: Optional[float] = None) -> List[str]:
         """Drop peers not heard from for :data:`PEER_TTL_S` (or seen in the future after a
-        clock step).  Returns the dropped ids; publishes ``lan.peers`` when any went."""
+        clock step).  Returns the dropped ids; publishes ``lan.peers`` when any went, or when a
+        change is still waiting for the rate limit (:meth:`_publish_peers`)."""
         now = float(self._clock() if now is None else now)
         gone: List[str] = []
         with self._lock:
@@ -660,6 +721,8 @@ class LanPeers:
         if gone:
             log.info("LAN peer(s) expired: %s", ", ".join(gone))
             self._publish_peers()
+        else:
+            self._flush_peers()
         return gone
 
     def _read_adapters(self) -> Optional[List[Any]]:

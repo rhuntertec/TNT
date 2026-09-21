@@ -1495,6 +1495,9 @@ class Engine:
             "type_name": getattr(nic, "type_name", None),
             "ipv4": getattr(first, "address", None) if first is not None else None,
             "network": getattr(first, "network", None) if first is not None else None,
+            # the tile shows this instead when IPv4 is self-assigned while IPv6 carries the traffic
+            # (an IPv6-only network): 169.254.x.x is not the address anything reaches the PC on
+            "ipv6": getattr(nic, "global_ipv6", None),
             "gateway": gws[0] if gws else None,
             "mac": getattr(nic, "mac", None),
             "warnings": [str(w["code"]) for w in found or [] if isinstance(w, dict) and w.get("code")],

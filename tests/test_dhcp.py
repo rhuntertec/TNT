@@ -960,6 +960,8 @@ def make_server(tmp_path, sim: NicSim, factory: Optional[FakeSocketFactory] = No
     bus.subscribe(lambda e: events.append(e))
     clock = clock or FakeClock()
     factory = factory or FakeSocketFactory()
+    # the pre-offer in-use check reads the neighbour table after an unanswered ping; never this PC's real one here
+    kw.setdefault("neighbour_fn", lambda ip, if_index=None: None)
     srv = dhcp.DhcpServer(db, cfg, bus, pinger=pinger or FakePinger(), clock=clock, socket_factory=factory, runner=sim,
                           adapters_fn=sim.get_adapters, tcp_connect=lambda ip, port, t: port == 80, resolver=lambda ip: None,
                           vendor_fn=lambda mac: "Acme", exe_path=r"C:\Program Files\TNT\TNTService.exe", sleep=clock.sleep, **kw)
@@ -2101,12 +2103,14 @@ def test_losing_the_server_address_or_the_nic_stops_the_server(tmp_path, fast_sc
         srv.stop()
         db.close()
     (tmp_path / "usb").mkdir()
-    sim2 = NicSim([adapter(name="USB Ethernet", mac="02:00:5E:10:00:1F", index=31)])
+    # the laptop's Wi-Fi stays listed: an enumeration with no adapter at all is a failed read, not a removal
+    wifi = adapter(name="Wi-Fi", ip="192.168.50.23", mac="02:00:5E:10:00:07", index=7, if_type=71, gateway="192.168.50.1")
+    sim2 = NicSim([adapter(name="USB Ethernet", mac="02:00:5E:10:00:1F", index=31), wifi])
     srv2, _events2, _factory2, db2, _cfg2, _clock2 = make_server(tmp_path / "usb", sim2)
     try:
         srv2.start(force=True)
         assert json.loads(db2.get_meta("dhcp.nic_changed"))["adapter"] == "USB Ethernet"
-        sim2.adapters.clear()                                           # the USB adapter was pulled out
+        sim2.adapters.remove(sim2.find("USB Ethernet"))                # the USB adapter was pulled out
         commands = len(sim2.commands)
         srv2.on_network_change({})
         assert wait_for(lambda: not srv2.running, 5.0)

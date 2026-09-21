@@ -65,7 +65,7 @@ and nothing else (NAK: 54 + 56).  Reply addressing follows §4.1 (:func:`reply_d
 
 Injectable seams (all keyword arguments, defaulting to the real thing): ``socket_factory``,
 ``runner`` (a ``subprocess.run`` stand-in), ``adapters_fn``, ``clock``, ``sleep``,
-``tcp_connect``, ``resolver``, ``vendor_fn`` and ``pinger``.  ``tnt.netinfo``,
+``tcp_connect``, ``resolver``, ``vendor_fn``, ``neighbour_fn`` and ``pinger``.  ``tnt.netinfo``,
 ``tnt.discovery``, ``tnt.oui`` and ``tnt.arp`` are imported lazily through ``importlib``
 so a fake in ``sys.modules`` is honoured.
 """
@@ -144,6 +144,11 @@ MIN_SCAN_WAIT_S = 1.0
 #: in ~1 s even when the first pick is taken.
 PING_CHECK_TIMEOUT_MS = 500
 PING_CHECK_MAX = 2
+#: Neighbour-table states that prove a host answered ARP (or was set by hand) just now.  A Windows PC on the Public
+#: firewall profile, or a camera with "ping" switched off, drops the echo but still answers the ARP request that went
+#: before it, so after an unanswered ping the entry is ``reachable``.  ``stale``/``delay``/``probe`` rows are a host
+#: that may have left minutes ago (or has not answered yet), so they never count.
+IN_USE_NEIGHBOUR_STATES = ("reachable", "permanent")
 #: Identical datagrams seen on both sockets within this window are handled once.
 DEDUPE_WINDOW_S = 1.5
 RX_TICK_S = 0.5
@@ -168,6 +173,10 @@ NIC_CHANGED_META = "dhcp.nic_changed"
 #: ``status()["warning"]`` prefix after a start was refused because of another server; a later
 #: clean scan clears it again (see ``DhcpServer._do_scan``).
 CONFLICT_WARNING = "another DHCP server is active"
+#: ``status()["warning"]`` while a net.changed enumeration failed or answered with nothing: the server keeps
+#: running (it may be fine), but the tile must not claim a healthy server on a NIC that may be gone.  The next
+#: enumeration that answers clears it.
+ADAPTERS_UNREAD_WARNING = "the network adapters could not be read after a network change; the serving adapter may be gone"
 
 _Z4 = b"\x00" * 4
 _Z64 = b"\x00" * 64
@@ -471,7 +480,7 @@ class LeaseTable:
 
     Keyed by the client key (option 61 or MAC); ``by_ip`` maps an address to the key that
     last held it.  ``bad`` holds addresses we must not offer for a while (a DECLINE, or a
-    ping answer before offering).  Every mutation goes through :meth:`_persist` so a
+    ping or ARP answer before offering).  Every mutation goes through :meth:`_persist` so a
     service restart (:meth:`load`) never re-offers a live address.  Records that leave the
     table (an untaken offer, a dead record whose address moved to another client) are
     collected in ``dropped`` until :meth:`drain_dropped` so the server can tell the UI to
@@ -574,7 +583,8 @@ class LeaseTable:
                     log.debug("ping check failed for %s", ip, exc_info=True)
                     in_use = False
                 if in_use:
-                    log.warning("DHCP: %s answered a ping before it was offered; holding it for %d s", ip, PING_HOLD_S)
+                    log.warning("DHCP: %s is in use (it answered the check before it was offered); holding it for %d s",
+                                ip, PING_HOLD_S)
                     self.bad[ip] = now + PING_HOLD_S
                     continue
             return ip
@@ -1693,7 +1703,8 @@ class DhcpServer:
                  tcp_connect: Optional[Callable[[str, int, float], bool]] = None,
                  resolver: Optional[Callable[[str], Optional[str]]] = None,
                  vendor_fn: Optional[Callable[[str], Optional[str]]] = None, port: int = SERVER_PORT,
-                 exe_path: Optional[str] = None, sleep: Optional[Callable[[float], None]] = None) -> None:
+                 exe_path: Optional[str] = None, sleep: Optional[Callable[[float], None]] = None,
+                 neighbour_fn: Optional[Callable[..., Optional[Tuple[str, Optional[str]]]]] = None) -> None:
         self._db = db
         self._config = config
         self._bus = bus
@@ -1706,6 +1717,7 @@ class DhcpServer:
         self._tcp_connect = tcp_connect
         self._resolver = resolver
         self._vendor_fn = vendor_fn
+        self._neighbour_fn = neighbour_fn
         self._port = int(port)
         self._exe_path = exe_path or sys.executable
         self._lock = threading.RLock()          # state
@@ -2148,6 +2160,8 @@ class DhcpServer:
                 name = str(getattr(self._adapter, "name", "")) if self._adapter is not None else ""
                 changed = self._nic_changed
                 server_ip = self._server_ip
+                if self._warning == ADAPTERS_UNREAD_WARNING:
+                    self._warning = None          # it spoke of the running server only
             if not was_running and not changed:
                 return self.status()
             # Sockets first (the receive thread wakes up on the closed socket and exits), then
@@ -2195,6 +2209,26 @@ class DhcpServer:
             if not running or adapter is None or not server_ip:
                 return
             pool = _get_adapters(self._adapters_fn)
+            if not pool:
+                # a failed enumeration (netinfo answers [] for one) is "no answer", never "every adapter was
+                # removed": reading it as a removal would drop the NIC-restore record while the NIC still has
+                # the static bench address.  It can also be a PC whose only adapter was the served one, so the
+                # status says the adapters could not be read rather than showing a healthy server; the next
+                # net.changed looks again.
+                log.warning("DHCP server: the adapters could not be read during a network change; keeping the server as it is")
+                with self._lock:
+                    flag = self._running and self._warning is None
+                    if flag:
+                        self._warning = ADAPTERS_UNREAD_WARNING
+                if flag:
+                    self._publish_state()
+                return
+            with self._lock:
+                cleared = self._warning == ADAPTERS_UNREAD_WARNING
+                if cleared:
+                    self._warning = None
+            if cleared:
+                self._publish_state()
             problem = self._serving_problem(adapter, server_ip, pool)
             if problem is None:
                 ips = {ip for a in pool for ip, _p in _adapter_ipv4s(a)}
@@ -2259,13 +2293,22 @@ class DhcpServer:
         """Stop because of *problem*.  An adapter that is *gone* (a USB NIC pulled out) is not put
         back on DHCP: its temporary address was set with ``store=active``, which went away with the
         interface, so there is nothing to restore (netsh would only fail) and no start-time restore
-        is left behind for it."""
+        is left behind for it.  "Gone" is confirmed first by a fresh enumeration that succeeds and
+        lacks the adapter; when that enumeration fails, or lists the adapter again, the NIC is
+        restored as usual (and when netsh cannot reach it the record stays for the next start)."""
         with self._lock:
             if not self._running:
                 return
             self._error = f"stopped: {problem}"
-            name = str(getattr(self._adapter, "name", "") or "") or "The adapter"
+            adapter = self._adapter
+            name = str(getattr(adapter, "name", "") or "") or "The adapter"
             changed = self._nic_changed
+        if gone and changed:
+            _invalidate_adapter_cache()
+            fresh = _get_adapters(self._adapters_fn)
+            if not fresh or self._same_nic(adapter, fresh) is not None:
+                log.warning("DHCP server: %s is listed again (or the adapters could not be read); restoring it as usual", name)
+                gone = False
         self._db_event("warning", f"DHCP server stopped: {problem}")
         try:
             self.stop(restore_nic=not gone)
@@ -2439,13 +2482,42 @@ class DhcpServer:
     def _nak(self, req: Packet, src: Tuple[str, int], why: str) -> None:
         self._send(req, src, NAK, None, [(54, _packed(self._server_ip)), (56, why.encode("ascii", "replace")[:255])])
 
-    def _ping_fn(self) -> Optional[Callable[[str], bool]]:
+    def _neighbour(self, ip: str, if_index: Any) -> Optional[Tuple[str, Optional[str]]]:
+        """``(MAC, state)`` of *ip* in this PC's neighbour table on the served adapter (the seam, else
+        ``tnt.arp.neighbour``, imported lazily); ``None`` when there is no row or the table cannot be read."""
+        try:
+            fn = self._neighbour_fn
+            if fn is None:
+                fn = importlib.import_module("tnt.arp").neighbour
+            return fn(ip, if_index)
+        except Exception:  # noqa: BLE001 - a table that cannot be read leaves the ping's verdict
+            log.debug("neighbour lookup for %s failed", ip, exc_info=True)
+            return None
+
+    def _ping_fn(self, client_mac: Optional[str] = None) -> Optional[Callable[[str], bool]]:
+        """The in-use check :meth:`LeaseTable.pick_address` runs before an offer: a ping, and when the echo is not
+        answered, the neighbour table of the served adapter.  Windows resolves the address with ARP before it sends the
+        echo, so a host that drops ICMP but answers ARP (a PC on the Public firewall profile) is left behind as a
+        ``reachable`` row; that counts as "in use" unless the row is the requesting client's own MAC (a returning
+        client may have its old address back).  The lookup is a table read, so the check still takes one ping timeout
+        at most per candidate."""
         if not self._settings()["ping_check"] or self.pinger is None:
             return None
+        if_index = getattr(self._adapter, "index", None)
+        own = _normalize_mac(client_mac)
 
         def check(ip: str) -> bool:
             r = self.pinger.ping(ip, size=32, timeout_ms=PING_CHECK_TIMEOUT_MS, ttl=128)
-            return bool(getattr(r, "ok", False))
+            if getattr(r, "ok", False):
+                return True
+            row = self._neighbour(ip, if_index)
+            if not row or row[1] not in IN_USE_NEIGHBOUR_STATES:
+                return False
+            mac = _normalize_mac(row[0])
+            if mac is None or mac == own:
+                return False
+            log.info("DHCP: %s did not answer the ping but %s answered ARP for it", ip, mac)
+            return True
 
         return check
 
@@ -2544,7 +2616,7 @@ class DhcpServer:
 
     def _on_discover(self, pkt: Packet, src: Tuple[str, int], now: float) -> Tuple[Optional[int], Optional[Lease]]:
         key = pkt.client_id()
-        ip = self._table.pick_address(key, pkt.requested_ip(), now, self._ping_fn())
+        ip = self._table.pick_address(key, pkt.requested_ip(), now, self._ping_fn(pkt.mac))
         if ip is None:
             log.warning("DHCP: no free address for %s (pool %s-%s)", pkt.mac, *(self._pool or ("?", "?")))
             return None, None

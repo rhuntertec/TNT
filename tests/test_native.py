@@ -954,11 +954,12 @@ def test_a_self_assigned_address_is_only_blamed_on_dhcp_when_dhcp_is_to_blame():
     assert codes(_fake_adapter(ipv4=[_v4("10.0.0.112", 24, dad=netinfo.IP_DAD_STATE_DUPLICATE), _v4("169.254.7.7", 16)],
                                dns=["10.0.0.251"])) == ["duplicate_address"]
     assert codes(_fake_adapter(ipv4=[_v4("169.254.10.20", 16)], gateways=[], dns=[], dhcp_enabled=False, dhcp_server=None)) == []
-    # DHCPv4 unanswered next to working IPv6: still no DHCP server, and the message says the network may be IPv6-only
+    # DHCPv4 unanswered next to working IPv6: still no DHCP server, but the adapter has a usable address, so it is its own
+    # code (the Faults tile grades by code, and the same code as a dead DHCP server made it "no usable address")
     v6only = _fake_adapter(ipv4=[_v4("169.254.30.40", 16)], gateways=["fe80::1"], dns=["2001:db8:77::53"], dhcp_server=None,
                            ipv6=[netinfo._make_ipaddr("2001:db8:77::1a2b", 6, 64, netinfo.IP_DAD_STATE_PREFERRED, 0, 4, 4)])
     w = netinfo.adapter_warnings(v6only)
-    assert [x["code"] for x in w] == ["apipa"] and w[0]["message"].endswith("(IPv6 works: this network may be IPv6-only)")
+    assert [x["code"] for x in w] == ["apipa_ipv6"] and w[0]["message"].endswith("but IPv6 works (this network may be IPv6-only)")
     plain = netinfo.adapter_warnings(_fake_adapter(ipv4=[_v4("169.254.30.40", 16)], gateways=[], dns=[], dhcp_server=None))
     assert plain[0]["message"] == "Self-assigned address 169.254.30.40: no DHCP server answered"
 

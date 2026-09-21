@@ -15,8 +15,14 @@ hit:
   (download or upload): byte budget, time budget, cancel event, progress
   callbacks and the final Mbps figure. Mbps = bytes * 8 / wall seconds of
   the phase, where the wall clock runs from the phase start to the moment
-  the last byte was counted (ramp-up included, trailing straggler time
-  excluded).
+  the phase really ended: when its byte or time budget was reached, or the
+  last byte counted if that came later (a tail request finishing). It used
+  to stop at the last byte counted, which let a line that delivered a burst
+  and then stalled for the rest of the phase report the burst rate. The
+  longest stretch in which nothing was counted is kept too
+  (``PhaseStats.stall_s``); a phase with one of at least :data:`STALL_S`
+  seconds (:data:`UPLOAD_STALL_S` for acked phases) is ``stalled`` and
+  :func:`phase_note` names it in the result's note.
 
   Downloads count bytes as they are read from the socket (they have
   provably arrived). Uploads must not: ``send()`` returns as soon as the
@@ -37,6 +43,15 @@ hit:
   resolved address in turn, and ``getaddrinfo`` itself is bounded only by
   the OS resolver). Transfer workers are daemon threads that the phase
   abandons rather than waits for, so a stuck socket never blocks the run.
+* The result's note: ``SpeedResult.error`` of an ``ok`` result is ``None``
+  for a clean test, or a plain-English note about the part of it that could
+  not be trusted: a stalled phase (:func:`phase_note`) or an upload that could
+  not be measured (:func:`upload_not_measured`, text starting with
+  :data:`UPLOAD_NOT_MEASURED`). Only ``ok=False`` makes a result a failure.
+* HTTP error text: :class:`HttpError` carries the status and a short, plain
+  detail from the body (:func:`error_detail`): for an HTML page (a captive
+  portal) only its ``<title>`` text, never markup, at most
+  :data:`ERROR_DETAIL_MAX` characters.
 * :func:`measure_latency` - N small GETs on one keep-alive connection;
   latency = median, jitter = mean absolute difference between consecutive
   samples. One un-counted warm-up request establishes the connection first
@@ -61,9 +76,11 @@ function in this module ever calls ``print``.
 from __future__ import annotations
 
 import email.utils
+import html
 import http.client
 import logging
 import os
+import re
 import ssl
 import threading
 import time
@@ -102,6 +119,23 @@ MIN_RETRY_AFTER_S = 60
 MAX_RETRY_AFTER_S = 3600
 #: Error prefix of a rate-limited result (the scheduler keys off ``raw["rate_limited"]``).
 RATE_LIMITED_PREFIX = "rate limited"
+#: A phase is *stalled* when nothing was counted for at least this long after its first byte. A
+#: healthy download counts bytes every few milliseconds; Wi-Fi roaming, an LTE handover or a DOCSIS
+#: line dropping out stops every flow for seconds.
+STALL_S = 3.0
+#: The same for an acked (upload) phase. Bytes count once per request there, and a request is sized
+#: to take about 2 s, so on one connection a healthy line counts nothing for 2 s at a time.
+UPLOAD_STALL_S = 4.0
+#: Start of the note of an ``ok`` result whose upload phase produced no figure (the patterns count these).
+UPLOAD_NOT_MEASURED = "upload not measured"
+#: In such a note when the server answered the upload requests with a 4xx (a fast.com cache server that takes no
+#: uploads): the server's doing, not the line's, and the patterns keep it out of the line finding.
+UPLOAD_REFUSED = "the server refused the upload"
+#: In such a note when nothing got through and no server answered (no errors, or only timeouts and dropped
+#: connections): what a dead or very slow upstream looks like.
+UPLOAD_LINE_HINT = "the upload is down, or too slow to finish one request in the phase"
+#: Longest detail an :class:`HttpError` keeps from a response body.
+ERROR_DETAIL_MAX = 120
 
 ProgressFn = Callable[[str, float], None]
 
@@ -157,6 +191,43 @@ class RunGuard:
         if self.cancel.is_set():
             return CANCELLED
         return f"timed out after {self.timeout_s:g} s (speedtest.timeout_s)"
+
+
+_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title\s*>", re.I | re.S)
+_TAG_RE = re.compile(r"<[^>]*>?")
+_HTML_SNIFF_RE = re.compile(r"\s*(<!doctype\s+html|<html|<head|<body|<title|<meta|<script|<!--)", re.I)
+
+
+def _plain(text: str) -> str:
+    """*text* without tags or angle brackets, entities decoded, whitespace collapsed."""
+    text = _TAG_RE.sub(" ", text)
+    text = html.unescape(text)
+    text = text.replace("<", " ").replace(">", " ")      # an entity can decode into markup: never pass that on
+    return " ".join("".join(ch if ch.isprintable() else " " for ch in text).split())
+
+
+def _bounded(text: str, limit: int = ERROR_DETAIL_MAX) -> str:
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "\u2026"
+
+
+def error_detail(body: Any, content_type: Optional[str] = None) -> str:
+    """A short, plain-text detail for an HTTP error *body*: never markup.
+
+    A captive portal or an inline proxy answers the speed test's requests with its own page, and
+    ``SpeedResult.error`` is shown in the UI and stored, so an HTML body (by its ``Content-Type`` or by
+    how it starts) is reduced to its ``<title>`` text, or ``"an HTML page"`` without one. Any other
+    body keeps its first words with any tags removed. At most :data:`ERROR_DETAIL_MAX` characters.
+    """
+    if isinstance(body, (bytes, bytearray)):
+        text = bytes(body[:65536]).decode("utf-8", errors="replace")
+    else:
+        text = str(body or "")[:65536]
+    ctype = str(content_type or "").lower()
+    if "html" in ctype or _HTML_SNIFF_RE.match(text):
+        m = _TITLE_RE.search(text)
+        title = _plain(m.group(1)) if m else ""
+        return _bounded(title) if title else "an HTML page"
+    return _bounded(_plain(text))
 
 
 class HttpError(Exception):
@@ -484,8 +555,12 @@ class Http:
     """
 
     def __init__(self, host: str, port: Optional[int] = None, scheme: str = "https",
-                 timeout: float = SOCKET_TIMEOUT_S, user_agent: str = BROWSER_UA) -> None:
+                 timeout: float = SOCKET_TIMEOUT_S, user_agent: str = BROWSER_UA,
+                 source_address: Optional[Tuple[str, int]] = None) -> None:
         self.host = host
+        # ("0.0.0.0", 0) pins the connection to IPv4: create_connection binds each candidate's socket
+        # to it, an IPv6 socket refuses that bind and the AAAA candidates are skipped (None: any family)
+        self.source_address = source_address
         self.scheme = scheme
         self.port = port if port is not None else (443 if scheme == "https" else 80)
         self.timeout = float(timeout)
@@ -496,9 +571,11 @@ class Http:
     def _connection(self) -> http.client.HTTPConnection:
         if self._conn is None:
             if self.scheme == "https":
-                self._conn = http.client.HTTPSConnection(self.host, self.port, timeout=self.timeout, context=ssl_context())
+                self._conn = http.client.HTTPSConnection(self.host, self.port, timeout=self.timeout,
+                                                         source_address=self.source_address, context=ssl_context())
             else:
-                self._conn = http.client.HTTPConnection(self.host, self.port, timeout=self.timeout)
+                self._conn = http.client.HTTPConnection(self.host, self.port, timeout=self.timeout,
+                                                        source_address=self.source_address)
         return self._conn
 
     def close(self) -> None:
@@ -549,7 +626,8 @@ class Http:
             raise
         if check and reply.status >= 400:
             self.close()
-            raise HttpError(reply.status, path, reply.text[:120].strip(), headers=reply.headers)
+            raise HttpError(reply.status, path, error_detail(reply.body, reply.headers.get("content-type")),
+                            headers=reply.headers)
         return reply
 
     # -- streaming --------------------------------------------------------
@@ -571,7 +649,8 @@ class Http:
             if resp.status not in (200, 206):
                 headers = self._header_dict(resp)
                 try:
-                    detail = resp.read(200).decode("utf-8", errors="replace").strip()
+                    # enough of a page to find its <title> (a portal's head can be long), never the markup itself
+                    detail = error_detail(resp.read(16384), headers.get("content-type"))
                 finally:
                     self.close()
                 raise HttpError(resp.status, path, detail, headers=headers)
@@ -615,13 +694,13 @@ class Http:
                     self.close()
                     return None, sent, True
             resp = conn.getresponse()
-            body = resp.read(4096)
+            body = resp.read(16384)
             while resp.read(READ_CHUNK):
                 pass
             if resp.status >= 300:
                 self.close()
-                raise HttpError(resp.status, path, body[:120].decode("utf-8", errors="replace"),
-                                headers=self._header_dict(resp))
+                headers = self._header_dict(resp)
+                raise HttpError(resp.status, path, error_detail(body, headers.get("content-type")), headers=headers)
             return resp.status, sent, False
         except Exception:
             self.close()
@@ -645,10 +724,15 @@ class PhaseStats:
     rate_limited: int = 0               # workers that gave up because the server kept refusing them
     retry_after_s: Optional[int] = None  # largest Retry-After seen (parsed seconds), if any
     rate_limit_status: Optional[int] = None  # the refusing status (429 or 403), if any
+    stall_s: float = 0.0                # longest stretch after the first counted byte with nothing counted
+    stalled: bool = False               # stall_s reached the phase's threshold (STALL_S, UPLOAD_STALL_S when acked)
+    acked: bool = False                 # an acked (upload) phase: bytes count when the server acknowledged them
+    last_error: Optional[str] = None    # the last request error a worker reported (plain text), if any
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
         d["seconds"] = round(self.seconds, 3)
+        d["stall_s"] = round(self.stall_s, 3)
         d["mbps"] = round(self.mbps, 3) if self.mbps is not None else None
         d["mbps_full"] = round(self.mbps_full, 3) if self.mbps_full is not None else None
         return d
@@ -673,13 +757,19 @@ class TransferPhase:
 
     * received (default, downloads): every counted byte has arrived, so the
       byte/time budget aborts in-flight requests at once and Mbps = bytes /
-      (last byte - start).
+      (end - start).
     * acked (``acked=True``, uploads): bytes only count once the worker calls
       :meth:`ack` after the server's response arrived. The byte budget stops
       new requests but in-flight ones may complete for ``tail_s`` more seconds
       (the time budget likewise), after which they are abandoned and *not*
       counted; acks arriving after the phase closed are ignored. Mbps =
-      acked bytes / (last ack - start).
+      acked bytes / (end - start).
+
+    ``end`` is the moment the budget was reached (the phase stopped asking for
+    more), or the last counted byte / ack when that came later. On a line that
+    keeps moving data the two are the same instant (or the last ack of the tail
+    is later), so a healthy figure is what it always was; on a line whose flows
+    stalled, the dead seconds are in the figure instead of being cut off.
     """
 
     #: A phase keeps transferring for at least this long even when the byte budget is
@@ -696,7 +786,8 @@ class TransferPhase:
                  cancel: Any = None, progress: Optional[ProgressFn] = None,
                  clock: Callable[[], float] = time.perf_counter, grace_s: float = SOCKET_TIMEOUT_S + 3.0,
                  acked: bool = False, tail_s: float = TAIL_GRACE_S,
-                 min_duration_s: Optional[float] = None, max_bytes_factor: Optional[float] = None) -> None:
+                 min_duration_s: Optional[float] = None, max_bytes_factor: Optional[float] = None,
+                 stall_s: Optional[float] = None) -> None:
         self.name = name
         self.duration_s = max(0.5, float(duration_s))
         self.byte_budget = max(1, int(byte_budget))
@@ -708,6 +799,7 @@ class TransferPhase:
         self.grace_s = float(grace_s)
         self.acked = bool(acked)
         self.tail_s = max(0.0, float(tail_s)) if self.acked else 0.0
+        self.stall_s = float(stall_s) if stall_s is not None else (UPLOAD_STALL_S if self.acked else STALL_S)
         self._progress = progress
         self._clock = clock
         self._lock = threading.Lock()
@@ -715,6 +807,7 @@ class TransferPhase:
         self._acked_bytes = 0
         self._requests = 0
         self._errors = 0
+        self._last_error: Optional[str] = None
         self._rate_limit_hits = 0
         self._rate_limited = 0
         self._retry_after: Optional[int] = None
@@ -817,26 +910,61 @@ class TransferPhase:
             self._trace_point(now, self._acked_bytes)
             return True
 
+    def _counted_at(self, start: float, t: float) -> float:
+        """Bytes counted by time *t*, interpolated between the trace points either side of it."""
+        prev_ts, prev_n = start, 0
+        for ts, counted in self._trace:
+            if ts >= t:
+                if ts <= prev_ts:
+                    return float(counted)
+                return prev_n + (counted - prev_n) * (t - prev_ts) / (ts - prev_ts)
+            prev_ts, prev_n = ts, counted
+        return float(prev_n)
+
     def _steady_mbps(self, start: float, end: float, total: int) -> Optional[float]:
-        """Throughput over the phase minus its ramp-up quarter (None when too short to tell)."""
+        """Throughput over the phase minus its ramp-up quarter (None when too short to tell).
+
+        The window is exactly ``cutoff..end``. It used to begin at the first byte counted *after* the
+        cutoff, so a stall that spanned the cutoff fell out of the window altogether (10 MB, six dead
+        seconds, 10 MB read 80 Mbps instead of 13).
+        """
         elapsed = end - start
         if elapsed <= 0 or self.RAMP_FRACTION <= 0:
             return None
         cutoff = start + self.RAMP_FRACTION * elapsed
-        for ts, counted in self._trace:
-            if ts >= cutoff:
-                if end - ts < self.STEADY_MIN_S or total <= counted:
-                    return None
-                return mbps(total - counted, end - ts)
-        return None
+        if end - cutoff < self.STEADY_MIN_S:
+            return None
+        counted = self._counted_at(start, cutoff)
+        if total <= counted:
+            return None
+        return mbps(int(round(total - counted)), end - cutoff)
+
+    def _longest_gap(self, end: float) -> float:
+        """Longest stretch with nothing counted, from the first counted byte to *end*.
+
+        The time before the first byte (connections, TLS, the first response) is not a stall, and a
+        line that never delivers anything has no figure at all.
+        """
+        gap = 0.0
+        prev: Optional[float] = None
+        for ts, _counted in self._trace:
+            if prev is not None:
+                gap = max(gap, ts - prev)
+            prev = ts
+        if prev is not None:
+            gap = max(gap, end - prev)
+        return gap
 
     def add_request(self) -> None:
         with self._lock:
             self._requests += 1
 
-    def add_error(self) -> None:
+    def add_error(self, detail: Optional[str] = None) -> None:
+        """Count a failed request; *detail* (plain text, no query string) is kept as the last error."""
         with self._lock:
             self._errors += 1
+            if detail:
+                self._last_error = _bounded(str(detail))
 
     def should_stop(self) -> bool:
         """True when no new request should be started."""
@@ -926,6 +1054,7 @@ class TransferPhase:
                 break
             alive[0].join(0.1)
             self._emit()
+        loop_end = self._clock()
         self._stop.set()
         # Bounded wind-down: at most ~1 s in total whatever the connection count.
         join_deadline = time.monotonic() + 1.0
@@ -940,18 +1069,90 @@ class TransferPhase:
             else:
                 nbytes = self._bytes
                 last = self._last_byte_ts
-            end = last if last is not None else self._clock()
+            # The phase ended when it stopped asking for more (its budget or time was reached), or when the
+            # last worker gave up if neither ever was; a byte or ack that landed later (the tail) extends it.
+            # The time budget is only noticed when something looks (the controller polls every 0.1 s while
+            # the workers are stuck), so it is taken as the moment it ran out, not the moment it was seen.
+            phase_end = self._ended_at if self._ended_at is not None else loop_end
+            phase_end = min(phase_end, start + self.duration_s)
+            end = max(last, phase_end) if last is not None else phase_end
+            if last is not None and (not self._trace or self._trace[-1][1] != nbytes):
+                # the trace is thinned to one point per 20 ms: close it with the final count
+                self._trace.append((last, nbytes))
             elapsed = max(0.0, end - start)
             full = mbps(nbytes, elapsed)
             steady = self._steady_mbps(start, end, nbytes) if full is not None else None
+            gap = self._longest_gap(end) if full is not None else 0.0
             stats = PhaseStats(name=self.name, bytes=self._bytes, seconds=elapsed, requests=self._requests,
                                errors=self._errors, aborted=self.cancel.is_set(),
                                mbps=steady if steady is not None else full,
                                acked_bytes=self._acked_bytes, mbps_full=full,
                                rate_limit_hits=self._rate_limit_hits, rate_limited=self._rate_limited,
-                               retry_after_s=self._retry_after, rate_limit_status=self._rate_limit_status)
+                               retry_after_s=self._retry_after, rate_limit_status=self._rate_limit_status,
+                               stall_s=gap, stalled=gap >= self.stall_s, acked=self.acked,
+                               last_error=self._last_error)
         self._emit(1.0)
         return stats
+
+
+# --------------------------------------------------------------------------- the result's note
+
+def phase_note(stats: PhaseStats) -> Optional[str]:
+    """``"download stalled: nothing arrived for 7.6 s of the 8.0 s phase"`` for a stalled phase, else None.
+
+    The figure of such a phase is already the average over the whole phase (a stall reads slow); the note
+    says why, so a technician does not take a Wi-Fi dropout or a flapping modem for a slow plan.
+    """
+    if not stats.stalled or stats.mbps is None:
+        return None
+    what = "nothing was acknowledged" if stats.acked else "nothing arrived"
+    return f"{stats.name} stalled: {what} for {stats.stall_s:.1f} s of the {stats.seconds:.1f} s phase"
+
+
+def upload_not_measured(stats: PhaseStats) -> str:
+    """Why an upload phase has no figure (the note without the :data:`UPLOAD_NOT_MEASURED` prefix).
+
+    Only acknowledged requests count, so a dead upstream, a shaper starving uploads, an upstream too
+    slow to finish one request inside the phase and a server refusing uploads all end here. The last
+    request error tells them apart well enough to word the note: an HTTP 4xx is the server refusing
+    (:data:`UPLOAD_REFUSED`), an HTTP 5xx is the server failing (neither hint), and timeouts or dropped
+    connections with nothing acknowledged point at the line (:data:`UPLOAD_LINE_HINT`).
+    """
+    sent_kb = int(round(stats.bytes / 1000.0))
+    last = stats.last_error or ""
+    if last.startswith("HTTP 4"):
+        why = f": {UPLOAD_REFUSED}, which says nothing about the line"
+    elif last.startswith("HTTP "):
+        why = ""
+    else:
+        why = f": {UPLOAD_LINE_HINT}"
+    if stats.errors and stats.acked_bytes <= 0:
+        text = (f"{stats.errors} upload request{'s' if stats.errors != 1 else ''} failed and nothing was "
+                f"acknowledged ({sent_kb} kB sent){why}")
+    elif stats.errors:
+        text = (f"{stats.errors} upload request error{'s' if stats.errors != 1 else ''} and only "
+                f"{int(round(stats.acked_bytes / 1000.0))} kB acknowledged ({sent_kb} kB sent)"
+                f"{why if why.startswith(': ' + UPLOAD_REFUSED) else ''}")
+    else:
+        text = f"no upload request was acknowledged ({sent_kb} kB sent): {UPLOAD_LINE_HINT}"
+    if stats.last_error:
+        text += f" (last: {stats.last_error})"
+    return text
+
+
+def join_notes(*notes: Optional[str]) -> Optional[str]:
+    """The result's note from its parts (``"; "``-separated), None when there is nothing to say."""
+    parts = [n for n in notes if n]
+    return "; ".join(parts) if parts else None
+
+
+def request_error_text(exc: BaseException) -> str:
+    """A failed request as a short plain phrase for :meth:`TransferPhase.add_error`: an HTTP status and its
+    detail, never the request's path or query (a fast.com URL carries a token)."""
+    if isinstance(exc, HttpError):
+        return f"HTTP {exc.status}" + (f": {exc.detail}" if exc.detail else "")
+    text = str(exc).strip()
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
 
 
 # --------------------------------------------------------------------------- latency

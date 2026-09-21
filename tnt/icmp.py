@@ -37,11 +37,15 @@ Contract gaps filled here (documented as required):
   (never ``ok=False, status=0``, which would read as a success code).
 * ``resolve`` strips surrounding whitespace and ``[]`` brackets and keeps an IPv6 scope
   id (``fe80::1%12``) returned by ``getaddrinfo``.
+* ``resolve`` prefers the A record unless asked otherwise; ``resolve_routable`` (what the ping
+  targets and the link map use) asks ``netinfo.prefers_ipv4()`` first, so an IPv6-only host
+  resolves names to their AAAA and dual-stack / IPv4-only hosts keep the A record.
 """
 from __future__ import annotations
 
 import ctypes
 import functools
+import importlib
 import ipaddress
 import logging
 import socket
@@ -54,7 +58,7 @@ from typing import Any, Dict, List, Optional
 
 log = logging.getLogger(__name__)
 
-__all__ = ["PingResult", "IcmpPinger", "resolve", "STATUS_TEXT", "status_text"]
+__all__ = ["PingResult", "IcmpPinger", "resolve", "resolve_routable", "STATUS_TEXT", "status_text"]
 
 AF_INET = 2
 AF_INET6 = 23
@@ -528,3 +532,27 @@ def resolve(host: str, prefer_ipv4: bool = True, timeout_s: float = 3.0) -> Opti
         if candidates:
             return candidates[0]
     return None
+
+
+def _prefers_ipv4() -> bool:
+    """``tnt.netinfo.prefers_ipv4()``; True (the old answer) when netinfo cannot be asked."""
+    try:
+        fn = getattr(importlib.import_module("tnt.netinfo"), "prefers_ipv4", None)
+        return True if fn is None else bool(fn())
+    except Exception:  # noqa: BLE001 - netinfo missing or broken: keep IPv4 first
+        log.debug("prefers_ipv4 unavailable, keeping IPv4 first", exc_info=True)
+        return True
+
+
+def resolve_routable(host: str, timeout_s: float = 3.0) -> Optional[str]:
+    """:func:`resolve` asking for the address family this machine can actually route.
+
+    IPv4 first, as always, except on an IPv6-only host (``netinfo.prefers_ipv4()`` is False: no
+    usable IPv4 address with an IPv4 gateway, but an IPv6 route), where the AAAA answer comes first.
+    Without this an IPv6-only network (NAT64/DNS64, where every browser works) had each name target
+    pinged at an A record it has no route to: a miss every second and a "full internet outage".
+    The ping targets and the link map's internet probe resolve through here.
+
+    An IP literal is returned unchanged either way: TNT pings the address that was typed.
+    """
+    return resolve(host, prefer_ipv4=_prefers_ipv4(), timeout_s=timeout_s)

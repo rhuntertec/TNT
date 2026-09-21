@@ -209,8 +209,12 @@ def test_nothing_answering_says_so_rather_than_passing(stun):
     assert "blocked" not in found["nat.silent"]["title"].lower()
 
 
-def test_no_translation_at_all_is_recognised(stun):
-    """A PC on a routable address with its own port: nothing is translating, so nothing can mistranslate."""
+def test_no_translation_at_all_is_recognised(stun, monkeypatch):
+    """A PC on a routable address with its own port: nothing is translating, so nothing can mistranslate.
+
+    The PC has to really send from that address: the same port on somebody else's address is a NAT that kept the
+    port, which tests/test_sip_accuracy.py covers."""
+    monkeypatch.setattr(sipnat, "_source_address", lambda host, port: "203.0.113.9")
     checker = StunChecker(timeout_s=1.5)
     probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     probe.bind(("", 0))

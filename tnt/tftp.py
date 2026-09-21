@@ -1914,7 +1914,14 @@ class TftpServer:
                 running, adapter, ips = self._running, self._adapter, [ip for ip, _p in self._listen]
             if not running or adapter is None:
                 return
-            problem = _serving_problem(adapter, ips, _dhcp._get_adapters(self._adapters_fn))
+            pool = _dhcp._get_adapters(self._adapters_fn)
+            if not pool:
+                # An enumeration that failed (or answered with nothing) is no answer, not proof the adapter was
+                # removed: stopping here would record a false reason ("Ethernet is no longer present").  The next
+                # net.changed reads again; the DHCP server makes the same call.
+                log.warning("TFTP server: the adapters could not be read after a network change; still serving")
+                return
+            problem = _serving_problem(adapter, ips, pool)
             if problem is None:
                 return
             log.info("TFTP server is stopping: %s", problem)

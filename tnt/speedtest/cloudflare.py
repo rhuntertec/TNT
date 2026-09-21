@@ -27,7 +27,16 @@ Measurement:
   :data:`UPLOAD_FIRST_BYTES` (128 kB, a cheap rate probe) and are resized so
   each request takes about :data:`UPLOAD_TARGET_S` (2 s), capped at
   :data:`UPLOAD_BODY_BYTES` (4 MB); requests in flight when the budget is
-  reached get :data:`UPLOAD_TAIL_S` to complete and be counted.
+  reached get :data:`UPLOAD_TAIL_S` to complete and be counted. When nothing
+  is acknowledged (a dead upstream, a shaper starving uploads, or one too slow
+  to finish a 128 kB request in the phase) the result stays ``ok`` with the
+  download reading, ``upload_mbps`` is None and the result's note (``error``)
+  starts with ``"upload not measured: "`` and says why; a test with a clean
+  upload has no note.
+* stalls   - a phase whose flows stopped for :data:`~tnt.speedtest.base.STALL_S`
+  (download) or :data:`~tnt.speedtest.base.UPLOAD_STALL_S` (upload) or more
+  is measured over the whole phase, dead time included, and named in the note
+  ("download stalled: nothing arrived for 7.6 s of the 8.0 s phase").
 
 Mbps = bytes * 8 / wall seconds of the phase, ramp-up (TCP/TLS handshakes and
 slow start of every connection) *included* as the contract asks. With the
@@ -101,8 +110,8 @@ from dataclasses import replace
 
 from .base import (
     Cancelled, Http, HttpError, PhaseStats, ProgressFn, RunGuard, SpeedResult, TransferPhase, budgets,
-    check_cancel, failed_result, get_cooldown, measure_latency, next_request_size, rate_limited_result,
-    SOCKET_TIMEOUT_S,
+    check_cancel, failed_result, get_cooldown, join_notes, measure_latency, next_request_size, phase_note,
+    rate_limited_result, request_error_text, upload_not_measured, SOCKET_TIMEOUT_S, UPLOAD_NOT_MEASURED,
 )
 
 log = logging.getLogger(__name__)
@@ -278,17 +287,17 @@ class CloudflareBackend:
                             continue
                         # refused even at the minimum size (or blocked outright): this worker is done
                         phase.note_rate_limit(exc.retry_after, gave_up=True, status=exc.status)
-                        phase.add_error()
+                        phase.add_error(request_error_text(exc))
                         log.info("cloudflare download worker %d: %s at %d-byte chunks; giving up", idx, exc, n)
                         break
-                    phase.add_error()
+                    phase.add_error(request_error_text(exc))
                     failures += 1
                     log.debug("cloudflare download worker %d error: %s", idx, exc)
                     if failures >= 3:
                         break
                     phase.wait(0.25)
                 except (OSError, http.client.HTTPException) as exc:
-                    phase.add_error()
+                    phase.add_error(request_error_text(exc))
                     failures += 1
                     log.debug("cloudflare download worker %d error: %s", idx, exc)
                     if failures >= 3:
@@ -308,7 +317,7 @@ class CloudflareBackend:
                 try:
                     _status, sent, aborted = http_.upload("/__up", n, phase.on_bytes)
                 except HttpError as exc:
-                    phase.add_error()
+                    phase.add_error(request_error_text(exc))
                     if exc.rate_limited:
                         phase.note_rate_limit(exc.retry_after, gave_up=True, status=exc.status)
                         log.info("cloudflare upload worker %d: %s; giving up", idx, exc)
@@ -320,7 +329,7 @@ class CloudflareBackend:
                     phase.wait(0.25)
                     continue
                 except (OSError, http.client.HTTPException) as exc:
-                    phase.add_error()
+                    phase.add_error(request_error_text(exc))
                     failures += 1
                     log.debug("cloudflare upload worker %d error: %s", idx, exc)
                     if failures >= 3:
@@ -412,15 +421,18 @@ class CloudflareBackend:
             check_cancel(guard)
             if ul_stats.rate_limited_phase(b["connections"]):
                 return self._refused(ul_stats, b["connections"], ts, t0, raw, **known)
+            # An upload phase without a figure is not "not measured" in silence: it is the one visible sign of a
+            # dead or very slow upstream (only acknowledged requests count), so the result's note says so.
+            unmeasured: Optional[str] = None
             if ul_stats.mbps is None:
-                log.warning("cloudflare upload phase: no request was acknowledged in time (%d errors, %d bytes "
-                            "sent); recording upload as unknown", ul_stats.errors, ul_stats.bytes)
-                raw["upload"]["error"] = "no upload request completed within the budget"
+                unmeasured = upload_not_measured(ul_stats)
+                log.warning("cloudflare upload phase: %s; recording upload as not measured", unmeasured)
             elif ul_stats.errors and ul_stats.acked_bytes < 0.25 * b["upload_bytes"]:
-                log.warning("cloudflare upload phase unreliable: %d request error(s), only %d bytes acknowledged; "
-                            "recording upload as unknown", ul_stats.errors, ul_stats.acked_bytes)
-                raw["upload"]["error"] = f"{ul_stats.errors} request error(s); too little data acknowledged"
+                unmeasured = upload_not_measured(ul_stats)
+                log.warning("cloudflare upload phase unreliable: %s; recording upload as not measured", unmeasured)
                 ul_stats = replace(ul_stats, mbps=None)
+            if unmeasured:
+                raw["upload"]["error"] = unmeasured
 
             report("done", 1.0)
             return SpeedResult(
@@ -428,7 +440,10 @@ class CloudflareBackend:
                 latency_ms=latency, jitter_ms=jitter,
                 download_mbps=round(dl_stats.mbps, 2),
                 upload_mbps=round(ul_stats.mbps, 2) if ul_stats.mbps is not None else None,
-                packet_loss_pct=None, duration_s=round(time.perf_counter() - t0, 3), error=None, raw=raw,
+                packet_loss_pct=None, duration_s=round(time.perf_counter() - t0, 3),
+                error=join_notes(phase_note(dl_stats),
+                                 f"{UPLOAD_NOT_MEASURED}: {unmeasured}" if unmeasured else phase_note(ul_stats)),
+                raw=raw,
             )
         except Cancelled:
             reason = guard.reason()

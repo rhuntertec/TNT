@@ -15,6 +15,12 @@ share so they are written once:
   another port list (an older build), another protocol or, when a remote scope is asked
   for (``remote_ip="localsubnet"``, the TFTP server), another remote scope ->
   ``delete rule`` + ``add rule``.
+  A rule that matches but is switched off or set to Block lets nothing in, so it is not
+  "present": it is switched back on with ``set rule name=<name> dir=in new enable=yes
+  action=allow`` (idempotent, locale-independent), and replaced when that fails.  The
+  ``Enabled``/``Action`` values are localised too (Ja/Nein, Zulassen/Blockieren), so only
+  an English ``Enabled: Yes`` + ``Action: Allow`` is trusted without the ``set``; an English
+  ``No``/``Block`` is logged as a warning naming the rule.
   ``show rule`` output has *localised* labels, so the program path and the port list are
   recognised by their *shape* (a ``X:\\`` path, a bare comma-separated number list) rather
   than by label, and the remote scope by its value (``LocalSubnet`` is a keyword, not a label).
@@ -142,6 +148,27 @@ def _rule_protocol(output: str) -> Optional[str]:
     return None
 
 
+def _rule_switched_on(output: str) -> Optional[bool]:
+    """Whether ``show rule ... verbose`` output says the rule is enabled and allows: ``True`` for an English
+    ``Enabled: Yes`` and ``Action: Allow`` on every rule listed, ``False`` when an English line says ``No`` or
+    ``Block``, ``None`` when it cannot be told (a localised Windows translates labels and values alike)."""
+    enabled: List[str] = []
+    action: List[str] = []
+    for line in (output or "").splitlines():
+        if ":" not in line:
+            continue
+        label, value = (part.strip().casefold() for part in line.split(":", 1))
+        if label == "enabled":
+            enabled.append(value)
+        elif label == "action":
+            action.append(value)
+    if any(v == "no" for v in enabled) or any(v == "block" for v in action):
+        return False
+    if enabled and action and all(v == "yes" for v in enabled) and all(v == "allow" for v in action):
+        return True
+    return None
+
+
 def _rule_has_value(output: str, wanted: str) -> bool:
     """True when some value in ``show rule ... verbose`` output is exactly *wanted*, case-insensitively
     (``RemoteIP: LocalSubnet`` for ``remoteip=localsubnet``)."""
@@ -181,7 +208,9 @@ def ensure_rule(name: str, exe_path: Optional[str], protocol: str, ports: PortSp
     *ports*) exists for *exe_path* (the running interpreter when ``None``).
 
     ``show rule name=<name> verbose`` first; missing -> ``add rule``; present for another
-    program, port list or protocol -> ``delete rule`` + ``add rule``.  Idempotent; returns
+    program, port list or protocol -> ``delete rule`` + ``add rule``; present but switched off
+    or set to Block (or on a localised Windows, where that cannot be read) -> ``set rule ...
+    new enable=yes action=allow``, and delete + add when that fails.  Idempotent; returns
     ``(ok, error)`` and never raises.
 
     *remote_ip* (a netsh ``remoteip`` value such as ``"localsubnet"``) scopes the rule to those
@@ -212,7 +241,25 @@ def ensure_rule(name: str, exe_path: Optional[str], protocol: str, ports: PortSp
             have_proto = _rule_protocol(out)
             if any(_same_path(p, exe) for p in progs) and set(wanted) <= _rule_ports(out) \
                     and (have_proto is None or have_proto == proto) and (not remote or _rule_has_value(out, remote)):
-                return True, None
+                state = _rule_switched_on(out)
+                if state is True:
+                    return True, None
+                # a disabled or blocking rule lets nothing in (the server would "start" and no device would
+                # get an answer); the values are localised, so when they cannot be read switch it on anyway
+                if state is False:
+                    log.warning("firewall rule '%s' was switched off or set to Block; switching it back on", rule)
+                src, sout = run_netsh(["advfirewall", "firewall", "set", "rule", f"name={rule}", "dir=in", "new",
+                                       "enable=yes", "action=allow"], runner)
+                if src == 0:
+                    return True, None
+                if state is None:
+                    # The state could not be read, so there is no proof the rule is off, and a failed 'set' on a
+                    # rule that exists is nearly always a caller without elevation, which would fail the delete
+                    # and add the same way (or delete it and leave none).  Keep it, as before this check existed.
+                    log.warning("could not make sure the firewall rule '%s' is switched on (%s); keeping it as it is",
+                                rule, _short(sout))
+                    return True, None
+                log.warning("could not switch the firewall rule '%s' on (%s); replacing it", rule, _short(sout))
             if progs or out:
                 # a rule with our name but another program / port list / protocol / remote scope: replace it
                 drc, dout = run_netsh(["advfirewall", "firewall", "delete", "rule", f"name={rule}"], runner)

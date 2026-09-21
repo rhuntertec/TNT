@@ -794,6 +794,17 @@
     const w = shown.find((x) => x.cls === 'red') || shown[0];
     return '<span class="badge ' + w.cls + '" title="Details on the Network info page">' + esc(w.label) + '</span>';
   }
+  /** The Network info tile's address line: the adapter's IPv4/prefix, or - when that address is one the adapter gave
+   *  itself while IPv6 carries the traffic (warning apipa_ipv6: an IPv6-only network), or there is no IPv4 at all -
+   *  its global IPv6 address, because 169.254.x.x is not the address anything is reaching it on. */
+  function nicAddressLine(nic) {
+    const v6works = Array.isArray(nic.warnings) && nic.warnings.indexOf('apipa_ipv6') >= 0;
+    if (nic.ipv6 && (v6works || !nic.ipv4)) {
+      return line('<span class="muted">IPv6</span> <code>' + esc(nic.ipv6) + '</code>', '',
+        v6works ? 'IPv4 is self-assigned (no DHCP server answered); IPv6 carries the traffic' : '');
+    }
+    return line('<span class="muted">IPv4</span> <code>' + esc(api.net.nicCidr(nic) || nic.ipv4 || '—') + '</code>');
+  }
 
   function renderTiles() {
     const st = state.status;
@@ -809,11 +820,11 @@
         // the adapter and its IPv4. The gateway is one line down on the page itself, with the live link map
         // beside it; on a two-line tile it was the least useful of the three.
         html = line('<span class="strong">' + esc(nic.name) + '</span><span class="badge blue" style="--accent:var(--blue)">internet</span>' + warningBadge(nic)) +
-          line('<span class="muted">IPv4</span> <code>' + esc(api.net.nicCidr(nic) || nic.ipv4 || '—') + '</code>');
+          nicAddressLine(nic);
       } else if (local) {
         // no adapter faces the internet: the one that is connected anyway (a bench cable, the DHCP server tool, no DHCP server)
         html = line('<span class="strong">' + esc(local.name) + '</span><span class="badge grey">no internet</span>' + warningBadge(local)) +
-          line('<span class="muted">IPv4</span> <code>' + esc(api.net.nicCidr(local) || local.ipv4 || '—') + '</code>');
+          nicAddressLine(local);
       } else {
         html = line('<span class="strong">No internet adapter</span>') + line((st.netinfo && st.netinfo.adapter_count || 0) + ' adapters found', 'muted');
       }
@@ -1069,7 +1080,11 @@
     /* Faults: the worst level as a badge, then the one line the watcher chose. The badge counts
        rather than names a level, because "2 faults" is what a tech needs off a glance and "bad" is
        not. A clean tile says how long it has been watching, so "no faults" carries its own weight:
-       nothing found in two hours means more than nothing found in ten seconds. */
+       nothing found in two hours means more than nothing found in ten seconds.
+       `reason` set means the last look could not read everything (the ARP table, the counters, the
+       adapters): then "clean" is a claim the tile cannot make, however long it has been watching, so
+       it says "watching" and names what it could not read - on the second line when nothing was
+       found, in the tooltip when a fault leads. */
     if (tileEls.faults) {
       const el = tileEls.faults;
       const f = st && st.faults;
@@ -1079,17 +1094,26 @@
         line(esc((f && f.reason) || 'The fault watch is not running'), 'muted');
       else {
         const bad = f.bad || 0, warn = f.warn || 0;
+        const blind = f.reason ? String(f.reason) : '';
         const badge = bad ? '<span class="badge red">' + fmtNum(bad) + (bad === 1 ? ' fault' : ' faults') + '</span>'
           : warn ? '<span class="badge yellow">' + fmtNum(warn) + ' to check</span>'
-            : f.level === 'good' ? '<span class="badge green">clean</span>'
+            : f.level === 'good' && !blind ? '<span class="badge green">clean</span>'
               : '<span class="badge grey">watching</span>';
         const extra = bad && warn ? ' <span class="muted">+' + fmtNum(warn) + ' to check</span>' : '';
         // a duration, not a clock time: "clean for 2h 14m" is the claim, and how long it has held
-        // is most of what makes it worth anything
-        const watched = f.watched_s ? ' <span class="muted">for ' + esc(fmtDuration(f.watched_s)) + '</span>' : '';
-        html = line(badge + extra + (bad || warn ? '' : watched));
-        html += line('<span class="tile-ellipsis">' + esc(f.headline || '—') + '</span>',
-          bad || warn ? '' : 'muted', f.headline || '');
+        // is most of what makes it worth anything. Clean is timed from when it last turned clean
+        // (clean_s), not from when TNT started watching: the levels follow the last few minutes, so a
+        // fault that cleared a minute ago must not read "clean for 2h".
+        const span = f.level === 'good' && f.clean_s != null ? f.clean_s : f.watched_s;
+        const watched = span ? ' <span class="muted">for ' + esc(fmtDuration(span)) + '</span>' : '';
+        const unread = blind ? 'Could not read ' + blind : '';
+        html = line(badge + extra + (bad || warn || blind ? '' : watched));
+        if (blind && !bad && !warn) {
+          html += line('<span class="tile-ellipsis">' + esc(unread) + '</span>', 'muted', unread);
+        } else {
+          html += line('<span class="tile-ellipsis">' + esc(f.headline || '—') + '</span>',
+            bad || warn ? '' : 'muted', (f.headline || '') + (unread ? ' · ' + unread : ''));
+        }
       }
       if (el.dataset.html !== html) { el.innerHTML = html; el.dataset.html = html; }
     }
@@ -1870,7 +1894,9 @@
     // a full scan's own speed test and Discovery scan are on its progress card: no toasts over it
     ev.on('speedtest.done', (d) => {
       const r = d && d.result;
-      if (r && !fullScan.running()) toast(r.ok ? 'Speed test: ↓ ' + fmtMbps(r.download_mbps) + ' ↑ ' + fmtMbps(r.upload_mbps) + ' Mbps' : 'Speed test failed: ' + (r.error || 'unknown error'), r.ok ? 'ok' : 'warn');
+      // an ok test with a note (an upload nothing acknowledged, a stall) is a warning, not a green success
+      const noted = r && r.ok && r.error;
+      if (r && !fullScan.running()) toast(r.ok ? 'Speed test: ↓ ' + fmtMbps(r.download_mbps) + ' ↑ ' + fmtMbps(r.upload_mbps) + ' Mbps' + (noted ? ' · ' + r.error : '') : 'Speed test failed: ' + (r.error || 'unknown error'), r.ok && !noted ? 'ok' : 'warn');
       if (state.status && state.status.speed) state.status.speed.running = false;
       refreshStatus();
     });

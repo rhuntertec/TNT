@@ -755,7 +755,7 @@ def test_faults_route_needs_the_watcher_then_hands_over_its_view(server, engine)
 
         def tile(self) -> Dict[str, Any]:
             return {"available": True, "reason": None, "level": "good", "bad": 0, "warn": 0,
-                    "headline": "No faults found", "watched_s": 0.5, "ts": 1.0}
+                    "headline": "No faults found", "watched_s": 0.5, "clean_s": 0.0, "ts": 1.0}
 
     engine.faults = FakeWatcher()
     status, data = call_json(server, "GET", "/api/faults")

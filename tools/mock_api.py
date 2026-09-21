@@ -323,10 +323,12 @@ GATEWAY_HOSTS = ("gateway", "default-gateway", "default gateway")
 #: adapters[].warnings messages by code, worded like tnt.netinfo.adapter_warnings
 NET_WARNINGS = {
     "apipa": "Self-assigned address {address}: no DHCP server answered",
+    "apipa_ipv6": "Self-assigned IPv4 address {address}: no DHCP server answered, but IPv6 works (this network may be IPv6-only)",
     "duplicate_address": "{address} is already used by another device on this network",
     "gateway_outside_subnet": "Gateway {gateway} is outside this adapter's subnet {network}: check the IP address and subnet mask",
     "no_dns": "No DNS servers: host names will not resolve",
-    "multiple_default_gateways": "{other} also has a default gateway ({other_gateway}); "
+    # the fakes only ever name another adapter with another gateway address, so it is always the different-router wording
+    "multiple_default_gateways": "{other} also has a default gateway: a different router ({other_gateway}); "
                                  "Windows sends traffic through the one with the lowest metric",
 }
 
@@ -439,19 +441,23 @@ def _tp_order(row: Dict[str, Any]) -> Tuple[int, int, str]:
 #: tnt.faults' shapes; a test asserts these still match the service's.
 FAULT_LEVELS = ("bad", "warn", "info", "good")
 FAULT_FINDING_KEYS = ("id", "level", "title", "detail", "advice", "evidence")
-FAULT_NIC_KEYS = ("name", "description", "index", "link_bps", "watched_s",
+FAULT_NIC_KEYS = ("name", "description", "index", "link_bps", "watched_s", "up", "last_read_s",
                   "rx_errors", "tx_errors", "rx_discards", "tx_discards",
                   "new_rx_errors", "new_tx_errors", "new_rx_discards", "new_tx_discards",
-                  "new_rx_packets", "new_tx_packets", "error_pct", "discard_pct")
+                  "new_rx_packets", "new_tx_packets", "error_pct", "discard_pct",
+                  "window_s", "recent_rx_errors", "recent_tx_errors", "recent_rx_discards", "recent_tx_discards",
+                  "recent_rx_packets", "recent_tx_packets")
+#: tnt.faults.RATE_WINDOW_S: the levels judge this much of the most recent readings
+FAULT_RATE_WINDOW_S = 300.0
 FAULT_VIEW_KEYS = ("ts", "watching_since", "watched_s", "level", "findings", "nics", "arp", "note")
-FAULT_TILE_KEYS = ("available", "reason", "level", "bad", "warn", "headline", "watched_s", "ts")
+FAULT_TILE_KEYS = ("available", "reason", "level", "bad", "warn", "headline", "watched_s", "clean_s", "ts")
 FAULT_MIN_WATCH_S = 60.0
 #: The fake site has one bad patch lead on "Ethernet 2", which is the whole point of the page: a
 #: tech should be able to see what a real fault reads like without breaking a real network.
 FAULT_ERROR_NIC = "Ethernet 2"
 FAULT_ERROR_RATE = 0.9          # damaged frames a second on that adapter
 FAULT_DISCARD_NIC = "Ethernet"
-FAULT_DISCARD_RATE = 2.2
+FAULT_DISCARD_RATE = 2.2        # frames a second it queued to send and dropped (the only discards judged)
 
 
 def _fault_duration(seconds: float) -> str:
@@ -659,8 +665,10 @@ def net_internet_brief(prof: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 def _net_nic_brief(nic: Dict[str, Any]) -> Dict[str, Any]:
     first = nic["ipv4"][0] if nic["ipv4"] else None
+    # tnt.netinfo._global_ipv6: the first IPv6 address that is not link-local (the fakes have no temporaries)
+    v6 = next((e["address"] for e in nic["ipv6"] if not e["address"].lower().startswith("fe80:")), None)
     return {"index": nic["index"], "name": nic["name"], "description": nic["description"], "type_name": nic["type_name"],
-            "ipv4": first["address"] if first else None, "network": first["network"] if first else None,
+            "ipv4": first["address"] if first else None, "network": first["network"] if first else None, "ipv6": v6,
             "gateway": (nic["gateways"] or [None])[0], "mac": nic["mac"], "warnings": [w["code"] for w in nic["warnings"]]}
 
 
@@ -4023,6 +4031,9 @@ class MockState:
         # the passive fault watch: when it started, and the level it last published
         self.faults_since = time.time()
         self.faults_level = "info"
+        # what the fake watch "could not read" (tnt.faults' note, the tile's reason): None, or a
+        # string such as "ARP table: OSError" for a page that has to show a partly blind watch
+        self.faults_reason: Optional[str] = None
         # realtime throughput (Network info): cumulative counters per adapter index, and the samples
         self.tp_totals: Dict[int, Dict[str, int]] = {}
         self.tp_samples: Dict[int, List[List[int]]] = {}
@@ -4539,7 +4550,7 @@ class MockState:
             rows = [r for r in self.speedtests if r["ts"] >= now - days * 86400]
             ok = [r for r in rows if r["ok"]]
             downs = sorted(r["download_mbps"] for r in ok)
-            ups = sorted(r["upload_mbps"] for r in ok)
+            ups = sorted(r["upload_mbps"] for r in ok if r["upload_mbps"] is not None)   # an unmeasured upload has no figure
 
             def median(xs: List[float]) -> Optional[float]:
                 if not xs:
@@ -4551,9 +4562,10 @@ class MockState:
             by_hour = []
             for h in range(24):
                 hs = [r for r in ok if local_hour(r["ts"]) == h]
+                hu = [r["upload_mbps"] for r in hs if r["upload_mbps"] is not None]
                 by_hour.append({"hour": h, "count": len(hs),
                                 "avg_down": round(sum(r["download_mbps"] for r in hs) / len(hs), 1) if hs else None,
-                                "avg_up": round(sum(r["upload_mbps"] for r in hs) / len(hs), 1) if hs else None,
+                                "avg_up": round(sum(hu) / len(hu), 1) if hu else None,
                                 "avg_latency": round(sum(r["latency_ms"] for r in hs) / len(hs), 1) if hs else None})
             by_wd = []
             for wd in range(7):
@@ -7426,32 +7438,47 @@ class MockState:
     def _fault_nics(self, now: float) -> List[Dict[str, Any]]:
         """One row per up adapter: what it has done since the fake watch started."""
         watched = max(0.0, now - self.faults_since)
+        window = min(watched, FAULT_RATE_WINDOW_S)
         rows = []
         for a in self._tp_adapters():
             name = str(a.get("name") or "")
             idx = int(a["index"])
-            tot = self.tp_totals.get(idx) or {"rx_packets": 0, "tx_packets": 0}
             buf = self.tp_samples.get(idx) or []
-            packets = sum(s[3] + s[4] for s in buf)
+            rx_packets, tx_packets = sum(s[3] for s in buf), sum(s[4] for s in buf)
+            recent = [s for s in buf if s[0] >= now - window]
+            recent_rx, recent_tx = sum(s[3] for s in recent), sum(s[4] for s in recent)
             errors = int(watched * FAULT_ERROR_RATE) if name == FAULT_ERROR_NIC else 0
             discards = int(watched * FAULT_DISCARD_RATE) if name == FAULT_DISCARD_NIC else 0
+            # inbound discards, which a healthy PC racks up all day and the service never judges
+            inbound = int(watched * 6.5) if name == FAULT_DISCARD_NIC else 0
             row = {"name": name, "description": a.get("description") or "", "index": idx,
                    "link_bps": a.get("speed_bps"), "watched_s": round(watched, 1),
+                   # every fake adapter is up and was read on the last tick
+                   "up": True, "last_read_s": round(min(watched, 5.0) * 0.4, 1),
                    "rx_errors": errors + 27, "tx_errors": 0,
-                   "rx_discards": discards + 154_426, "tx_discards": 0,
+                   "rx_discards": inbound + 154_426, "tx_discards": discards + 12,
                    "new_rx_errors": errors, "new_tx_errors": 0,
-                   "new_rx_discards": discards, "new_tx_discards": 0,
-                   "new_rx_packets": packets, "new_tx_packets": 0,
-                   "error_pct": None, "discard_pct": None}
-            if packets:
-                row["error_pct"] = 100.0 * errors / packets
-                row["discard_pct"] = 100.0 * discards / packets
+                   "new_rx_discards": inbound, "new_tx_discards": discards,
+                   "new_rx_packets": rx_packets, "new_tx_packets": tx_packets,
+                   "error_pct": None, "discard_pct": None, "window_s": round(window, 1),
+                   "recent_rx_errors": int(window * FAULT_ERROR_RATE) if errors else 0, "recent_tx_errors": 0,
+                   "recent_rx_discards": int(window * 6.5) if inbound else 0,
+                   "recent_tx_discards": int(window * FAULT_DISCARD_RATE) if discards else 0,
+                   "recent_rx_packets": recent_rx, "recent_tx_packets": recent_tx}
+            # tnt.faults: errors of every frame carried (Windows counts the damaged and the dropped
+            # ones apart from the packets), discards of every frame queued to send
+            frames = rx_packets + tx_packets + errors + inbound + discards
+            if frames:
+                row["error_pct"] = 100.0 * errors / frames
+            if tx_packets + discards:
+                row["discard_pct"] = 100.0 * discards / (tx_packets + discards)
             rows.append(row)
         rows.sort(key=lambda r: r["name"])
         return rows
 
     def fault_findings(self, now: float) -> List[Dict[str, Any]]:
-        """What the fake watch has found: one bad lead, and congestion on the internet NIC."""
+        """What the fake watch has found: one bad lead, and congestion on the way out of the internet NIC,
+        both judged on the recent window like the service (FAULT_RATE_WINDOW_S)."""
         watched = max(0.0, now - self.faults_since)
         nics = self._fault_nics(now)
         out: List[Dict[str, Any]] = []
@@ -7461,38 +7488,52 @@ class MockState:
                                f"before they mean anything, and TNT has been here {int(watched)} seconds.",
                      "advice": "Nothing to do. This checks itself, from the moment the service starts.",
                      "evidence": None}]
+        span = (f"in the {_fault_duration(watched)} since TNT started watching" if watched <= FAULT_RATE_WINDOW_S
+                else f"in the last {_fault_duration(FAULT_RATE_WINDOW_S)}")
         # the service needs FAULT_MIN_PACKETS before it will judge a ratio; without any traffic
         # there is no percentage to quote, and no finding to make
-        bad = next((n for n in nics if n["new_rx_errors"] and n["error_pct"]), None)
+        frames = {n["name"]: n["recent_rx_packets"] + n["recent_tx_packets"] + n["recent_rx_errors"]
+                  + n["recent_rx_discards"] + n["recent_tx_discards"] for n in nics}
+        bad = next((n for n in nics if n["recent_rx_errors"] and frames[n["name"]]), None)
         if bad:
+            pct = 100.0 * bad["recent_rx_errors"] / frames[bad["name"]]
             out.append({"id": "fault.errors", "level": "bad",
                         "title": f"{bad['name']} is seeing frame errors",
-                        "detail": f"{bad['new_rx_errors']:,} arriving damaged out of "
-                                  f"{bad['new_rx_packets']:,} frames in the {_fault_duration(watched)} since "
-                                  f"TNT started watching - {bad['error_pct']:.3g}% of them. These are frames the "
-                                  "adapter received damaged, not frames dropped because the link was busy.",
+                        "detail": f"{bad['recent_rx_errors']:,} arriving damaged out of {frames[bad['name']]:,} "
+                                  f"frames {span} - {pct:.3g}% of them. These are frames the adapter received "
+                                  "damaged, not frames dropped because the link was busy.",
                         "advice": "On a switched link this should be flat zero. Re-seat both ends of the cable "
                                   "and try a known good patch lead first; if it stays, suspect the run itself, "
                                   "the socket, or a duplex mismatch with the switch port.",
-                        "evidence": [{"name": bad["name"], "rx_errors": bad["new_rx_errors"],
-                                      "tx_errors": 0, "pct": round(bad["error_pct"], 4)}]})
-        busy = next((n for n in nics if n["new_rx_discards"] and (n["discard_pct"] or 0) >= 0.5), None)
+                        "evidence": [{"name": bad["name"], "rx_errors": bad["recent_rx_errors"],
+                                      "tx_errors": 0, "pct": round(pct, 4), "level": "bad"}]})
+        queued = {n["name"]: n["recent_tx_packets"] + n["recent_tx_discards"] for n in nics}
+        busy = next((n for n in nics if n["recent_tx_discards"] and queued[n["name"]]
+                     and 100.0 * n["recent_tx_discards"] / queued[n["name"]] >= 0.5), None)
         if busy:
-            out.append({"id": "fault.discards", "level": "warn",
-                        "title": f"{busy['name']} is dropping frames it had no room for",
-                        "detail": f"{busy['new_rx_discards']:,} frames discarded out of "
-                                  f"{busy['new_rx_packets']:,} - {busy['discard_pct']:.3g}%. Nothing here is "
-                                  "damaged: these arrived intact and were dropped because there was nowhere "
-                                  "to put them.",
-                        "advice": "This is congestion, not a fault in the cable. Check what is saturating the "
-                                  "link on the Realtime throughput card.",
-                        "evidence": [{"name": busy["name"], "rx_discards": busy["new_rx_discards"],
-                                      "tx_discards": 0, "pct": round(busy["discard_pct"], 4)}]})
+            pct = 100.0 * busy["recent_tx_discards"] / queued[busy["name"]]
+            level = "bad" if pct >= 5.0 else "warn"
+            out.append({"id": "fault.discards", "level": level,
+                        "title": f"{busy['name']} is dropping frames it could not send",
+                        "detail": f"{busy['recent_tx_discards']:,} of the {queued[busy['name']]:,} frames this "
+                                  f"PC queued to send {span} were discarded before they left - {pct:.3g}%. Nothing "
+                                  "here is damaged: the adapter's send queue was full, or the link went down while "
+                                  "they waited in it.",
+                        "advice": "This is congestion on the way out, not a fault in the cable. Check what is "
+                                  "saturating the link on the Realtime throughput card.",
+                        "evidence": [{"name": busy["name"], "tx_discards": busy["recent_tx_discards"],
+                                      "tx_packets": busy["recent_tx_packets"], "pct": round(pct, 4),
+                                      "level": level}]})
+        if not out and self.faults_reason:
+            out.append({"id": "fault.clean", "level": "info", "title": "No faults found in what could be read",
+                        "detail": f"The rest could not be read on the last look ({self.faults_reason}), so it "
+                                  "was not checked.",
+                        "advice": "The service log says which call failed.", "evidence": None})
         if not out:
             out.append({"id": "fault.clean", "level": "good", "title": "No faults found",
                         "detail": f"In the {_fault_duration(watched)} TNT has been watching: no frame errors, "
-                                  "no congestion drops, every adapter addressed properly, and no address "
-                                  "answered by two devices.",
+                                  "no frames dropped on the way out, every adapter addressed properly, and no "
+                                  "address answered by two devices.",
                         "advice": "Nothing to do.", "evidence": None})
         return out
 
@@ -7507,18 +7548,21 @@ class MockState:
                     "nics": self._fault_nics(now),
                     "arp": {"tracked": 23, "conflicts": [], "window_s": 120.0,
                             "gateway": net_profile(self.net_profile)["default_gateway"]},
-                    "note": None}
+                    "note": self.faults_reason}
 
     def faults_tile(self) -> Dict[str, Any]:
         """status.faults (tnt.faults.FaultWatcher.tile)."""
         now = time.time()
         with self.lock:
             findings = self.fault_findings(now)
-        return {"available": True, "reason": None, "level": _fault_worst(findings),
+        level = _fault_worst(findings)
+        watched = round(max(0.0, now - self.faults_since), 1)
+        return {"available": True, "reason": self.faults_reason, "level": level,
                 "bad": sum(1 for f in findings if f["level"] == "bad"),
                 "warn": sum(1 for f in findings if f["level"] == "warn"),
                 "headline": findings[0]["title"] if findings else "No faults found",
-                "watched_s": round(max(0.0, now - self.faults_since), 1), "ts": now}
+                # the fake watch is either clean from the start or not clean at all
+                "watched_s": watched, "clean_s": watched if level == "good" else None, "ts": now}
 
     def faults_tick(self) -> None:
         """Publish faults.state when the level changes, exactly as the service does."""

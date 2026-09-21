@@ -44,7 +44,8 @@ Contract gaps and small additions (documented as required by the contract):
 * ``validate_host`` canonicalises IP literals (``2606:4700:4700:0:0:0:0:1111`` →
   ``2606:4700:4700::1111``) so the same address spelled differently is one target.
 * ``PingManager.__init__`` accepts an optional ``resolver`` callable
-  (``host -> ip | None``) so tests can script DNS; the default is ``tnt.icmp.resolve``.
+  (``host -> ip | None``) so tests can script DNS; the default is ``tnt.icmp.resolve_routable``
+  (IPv4 first, IPv6 first only on an IPv6-only host - ``netinfo.prefers_ipv4()``).
   ``pinger`` and ``raw_log`` are created lazily (``tnt.icmp.IcmpPinger`` /
   ``RawPingLog(paths.ping_logs_dir())``) when not injected. The instances are exposed
   as ``.pinger`` and ``.raw_log`` (the Engine needs ``raw_log.trim`` for retention).
@@ -133,6 +134,8 @@ _STOP_TOTAL_S = 3.5             # overall budget for stop() (joins + flush + raw
 _ERR_LOG_EVERY_S = 60.0         # repeated failures of the same kind are logged this often at most
 _LABEL_MAX = 80                 # longest target label accepted from the API
 _ALIAS_MISS_RECHECK_S = 2.0     # a missed gateway echo makes the alias look the gateway up again this soon
+_STALE_ECHO_S = 10.0            # a ping call this far past its timeout was out while the machine slept: dropped
+_STALE_ECHO_DROP = 2            # ... this many in a row at most; after that the calls are slow every time: recorded
 NETWORK_CHANGED_NOTE = "network changed"
 _STALE = object()               # a lookup a network change overtook
 
@@ -702,6 +705,8 @@ class _TargetState:
         self.consecutive_missed = 0
         self.consecutive_ok = 0
         self.in_outage = False
+        self.stale_calls = 0            # ping() calls in a row that outlived their timeout by far (_STALE_ECHO_S)
+        self.stale_log = _Throttle()    # "slow every time" is logged once, then every _ERR_LOG_EVERY_S at most
         self.since_ts = now
         self.minute: Optional[_MinuteAgg] = None
         self.day_cache: Optional[Dict[str, Any]] = None
@@ -801,11 +806,13 @@ class PingManager:
     def __init__(self, db: Any, config: Any, bus: Any, pinger: Any = None, raw_log: Optional[RawPingLog] = None,
                  clock: Callable[[], float] = time.time, sleep: Callable[[float], None] = time.sleep,
                  resolver: Optional[Callable[[str], Optional[str]]] = None,
-                 network_fn: Optional[Callable[[], Optional[int]]] = None) -> None:
+                 network_fn: Optional[Callable[[], Optional[int]]] = None, *,
+                 monotonic: Callable[[], float] = time.monotonic) -> None:
         self._db = db
         self._config = config
         self._bus = bus
         self._clock = clock
+        self._monotonic = monotonic             # times a ping() call alongside ``clock`` (it counts the time asleep)
         self._sleep = sleep
         self._resolver = resolver
         self._network_fn = network_fn           # the current network id (tnt.networks); None: minutes are not tagged
@@ -1040,8 +1047,9 @@ class PingManager:
             self._close_pinger()
 
     def tick(self, target_id: int) -> Optional[Sample]:
-        """Run one worker iteration for *target_id* synchronously (None if paused/unknown, and for
-        the ``gateway`` alias while this machine has no default gateway)."""
+        """Run one worker iteration for *target_id* synchronously (None if paused/unknown, for the
+        ``gateway`` alias while this machine has no default gateway, and for an echo that was out
+        while the machine slept, see ``_STALE_ECHO_S`` and ``_STALE_ECHO_DROP``)."""
         st = self._state(target_id)
         if st is None:
             return None
@@ -1063,6 +1071,7 @@ class PingManager:
         if ip is None or self.pinger is None:
             sample = Sample(ts=now, ok=False, rtt_ms=None)
         else:
+            sent, sent_mono = float(self._clock()), float(self._monotonic())
             try:
                 res = self.pinger.ping(ip, size, timeout_ms, ttl)
                 ok = bool(getattr(res, "ok", False))
@@ -1073,6 +1082,36 @@ class PingManager:
             except Exception:  # noqa: BLE001
                 log.exception("ping(%s) raised", ip)
                 sample = Sample(ts=now, ok=False, rtt_ms=None)
+            returned = float(self._clock())
+            # Timed on both clocks, and either one showing the overrun counts: the monotonic clock
+            # (GetTickCount64, which counts the time asleep) still sees a sleep across which w32time set the
+            # wall clock back, and a wall clock set forward mid-call costs that one sample and no more.
+            took = max(returned - sent, float(self._monotonic()) - sent_mono)
+            if took <= timeout_ms / 1000.0 + _STALE_ECHO_S:
+                if st.stale_calls:
+                    st.stale_calls = 0
+                    st.stale_log.reset()
+            else:
+                st.stale_calls += 1
+                if st.stale_calls <= _STALE_ECHO_DROP:
+                    # The call outlived its own timeout by far: the machine slept (or TNT was frozen) while the
+                    # echo was out, and IcmpSendEcho2 returned after the wake.  Its "timed out" is about the
+                    # sleep, not the network, and it is stamped with the moment it was sent, before the sleep:
+                    # recorded, it would be a miss the ping card and the outage tracker date to before the lid
+                    # closed.  Nothing is recorded for it; the next tick measures the network the machine woke on.
+                    log.info("dropping the echo to %s: it came back %.0f s after it was sent, past its %d ms timeout "
+                             "(the machine slept or the service was frozen while it was out)", st.host, took, timeout_ms)
+                    return None
+                # More in a row than a sleep leaves (one per target, two when the machine woke only for a
+                # moment and slept again): the calls are slow every time - a wedged ICMP or filter driver, a VPN
+                # client holding IcmpSendEcho2, a starved process.  Dropping them all would leave the card on its
+                # last reading and no outage could ever open, so they are recorded as they came back, dated when
+                # the call returned rather than when it was sent, which can never be before a sleep inside it.
+                if st.stale_log.should_log():
+                    log.warning("ping calls to %s keep taking %.0f s against a %d ms timeout, %d in a row: "
+                                "recording them as they come back (logged every %.0f s at most)",
+                                st.host, took, timeout_ms, st.stale_calls, _ERR_LOG_EVERY_S)
+                sample = Sample(ts=returned, ok=sample.ok, rtt_ms=sample.rtt_ms)
         self._record(st, sample, size)
         return sample
 
@@ -1135,7 +1174,9 @@ class PingManager:
         resolver = self._resolver
         if resolver is None:
             try:
-                resolver = importlib.import_module("tnt.icmp").resolve
+                # the family this host can route: an IPv6-only network gets the AAAA, not an A record
+                # it would miss every second (a false "full internet outage")
+                resolver = importlib.import_module("tnt.icmp").resolve_routable
             except Exception as exc:  # noqa: BLE001
                 return None, f"resolver unavailable: {exc}"
         try:

@@ -44,7 +44,11 @@ Readers
   each EPB/PB) and seeks past the bodies, so memory stays constant (the packet capture file list).
 * :func:`iter_packets_with_offsets` yields ``(block offset, PACKET)``, which is how the live capture indexes a file it
   opened, and :func:`read_packet_at` reads one packet back from such an offset (None for anything that is not a packet
-  block there, never an error).
+  block there, never an error). A file may hold several interfaces (Wireshark's "all interfaces", a mergecap) and
+  several sections, so the packet is read with the byte order, link type and timestamp resolution of *its own*
+  section and interface: the block headers before it are walked once (bodies skipped, IDBs read) and that interface
+  table is remembered per file, resuming where it stopped for a file that grows. Only a file whose blocks before the
+  packet cannot be walked falls back to the caller's byte order / link type / resolution for interface 0.
 
 Writing
 -------
@@ -88,9 +92,12 @@ A subframe length under 8 or a missing SNAP fails the conversion; later subframe
 """
 from __future__ import annotations
 
+import bisect
 import io
 import os
 import struct
+import threading
+from collections import OrderedDict
 from typing import Any, BinaryIO, Dict, Iterator, List, Optional, Tuple, Union
 
 __all__ = ["PcapngError", "MAX_BLOCK", "MAX_IN_MEMORY", "PACKET_KEYS", "REWRITE_KEYS", "KNOWN_ETHERTYPES",
@@ -394,33 +401,122 @@ def iter_packets_with_offsets(fileobj: BinaryIO, *, max_packets: Optional[int] =
         offset += len(body) + 12
 
 
+class _FileSections:
+    """What :func:`read_packet_at` learnt walking one file: its sections ``[(start offset, _Section)]`` in file order
+    and the offset of the first block it has not walked yet, so a later packet (a file that grows) resumes there."""
+
+    __slots__ = ("ident", "starts", "sections", "next_offset")
+
+    def __init__(self, ident: Tuple[Any, ...]) -> None:
+        self.ident = ident
+        self.starts: List[int] = []
+        self.sections: List[_Section] = []
+        self.next_offset = 0
+
+    def walk_to(self, fileobj: BinaryIO, offset: int) -> None:
+        """Walk the block headers from :attr:`next_offset` through the block that starts at or before *offset*: an SHB
+        opens a section, an IDB extends its interface table, every other body is skipped.  Raises PcapngError."""
+        pos = self.next_offset
+        endian = self.sections[-1].endian if self.sections else None
+        fileobj.seek(pos)
+        while pos <= offset:
+            header = _read_header(fileobj, endian, pos)
+            if header is None:
+                return
+            endian, block_type, length, magic = header
+            if block_type == BLOCK_SHB:
+                self.starts.append(pos)
+                self.sections.append(_Section(endian))
+                fileobj.seek(pos + length)
+            elif block_type == BLOCK_IDB:
+                rest = _read_exact(fileobj, length - 8)
+                if len(rest) < length - 8:
+                    return                  # a block still being written: walked no further
+                _check_trailer(endian, rest[-4:], length, pos)
+                self.sections[-1].add_interface(rest[:-4])
+            else:
+                fileobj.seek(pos + length)
+            pos += length
+            self.next_offset = pos
+
+    def section_at(self, offset: int) -> Optional[_Section]:
+        i = bisect.bisect_right(self.starts, offset) - 1
+        return self.sections[i] if i >= 0 else None
+
+
+#: The walked files, most recent last (a handful: the capture page reads from one file at a time).
+_SECTIONS: "OrderedDict[str, _FileSections]" = OrderedDict()
+_SECTIONS_MAX = 8
+_SECTIONS_LOCK = threading.Lock()
+_WALK_BUFFER = 1 << 16
+
+
+def _file_ident(st: os.stat_result) -> Tuple[Any, ...]:
+    """A file's identity: another file written to the same path is walked afresh."""
+    born = getattr(st, "st_birthtime_ns", None) or st.st_ctime_ns
+    return (st.st_dev, st.st_ino, born)
+
+
+def _section_for(path: PathLike, offset: int) -> Optional[_Section]:
+    """The section (byte order + interface table) that holds the block at *offset*, or None when the blocks before it
+    cannot be walked (not a pcapng, a damaged block)."""
+    try:
+        key = os.path.normcase(os.path.abspath(os.fspath(path)))
+        st = os.stat(key)
+    except (OSError, TypeError, ValueError):
+        return None
+    ident = _file_ident(st)
+    with _SECTIONS_LOCK:
+        known = _SECTIONS.get(key)
+        if known is None or known.ident != ident or st.st_size < known.next_offset:
+            known = _FileSections(ident)
+            _SECTIONS[key] = known
+        _SECTIONS.move_to_end(key)
+        while len(_SECTIONS) > _SECTIONS_MAX:
+            _SECTIONS.popitem(last=False)
+        if known.next_offset <= offset:
+            try:
+                with open(key, "rb", buffering=_WALK_BUFFER) as fileobj:
+                    known.walk_to(fileobj, offset)
+            except (OSError, PcapngError, struct.error):
+                _SECTIONS.pop(key, None)
+                return None
+        return known.section_at(offset)
+
+
 def read_packet_at(path: PathLike, offset: int, *, endian: str = "<", linktype: int = LINKTYPE_ETHERNET,
                    ts_divisor: int = DEFAULT_TS_DIVISOR) -> Optional[Dict[str, Any]]:
     """The PACKET at *offset* of a pcapng file, or None when there is no packet block there.
 
-    The section's byte order, link type and timestamp resolution are the caller's (it indexed the file with
-    :func:`iter_packets_with_offsets`), so one packet is read without walking the file again.  A block that is not an
-    EPB, SPB or PB, or one that does not read back, gives None rather than an error."""
+    The packet is read with its own section's byte order and its own interface's link type and timestamp resolution
+    (the file's SHBs and IDBs, walked once and remembered: see the module docstring), so a packet on the second
+    interface of an "all interfaces" capture, in a big-endian file or in a nanosecond one reads back exactly as
+    :func:`iter_packets_with_offsets` indexed it.  *endian*, *linktype* and *ts_divisor* are used only when the blocks
+    before the packet cannot be walked, and then for interface 0.  A block that is not an EPB, SPB or PB, or one that
+    does not read back, gives None rather than an error."""
     if offset < 0:
         return None
+    section = _section_for(path, offset)
+    if section is None:
+        section = _Section(endian)
+        section.interfaces.append((linktype, 0, ts_divisor))
     try:
         with open(path, "rb") as fileobj:
             fileobj.seek(offset)
             head = _read_exact(fileobj, 8)
             if len(head) < 8:
                 return None
-            block_type, length = struct.unpack(endian + "II", head)
+            block_type, length = struct.unpack(section.endian + "II", head)
             if block_type not in PACKET_BLOCKS or length < _MIN_LENGTH.get(block_type, 12) or length > MAX_BLOCK:
                 return None
-            body = _read_exact(fileobj, length - 12)
-            if len(body) < length - 12:
+            rest = _read_exact(fileobj, length - 8)
+            if len(rest) < length - 8:
                 return None
     except OSError:
         return None
-    section = _Section(endian)
-    section.interfaces.append((linktype, 0, ts_divisor))
     try:
-        return section.packet(block_type, body, offset)
+        _check_trailer(section.endian, rest[-4:], length, offset)
+        return section.packet(block_type, rest[:-4], offset)
     except (PcapngError, struct.error):
         return None
 

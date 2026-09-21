@@ -56,6 +56,20 @@ Scheduler behaviour
 * a backwards jump of the wall clock (NTP correction, manual change) shifts
   ``next_run_ts`` by the same amount instead of postponing the next test by
   the size of the jump; a forward jump simply runs the test at once.
+* after a sleep/resume the next test is held off ``RESUME_HOLDOFF_S`` (60 s),
+  because the NIC is often still re-associating and DNS does not answer yet.
+  The scheduler sees the resume on its own thread: a poll whose wait took more
+  than ``SLEEP_GAP_S`` longer than asked on the *monotonic* clock (``monotonic``,
+  injectable; ``time.monotonic`` is ``GetTickCount64`` on Windows, which counts
+  the time asleep, and a test pins that) means this thread did not run.  The
+  stamp is taken after the poll's own work, so a scheduled test run on this
+  thread is never taken for a sleep.  The Engine's ``monitoring.gap`` event
+  holds the test off too, but it comes from the maintenance thread, which
+  waits up to 5 s and writes to the database first: on its own it usually
+  arrived after the overdue test had started ("Speed test failed: gaierror"
+  after most resumes).  A wall clock set forward while the machine is awake,
+  or a poll a few seconds late on a loaded machine, is not a resume and still
+  runs the test at once.
 * :meth:`run_now` starts a manual run on its own thread and returns True, or
   False when a run (manual or scheduled) is already in progress. Manual runs
   ignore ``enabled``/``internet_down`` (the user asked) and, when finished,
@@ -286,6 +300,11 @@ class SpeedScheduler:
     STOP_JOIN_S = 5.0
     #: A clock reading this much earlier than the previous one counts as a clock jump.
     CLOCK_JUMP_S = 60.0
+    #: A poll that comes round this much later than its wait, on the monotonic clock, means this thread
+    #: did not run: the machine slept or hibernated (``time.monotonic`` is ``GetTickCount64`` on
+    #: Windows, which counts the time asleep), or the process was frozen.  The next test is then held
+    #: off RESUME_HOLDOFF_S.
+    SLEEP_GAP_S = 10.0
     #: Rate-limited outcomes within this window trigger the adaptive spacing ...
     RATE_LIMIT_WINDOW_S = 3600.0
     #: ... which never spaces tests further apart than this (or the configured interval).
@@ -299,11 +318,13 @@ class SpeedScheduler:
     def __init__(self, db: Any, config: Any, bus: Any, clock: Callable[[], float] = time.time,
                  internet_down: Optional[Callable[[], bool]] = None, poll_s: float = 1.0,
                  network_fn: Optional[Callable[[], Optional[int]]] = None, *, pinger: Any = None,
-                 quality_target: str = QUALITY_TARGET, baseline_s: float = 3.0) -> None:
+                 quality_target: str = QUALITY_TARGET, baseline_s: float = 3.0,
+                 monotonic: Callable[[], float] = time.monotonic) -> None:
         self._db = db
         self._config = config
         self._bus = bus
         self._clock = clock
+        self._monotonic = monotonic         # how long a poll's wait really took (a sleep shows here)
         self._internet_down = internet_down
         self._network_fn = network_fn       # the current network id (tnt.networks); None: results are not tagged
         self._pinger = pinger               # the engine's IcmpPinger; None: no latency-under-load probe
@@ -321,6 +342,7 @@ class SpeedScheduler:
         self._cancel: Optional[threading.Event] = None
         self._next_run_ts: Optional[float] = None
         self._last_seen_now: Optional[float] = None
+        self._last_wait: Optional[Tuple[float, float]] = None   # (monotonic time a poll's wait began, its length)
         self._last_result: Optional[Dict[str, Any]] = None
         self._progress: Dict[str, Any] = dict(self.IDLE_PROGRESS)
         self._internet_outage = False      # a total_internet outage is open (from the bus)
@@ -337,6 +359,7 @@ class SpeedScheduler:
             now = float(self._clock())
             self._next_run_ts = now + self.FIRST_RUN_DELAY_S
             self._last_seen_now = now
+            self._last_wait = None
             if self._last_result is None:
                 self._last_result = self._load_last()
             self._subscribe()
@@ -519,9 +542,10 @@ class SpeedScheduler:
     # -- scheduler loop -------------------------------------------------------
     def _loop(self) -> None:
         while not self._stop.is_set():
+            wait = self._poll_s
             try:
-                now = float(self._clock())
                 with self._lock:
+                    now = float(self._clock())
                     prev = self._last_seen_now
                     self._last_seen_now = now
                     if prev is not None and now < prev - self.CLOCK_JUMP_S and self._next_run_ts is not None:
@@ -530,14 +554,41 @@ class SpeedScheduler:
                         log.warning("clock went back %.0f s; next speed test moved from %.0f to %.0f",
                                     prev - now, self._next_run_ts, shifted)
                         self._next_run_ts = shifted
+                    self._hold_off_after_a_sleep(now)
                     nxt = self._next_run_ts
                 if nxt is not None and now >= nxt:
                     self._tick(now)
             except Exception:  # noqa: BLE001 - the scheduler must never die
                 log.exception("speed scheduler loop error")
-                self._stop.wait(5.0)
-                continue
-            self._stop.wait(self._poll_s)
+                wait = 5.0
+            with self._lock:
+                # taken after this poll's own work: a scheduled test run on this thread is not a sleep
+                self._last_wait = (float(self._monotonic()), wait)
+            self._stop.wait(wait)
+
+    def _hold_off_after_a_sleep(self, now: float) -> None:
+        """Hold the next test off when the last wait took far longer than asked.  Called under the lock.
+
+        That wait is where this thread was when the machine slept: on resume the next test is often long
+        overdue while the NIC is still re-associating and DNS does not answer yet, and running it at once
+        is "Speed test failed: gaierror" and, in time, an "N tests failed" pattern on a network that is
+        fine.  ``monitoring.gap`` does the same from the Engine's maintenance thread, but that thread waits
+        up to 5 s and writes to the database before it publishes, so this one usually woke first and the
+        test had already started.  Seen here, on this thread, the resume cannot lose that race.  Only the
+        monotonic clock can tell: a wall clock set forward while the machine is awake is time that really
+        is up, and the overdue test runs at once as it always has.
+        """
+        last = self._last_wait
+        if last is None or self._next_run_ts is None:
+            return
+        slept = float(self._monotonic()) - last[0] - last[1]
+        if slept <= self.SLEEP_GAP_S:
+            return
+        held = now + self.RESUME_HOLDOFF_S
+        if self._next_run_ts < held:
+            self._next_run_ts = held
+            log.info("speed scheduler: this thread was stopped for %.0f s (sleep/resume); next speed test held off "
+                     "for %.0f s", slept, self.RESUME_HOLDOFF_S)
 
     def _tick(self, now: float) -> None:
         with self._lock:

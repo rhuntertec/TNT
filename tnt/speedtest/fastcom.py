@@ -26,7 +26,11 @@ Measurement:
   As with Cloudflare only server-acknowledged bytes count (see
   :mod:`tnt.speedtest.base`) and bodies are sized adaptively (128 kB first,
   ~2 s per request, 4 MB max). If no upload request completes ``upload_mbps``
-  is ``None`` and the result stays ``ok`` (the contract asks for this).
+  is ``None`` and the result stays ``ok`` (the contract asks for this), with a
+  note in ``error`` that starts with ``"upload not measured: "`` and says why
+  (nothing acknowledged, or the requests failed and how), so it is never
+  mistaken for a test that did not try. A stalled phase is measured over the
+  whole phase and named in the note, as for Cloudflare.
 
 Requests per run: 1 API call + 9 latency GETs, then with the default budgets
 (50 MB / 20 MB, 8 s, 4 connections) a handful of download ranges (25 MB each,
@@ -44,7 +48,9 @@ its range on 429 before giving up, and when every worker of a phase gave up
 (:func:`tnt.speedtest.base.set_cooldown`) so :meth:`FastComBackend.available`
 reports it and the scheduler uses Cloudflare meanwhile. A 403 on the *upload*
 POSTs alone is *not* a rate limit: it is an OCA that does not accept uploads,
-so the upload is recorded as unknown and the download reading is kept.
+so the upload is recorded as not measured (``upload_mbps`` None, an
+``"upload not measured: ..."`` note naming the refusal) and the download
+reading is kept.
 
 The whole run is bounded by ``speedtest.timeout_s`` via
 :class:`~tnt.speedtest.base.RunGuard`.
@@ -69,8 +75,8 @@ from urllib.parse import urlsplit
 
 from .base import (
     Cancelled, Http, HttpError, PhaseStats, ProgressFn, RunGuard, SpeedResult, TransferPhase, budgets,
-    check_cancel, failed_result, get_cooldown, measure_latency, next_request_size, rate_limited_result,
-    SOCKET_TIMEOUT_S,
+    check_cancel, failed_result, get_cooldown, join_notes, measure_latency, next_request_size, phase_note,
+    rate_limited_result, request_error_text, upload_not_measured, SOCKET_TIMEOUT_S, UPLOAD_NOT_MEASURED,
 )
 
 log = logging.getLogger(__name__)
@@ -205,17 +211,17 @@ class FastComBackend:
                                 phase.wait(0.2)
                                 continue
                             phase.note_rate_limit(exc.retry_after, gave_up=True, status=exc.status)
-                            phase.add_error()
+                            phase.add_error(request_error_text(exc))
                             log.info("fast.com download worker %d (%s): %s; giving up", idx, target["host"], exc)
                             break
-                        phase.add_error()
+                        phase.add_error(request_error_text(exc))
                         failures += 1
                         log.debug("fast.com download worker %d (%s) error: %s", idx, target["host"], exc)
                         if failures >= 3:
                             break
                         phase.wait(0.25)
                     except (OSError, http.client.HTTPException) as exc:
-                        phase.add_error()
+                        phase.add_error(request_error_text(exc))
                         failures += 1
                         log.debug("fast.com download worker %d (%s) error: %s", idx, target["host"], exc)
                         if failures >= 3:
@@ -238,9 +244,9 @@ class FastComBackend:
                     try:
                         _status, sent, aborted = http_.upload(range_path(target["url"], 0, n - 1), n, phase.on_bytes)
                     except HttpError as exc:
-                        phase.add_error()
+                        phase.add_error(request_error_text(exc))
                         if exc.status == RATE_LIMIT_STATUS:
-                            # a 403 here is an OCA refusing uploads (upload -> unknown), not a rate limit
+                            # a 403 here is an OCA refusing uploads (upload -> not measured), not a rate limit
                             phase.note_rate_limit(exc.retry_after, gave_up=True, status=exc.status)
                             log.info("fast.com upload worker %d (%s): %s; giving up", idx, target["host"], exc)
                             break
@@ -251,7 +257,7 @@ class FastComBackend:
                         phase.wait(0.25)
                         continue
                     except (OSError, http.client.HTTPException) as exc:
-                        phase.add_error()
+                        phase.add_error(request_error_text(exc))
                         failures += 1
                         log.debug("fast.com upload worker %d (%s) error: %s", idx, target["host"], exc)
                         if failures >= 3:
@@ -332,6 +338,8 @@ class FastComBackend:
                                      time.perf_counter() - t0, raw, **known)
 
             upload_mbps: Optional[float] = None
+            unmeasured: Optional[str] = None
+            ul_note: Optional[str] = None
             try:
                 ul = TransferPhase("upload", b["duration_s"], b["upload_bytes"], cancel=guard, progress=report,
                                    acked=True, tail_s=UPLOAD_TAIL_S)
@@ -344,15 +352,17 @@ class FastComBackend:
                 # supported" signature) can never become a number.
                 if ul_stats.mbps is not None:
                     upload_mbps = round(ul_stats.mbps, 2)
+                    ul_note = phase_note(ul_stats)
                 else:
-                    raw["upload"]["error"] = "upload not supported or no request completed within the budget"
-                    log.info("fast.com upload unavailable (%d errors, %d bytes sent); recording upload as unknown",
-                             ul_stats.errors, ul_stats.bytes)
+                    unmeasured = upload_not_measured(ul_stats)
+                    raw["upload"]["error"] = unmeasured
+                    log.info("fast.com upload not measured: %s", unmeasured)
             except Cancelled:
                 raise
             except Exception as exc:  # noqa: BLE001 - upload is best effort
                 log.info("fast.com upload phase failed: %s", exc)
-                raw["upload"] = {"error": f"{type(exc).__name__}: {exc}"}
+                unmeasured = f"the upload phase failed ({request_error_text(exc)})"
+                raw["upload"] = {"error": unmeasured}
             check_cancel(guard)
 
             report("done", 1.0)
@@ -360,7 +370,9 @@ class FastComBackend:
                 ok=True, ts=ts, backend=self.name, server=server, isp=isp, external_ip=external_ip,
                 latency_ms=latency, jitter_ms=jitter, download_mbps=round(dl_stats.mbps, 2),
                 upload_mbps=upload_mbps, packet_loss_pct=None,
-                duration_s=round(time.perf_counter() - t0, 3), error=None, raw=raw,
+                duration_s=round(time.perf_counter() - t0, 3),
+                error=join_notes(phase_note(dl_stats), f"{UPLOAD_NOT_MEASURED}: {unmeasured}" if unmeasured else ul_note),
+                raw=raw,
             )
         except Cancelled:
             reason = guard.reason()

@@ -96,7 +96,8 @@ PORTABLE_NETWORK_TEXT = ("This network is carried from site to site (a hotspot o
                          "counts (the window above).")
 KIND_TEXT = {"total_local": "All local targets", "total_internet": "All internet targets", "gap": "Not monitoring"}
 ROLE_TEXT = {"gateway": "Gateway", "local": "Local", "internet": "Internet"}
-WARNING_TEXT = {"apipa": "self-assigned address (no DHCP answer)", "duplicate_address": "duplicate address",
+WARNING_TEXT = {"apipa": "self-assigned address (no DHCP answer)",
+                "apipa_ipv6": "self-assigned IPv4 (no DHCP answer), IPv6 works", "duplicate_address": "duplicate address",
                 "gateway_outside_subnet": "gateway outside the subnet", "no_dns": "no DNS server",
                 "multiple_default_gateways": "several default gateways"}
 

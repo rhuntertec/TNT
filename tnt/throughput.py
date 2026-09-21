@@ -39,6 +39,18 @@ A gap longer than :data:`MAX_SPAN_S` - the machine slept, or the service was sto
 a gap in the series instead of being drawn as one long low-rate sample, because a flat line
 across eight hours of sleep would be a claim about time nobody measured.
 
+The clocks are read *after* the counters, so a reading belongs to the moment it was taken, not the
+second the loop meant to take it in.  The time between two readings is measured on a monotonic clock
+and the sample is stamped with the whole wall-clock second nearest the moment it was taken.  A reading
+across which the wall clock moved :data:`CLOCK_STEP_S` more or less than the monotonic clock is a gap
+as well (the clock was stepped, or the machine slept on a monotonic clock that stops in sleep), and a
+clock set back drops the samples stamped after the new time, so a second is never in the series twice
+(after a step back of half an hour or more, that is the whole history: the card starts again from the
+next reading).  Each wait is worked out afresh from the clock, to the whole second after the one a
+reading taken now would be stamped with: between half a second and a second and a half, so no clock step
+can put the loop to sleep for the size of the step, and a reading is never taken a sliver after the one
+before it.
+
 Shapes
 ------
 * :func:`read_counters` -> ``[Counters, ...]``, the eligible interfaces and their raw totals.
@@ -83,8 +95,14 @@ HISTORY_S = 1800
 #: bucketing to this keeps the longest window near 25 kB and still gives 2 points per pixel.
 MAX_POINTS = 600
 #: A reading further than this from the one before it is a gap (sleep, a stopped service), not a
-#: sample.  Generous next to the one-second tick so a loaded machine does not punch holes.
+#: sample.  Generous next to the one-second tick so a loaded machine does not punch holes.  The span is
+#: measured on the monotonic clock, between the moments the two readings were actually taken.
 MAX_SPAN_S = 10.0
+#: How far the wall clock may move more, or less, than the monotonic clock between two readings before
+#: the reading is a gap rather than a rate: the wall clock was stepped (w32time, a VM restore, a hand
+#: correction) or the machine slept on a monotonic clock that stops in sleep.  Far above the drift of a
+#: healthy clock and the 16 ms resolution of both.
+CLOCK_STEP_S = 2.0
 #: How long the internet-facing NIC is remembered before it is looked up again.
 PRIMARY_TTL_S = 5.0
 STOP_JOIN_S = 2.0
@@ -340,9 +358,9 @@ class _Nic:
     """One interface's history and the last raw reading taken from it."""
 
     __slots__ = ("luid", "index", "name", "description", "if_type", "link_bps", "last", "last_ts",
-                 "samples", "seen_ts")
+                 "last_mono", "samples", "seen_ts")
 
-    def __init__(self, c: Counters, ts: float) -> None:
+    def __init__(self, c: Counters, ts: float, mono: float) -> None:
         self.luid = c.luid
         self.index = c.index
         self.name = c.name
@@ -350,7 +368,8 @@ class _Nic:
         self.if_type = c.if_type
         self.link_bps = c.link_bps
         self.last: Counters = c
-        self.last_ts: float = ts
+        self.last_ts: float = ts            # wall clock at the last reading
+        self.last_mono: float = mono        # monotonic clock at the last reading
         self.seen_ts: float = ts
         self.samples: Deque[Tuple[int, int, int, int, int]] = collections.deque(maxlen=HISTORY_S)
 
@@ -366,15 +385,23 @@ class ThroughputMonitor:
 
     ``reader`` and ``primary_fn`` are the seams the tests drive it through; left alone it reads
     the real interface table and asks :mod:`tnt.netinfo` which NIC carries the default route.
+
+    Two clocks, for two jobs.  ``clock`` (the wall clock) names the second a reading belongs to, so the
+    samples line up with the ping tiles.  ``monotonic`` measures the time between two readings, which is
+    what a rate is divided by: a wall clock that is stepped would make that span wrong, or negative.  It is
+    ``time.perf_counter`` because ``time.monotonic`` moves in 16 ms steps on Windows, 1.6 % of a one-second
+    span.  A test that injects only ``clock`` has that one clock stand for both.
     """
 
     def __init__(self, bus: Any = None, *, config: Any = None,
                  clock: Optional[Callable[[], float]] = None,
                  reader: Optional[Callable[[], List[Counters]]] = None,
-                 primary_fn: Optional[Callable[[], Optional[int]]] = None) -> None:
+                 primary_fn: Optional[Callable[[], Optional[int]]] = None,
+                 monotonic: Optional[Callable[[], float]] = None) -> None:
         self._bus = bus
         self._config = config
         self._clock = clock or time.time
+        self._monotonic = monotonic or (self._clock if clock is not None else time.perf_counter)
         self._reader = reader or read_counters
         self._primary_fn = primary_fn
         self._lock = threading.Lock()
@@ -404,29 +431,48 @@ class ThroughputMonitor:
             t.join(STOP_JOIN_S)
 
     def _run(self) -> None:
-        """One tick a second, aligned to the second so the samples line up with the ping tiles."""
-        nxt = math.floor(self._clock()) + 1.0
+        """One tick a second, on the wall-clock second so the samples line up with the ping tiles.
+
+        Each wait is worked out afresh from the clock: to the whole second after the one a reading
+        taken now would be stamped with, so between half a second and a second and a half.
+        ``threading.Event.wait`` measures its timeout on the monotonic clock: a schedule kept on the
+        wall clock (``nxt += 1``) turned a clock stepped back an hour into a wait of an hour, with the
+        card frozen on its last rate.  Worked out each time, a step either way costs one reading, which
+        ``tick`` leaves as a gap.
+        """
         while not self._stop.is_set():
-            delay = nxt - self._clock()
-            if delay > 0:
-                if self._stop.wait(delay):
-                    break
+            if self._stop.wait(self._to_next_second()):
+                break
             try:
-                self.tick(nxt)
+                self.tick()
             except Exception:  # noqa: BLE001 - one bad read must not end the thread
                 log.exception("throughput tick failed")
-            nxt += 1.0
-            if self._clock() > nxt + 2.0:       # fell behind (a busy machine, a resume): realign
-                nxt = math.floor(self._clock()) + 1.0
+
+    def _to_next_second(self) -> float:
+        """Seconds from now to the whole second after the one a reading taken now would be stamped with.
+
+        Never under half a second: after a read held up to late in its second, the next whole second
+        is skipped rather than read a sliver later.  A counter that the driver updates in steps would
+        turn a tenth-of-a-second span into a tenfold spike, or a zero.
+        """
+        now = float(self._clock())
+        return max(0.0, _second_of(now) + 1.0 - now)
 
     # -- sampling -------------------------------------------------------------------------
     def tick(self, now: Optional[float] = None) -> Optional[Dict[str, Any]]:
         """Read the counters once and record a sample per NIC.  Returns the event it published.
 
-        None when there is nothing to say: the very first read (no previous reading to subtract)
-        or a read that failed.
+        None when there is nothing to say: the very first read (no previous reading to subtract),
+        a read that failed, or one across a gap.
+
+        The clocks are read *after* the counters: a reading belongs to the moment it was taken, and a
+        read that was held up (a busy machine, a slow ``GetIfTable2``) covered the time up to then.  The
+        rate is the counter difference over the monotonic time between the two readings, and the sample
+        is stamped with the whole wall-clock second nearest the reading.  Stamping the second the loop meant to
+        read at, and dividing by exactly one second, turned a read held up 1.8 s into a 2.8x spike and
+        a hole, and the first read after a sleep into the whole night's bytes over one second.  *now*,
+        when given, stands for both clocks (a test driving one clock by hand).
         """
-        now = float(self._clock() if now is None else now)
         try:
             rows = list(self._reader())
             note = None
@@ -436,6 +482,11 @@ class ThroughputMonitor:
             with self._lock:
                 self._note = note
             return None
+        if now is None:
+            now, mono = float(self._clock()), float(self._monotonic())
+        else:
+            now = mono = float(now)
+        second = _second_of(now)
         published = False
         with self._lock:
             self._note = None
@@ -445,28 +496,38 @@ class ThroughputMonitor:
                 nic = self._nics.get(c.luid)
                 if nic is None:
                     # a rate needs two readings: remember this one and start measuring next tick
-                    self._nics[c.luid] = _Nic(c, now)
+                    self._nics[c.luid] = _Nic(c, now, mono)
                     continue
-                span = now - nic.last_ts
+                span = mono - nic.last_mono
+                # a wall clock that moved more, or less, than the time that passed was stepped, or the
+                # machine slept on a monotonic clock that stops in sleep: either way not a rate
+                stepped = abs((now - nic.last_ts) - span) > CLOCK_STEP_S
                 nic.seen_ts = now
                 nic.index, nic.name, nic.description, nic.link_bps = c.index, c.name, c.description, c.link_bps
-                if 0 < span <= MAX_SPAN_S:
+                while nic.samples and nic.samples[-1][0] >= second:
+                    # the wall clock was set back: by the clock as it is now these seconds have not
+                    # happened yet, and a window would count them on top of the new ones.  A step back of
+                    # half an hour or more empties the history; the card starts again from the next
+                    # reading.  (Shifting the history by the step instead would put it out of line with
+                    # the ping samples, which keep the stamps the old clock gave them.)
+                    nic.samples.pop()
+                if 0 < span <= MAX_SPAN_S and not stepped:
                     nic.samples.append((
-                        int(now),
+                        second,
                         _rate(c.rx_bytes, nic.last.rx_bytes, span, bits=True),
                         _rate(c.tx_bytes, nic.last.tx_bytes, span, bits=True),
                         _rate(c.rx_packets, nic.last.rx_packets, span),
                         _rate(c.tx_packets, nic.last.tx_packets, span),
                     ))
                     published = True
-                nic.last, nic.last_ts = c, now
+                nic.last, nic.last_ts, nic.last_mono = c, now, mono
             for luid in [k for k in self._nics if k not in seen]:
                 # the adapter went down or away: its history goes with it, so a cable pulled out
                 # does not leave a frozen line on the chart
                 del self._nics[luid]
         if not published:
             return None
-        event = self.latest(now)
+        event = self.latest(float(second))
         if self._bus is not None:
             try:
                 self._bus.publish("throughput.sample", event)
@@ -594,6 +655,16 @@ class ThroughputMonitor:
         with self._primary_lock:
             self._primary, self._primary_ts = luid, now
         return luid
+
+
+def _second_of(ts: float) -> int:
+    """The whole wall-clock second a reading taken at *ts* is stamped with: the nearest one.
+
+    Nearest, not the one it falls in: the wait for a second is measured on the monotonic clock and
+    may end a few milliseconds before the wall clock gets there, and that reading belongs to the
+    second it was meant for.  It also keeps the loop's next reading at least half a second away.
+    """
+    return int(math.floor(float(ts) + 0.5))
 
 
 def _rate(new: int, old: int, span: float, bits: bool = False) -> int:

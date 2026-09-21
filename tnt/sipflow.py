@@ -366,11 +366,17 @@ def call_findings(sides: Dict[str, Dict[str, Any]], ladder: List[Dict[str, Any]]
                 "An ACK that goes missing is usually addressed somewhere the network cannot deliver - look at the "
                 "Contact in the 200 OK."))
 
-    failure = next((row for row in ladder if isinstance(row["status"], int) and row["status"] >= 400), None)
+    # A refusal of an INVITE that a newer INVITE (a higher CSeq, same Call-ID) then replaced was a step, not the
+    # end: RFC 3261 22.2 answers a 401 or 407 by sending the INVITE again with credentials, which is how nearly every
+    # call through an authenticating PBX or trunk starts. Only a refusal nothing replaced is the call's failure.
+    failure = next((row for row in ladder if isinstance(row["status"], int) and row["status"] >= 400
+                    and not _superseded(row, ladder)), None)
     if failure is not None:
+        challenged = failure["status"] in (401, 407) and failure.get("cseq_method") == "INVITE"
         out.append(_finding(
             "flow.failed", "warn" if state == "cancelled" else "bad",
-            f"The call failed: {failure['label']}",
+            (f"The call failed at the credential challenge: {failure['label']}" if challenged
+             else f"The call failed: {failure['label']}"),
             f"The far end answered with {failure['label']}"
             + (f" at {failure['rel']} s into the flow." if failure.get("rel") is not None else "."),
             _failure_advice(failure["status"]),
@@ -408,10 +414,20 @@ def call_findings(sides: Dict[str, Dict[str, Any]], ladder: List[Dict[str, Any]]
             "reading with the audio findings above.", None))
 
     if not out and state in ("answered", "ended"):
-        out.append(_finding(
-            "flow.ok", "good", "Nothing wrong with this call",
-            "Signalling completed, audio flowed both ways, and the streams were clean." if sending
-            else "Signalling completed cleanly.", None))
+        # A stream with no jitter figure (a dynamic codec whose SDP was not captured, so its clock rate is unknown)
+        # was not checked for jitter, and "clean" would claim a check that never ran.
+        unmeasured = [s for s in sending if s["packets"] > 1 and not isinstance(s.get("jitter_ms"), (int, float))]
+        if not sending:
+            detail = "Signalling completed cleanly."
+        elif unmeasured:
+            where = ("" if len(unmeasured) == len(sending)
+                     else f" on {len(unmeasured)} of the {len(sending)} streams")
+            detail = (f"Signalling completed and audio flowed both ways, but jitter was not measured{where}: the "
+                      "SDP that gives the codec's clock rate was not in the capture, so how evenly the audio "
+                      "arrived is not known.")
+        else:
+            detail = "Signalling completed, audio flowed both ways, and the streams were clean."
+        out.append(_finding("flow.ok", "good", "Nothing wrong with this call", detail, None))
     out.sort(key=lambda finding: _LEVEL_ORDER.get(finding["level"], 9))
     return out
 
@@ -420,11 +436,41 @@ def _ladder_key(row: Dict[str, Any]) -> Tuple[Any, ...]:
     return (row.get("kind"), row.get("method"), row.get("cseq"), row.get("cseq_method"), row.get("status"))
 
 
+def _host(endpoint: Any) -> Any:
+    """The address part of a message's ``ip:port`` (``[v6]:port`` for IPv6); anything else unchanged."""
+    if not isinstance(endpoint, str):
+        return endpoint
+    if endpoint.startswith("["):
+        return endpoint[1:endpoint.find("]")] if "]" in endpoint else endpoint
+    return endpoint.rsplit(":", 1)[0] if endpoint.count(":") == 1 else endpoint
+
+
+def _superseded(row: Dict[str, Any], ladder: List[Dict[str, Any]]) -> bool:
+    """True when *row* answers an INVITE that the same sender, in the same capture, then sent again with a higher CSeq.
+
+    CSeq numbers only compare within one sender's requests on one Call-ID (RFC 3261 8.1.1.5). Two captures either
+    side of an SBC are two Call-IDs, each numbered from wherever its own sender began, and in one dialog the callee's
+    re-INVITE counts from its own start too. So a response is compared only with INVITEs from the end it was sent to
+    (the INVITE's sender), on its own side; the port is left out because a response need not go back to the port the
+    request came from. When no INVITE on that side came from there (a capture that saw only the answers), the side's
+    own INVITEs are the best evidence there is."""
+    cseq = row.get("cseq")
+    if row.get("cseq_method") != "INVITE" or not isinstance(cseq, int) or isinstance(cseq, bool):
+        return False
+    side, sender = row.get("side"), _host(row.get("dst"))
+    same_side = [other for other in ladder if other.get("side") == side and other.get("kind") == "request"
+                 and other.get("method") == "INVITE" and isinstance(other.get("cseq"), int)]
+    same_sender = [other for other in same_side if _host(other.get("src")) == sender]
+    return any(other["cseq"] > cseq for other in (same_sender or same_side))
+
+
 def _failure_advice(status: Any) -> Optional[str]:
     if not isinstance(status, int):
         return None
     if status in (401, 407):
-        return "That is an authentication challenge, not a failure: the caller should retry with credentials."
+        return "That is an authentication challenge that was never passed: the far end asked for credentials, "\
+               "and either the caller never sent the request again with them or the ones it sent were refused. "\
+               "Check the account's user name, authentication ID and password on the phone or trunk."
     if status == 403:
         return "The far end refused the call outright. Check the account, the caller ID it presented and whether "\
                "the source address is permitted on the trunk."

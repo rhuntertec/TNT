@@ -14,6 +14,15 @@ Findings are plain-English strings from simple rules:
 * worst 3-hour block (>= 3 tests) whose mean download is >= 15 % below the
   overall median  -> "Downloads are ~40% slower between 19:00 and 22:00"
 * failed tests    -> "3 tests failed in the last 7 days"
+* ok tests whose upload could not be measured (their note starts with
+  ``base.UPLOAD_NOT_MEASURED``: nothing was acknowledged, which is what a dead
+  or very slow upstream looks like) -> "The upload could not be measured in 3
+  of 20 tests in the last 7 days, while the download worked."  Notes where the
+  server refused the upload (``base.UPLOAD_REFUSED``, an HTTP 4xx) are not the
+  line's doing and get their own finding -> "The test server refused the upload
+  in 2 of 20 tests in the last 7 days: that is the server, not this line."
+* ok tests with a stalled phase (note "... stalled: ...") -> "2 tests stalled
+  part-way: nothing moved for several seconds."
 * weekday (>= 3 tests) >= 20 % below the median -> "... slower on Saturdays"
 * upload/download asymmetry (median upload < 10 % of median download)
 * latency spikes (latency > max(2 x median, median + 50 ms))
@@ -33,7 +42,7 @@ import logging
 import math
 from typing import Any, Dict, List, Optional
 
-from .base import median
+from .base import UPLOAD_NOT_MEASURED, UPLOAD_REFUSED, median
 
 log = logging.getLogger(__name__)
 
@@ -223,6 +232,25 @@ def analyse_patterns(rows: List[Dict[str, Any]], now: float, warn_below_pct: flo
     failed = count - ok_count
     if failed > 0:
         findings.append(f"{_plural(failed, 'test')} failed in the last {day_word}.")
+
+    # An ok test's note (its ``error``) names what could not be trusted. A test that never tried the upload has
+    # no note, so it is not counted here; one whose upload acknowledged nothing is the only trace of a dead upstream.
+    notes = [str(r.get("error") or "") for r in ok_rows_all]
+    # A server refusing the upload (an HTTP 4xx: a fast.com cache server that takes no uploads) is counted apart,
+    # so the line finding never sends a technician after an upstream that is fine.
+    unmeasured_notes = [n for n in notes
+                        if n.startswith(UPLOAD_NOT_MEASURED + ":") or ("; " + UPLOAD_NOT_MEASURED + ":") in n]
+    refused = sum(1 for n in unmeasured_notes if UPLOAD_REFUSED in n)
+    unmeasured = len(unmeasured_notes) - refused
+    if unmeasured:
+        findings.append(f"The upload could not be measured in {unmeasured} of {_plural(ok_count, 'test')} in the last "
+                        f"{day_word}, while the download worked.")
+    if refused:
+        findings.append(f"The test server refused the upload in {refused} of {_plural(ok_count, 'test')} in the last "
+                        f"{day_word}: that is the server, not this line.")
+    stalled = sum(1 for n in notes if " stalled: " in n)
+    if stalled:
+        findings.append(f"{_plural(stalled, 'test')} stalled part-way: nothing moved for several seconds.")
 
     # weekday effect
     if median_down and ok_rows:

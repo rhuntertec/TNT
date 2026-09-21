@@ -152,22 +152,26 @@ def test_resolve_names_off_skips_reverse_dns_and_custom_parameters_reach_the_pin
     assert events[0]["data"]["max_hops"] == 10 and events[0]["data"]["probes"] == 2
 
 
-def test_gives_up_after_five_silent_hops():
+def test_a_silent_tail_runs_to_max_hops_on_one_probe_per_hop_and_says_where_replies_stopped():
+    """Silent hops no longer end the trace (the destination may answer beyond a silent core, as tracert shows); this
+    test used to pin the old stop after five silent hops, which reported a reachable destination as dead. A tail that
+    really is silent still reads "no reply after hop 2", and past the fifth silent hop each hop costs one probe."""
     tracer, pinger, events, clock, _ = make({1: [(GATEWAY, 1.0)], 2: [(CGNAT, 4.0)]})
     res = tracer.trace(TARGET)
     assert res["complete"] is False and res["error"] == "no reply after hop 2"
-    assert len(res["hops"]) == 2 + SILENT_HOPS_LIMIT
-    assert [h["kind"] for h in res["hops"]] == ["gateway", "lan"] + ["unknown"] * SILENT_HOPS_LIMIT
-    assert max(c[3] for c in pinger.calls) == 2 + SILENT_HOPS_LIMIT     # never went on to hop 8..30
+    assert len(res["hops"]) == 30
+    assert [h["kind"] for h in res["hops"]] == ["gateway", "lan"] + ["unknown"] * 28
+    assert max(c[3] for c in pinger.calls) == 30
+    assert len(pinger.calls) == 2 * 3 + SILENT_HOPS_LIMIT * 3 + (28 - SILENT_HOPS_LIMIT)
     assert events[-1]["type"] == "trace.done" and events[-1]["data"]["complete"] is False
-    assert events[-1]["data"]["hops"] == 7 and events[-1]["data"]["error"] == "no reply after hop 2"
+    assert events[-1]["data"]["hops"] == 30 and events[-1]["data"]["error"] == "no reply after hop 2"
     assert tracer.last is res
 
-    # a silent hop between answering ones resets the count (see FULL_PATH), nothing at all gives up too
+    # a silent hop between answering ones resets the count (see FULL_PATH); when nothing at all answers, it says so
     tracer2, pinger2, _, _, _ = make({})
     res2 = tracer2.trace(TARGET)
-    assert res2["complete"] is False and len(res2["hops"]) == SILENT_HOPS_LIMIT
-    assert res2["error"] == f"no reply from the first {SILENT_HOPS_LIMIT} hops"
+    assert res2["complete"] is False and len(res2["hops"]) == 30
+    assert res2["error"] == "no reply from any of the 30 hops"
 
 
 def test_max_hops_exhausted_and_unreachable_reply_stop_the_trace():

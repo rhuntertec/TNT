@@ -141,9 +141,9 @@ Contract gaps resolved here (documented deviations):
 * Faults (``engine.faults``, :mod:`tnt.faults`): ``GET /api/faults`` is the passive watch's view -
   ``{"ts","watching_since","watched_s","level","findings":[FINDING...],"nics":[...],"arp","note"}``,
   503 without the component.  ``GET /api/status`` carries ``"faults"`` (TILE:
-  ``{"available","reason","level","bad","warn","headline","watched_s","ts"}``, null without it).  The
-  live feed is the ``faults.state`` event, published only when the **level** changes - a green tile
-  has nothing to say once a second.  Nothing here is a start route: the watch is always on and sends
+  ``{"available","reason","level","bad","warn","headline","watched_s","clean_s","ts"}``, null without
+  it).  The live feed is the ``faults.state`` event, published only when the **level** changes - a
+  green tile has nothing to say once a second.  Nothing here is a start route: the watch is always on and sends
   nothing, so there is no work for a caller to trigger and nothing to gate.
 * Realtime throughput (``engine.throughput``, :mod:`tnt.throughput`): ``GET /api/throughput?window_s=``
   is the card's payload - ``{"ts","window_s","step_s","history_s","windows","nics":[NIC...],"note"}``, one

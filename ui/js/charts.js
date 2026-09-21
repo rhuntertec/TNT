@@ -60,6 +60,16 @@
     ctx.closePath();
   }
 
+  /** Text made safe to sit inside a tooltip's HTML. A tooltip is built as a string and handed to
+   *  innerHTML, and much of what goes into one came from somewhere else: a failed speed test's error
+   *  carries the first bytes of whatever answered the probe (a captive portal's page, a proxy's block
+   *  page), a target's host name is whatever was typed. Every such string goes through this, so it
+   *  reads as the text it is and never becomes an element in the TNT window. charts.js loads before
+   *  app.js, so it keeps its own copy of TNT.util.esc. */
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+  }
+
   function pad2(n) { return (n < 10 ? '0' : '') + n; }
   function clock(ts) { const d = new Date(ts * 1000); return pad2(d.getHours()) + ':' + pad2(d.getMinutes()); }
   function clockS(ts) { const d = new Date(ts * 1000); return clock(ts) + ':' + pad2(d.getSeconds()); }
@@ -178,6 +188,10 @@
       this.showTip(hit.tip, x, y);
     }
 
+    /** `html` is markup: the tooltips built in this file escape every string that came from
+     *  elsewhere (esc above), and a caller that hands in its own markup (a LineChart's formatTip,
+     *  a bar's tip) escapes its own fields the same way, with TNT.util.esc. An average rule's
+     *  label and tip are text. */
     showTip(html, x, y) {
       const parent = this.canvas.parentElement;
       if (!parent) return;
@@ -390,10 +404,10 @@
           : s.kind === 'total_local' ? 'Local network outage'
           : (s.host || ('target ' + s.target_id)) + ' down';
         const end = s.open ? now : s.end_ts;
-        const tip = '<div class="t">' + title + (s.open ? ' <span class="ongoing">· ongoing</span>' : '') + '</div>' +
+        const tip = '<div class="t">' + esc(title) + (s.open ? ' <span class="ongoing">· ongoing</span>' : '') + '</div>' +
           clockS(s.start_ts) + ' – ' + (s.open ? 'now' : clockS(end)) +
           '<div class="muted">' + durationText(end - s.start_ts) +
-          (s.missed ? ' · ' + s.missed + ' missed' + missedPctText(s) : '') + '</div>';
+          (s.missed ? ' · ' + esc(s.missed) + ' missed' + esc(missedPctText(s)) : '') + '</div>';
         this.hits.push({ x0: sx0, x1: sx1, y0: barY - 2, y1: barY + barH + 2, priority: pri, tip });
         return { x: sx0, x1: sx1, s, title };
       };
@@ -637,7 +651,7 @@
           ctx.fillText(text, lx + 7, ly + bh / 2 + 0.5);
           ctx.textBaseline = 'alphabetic';
           this.hits.push({ x0: lx, x1: lx + bw, y0: ly, y1: ly + bh, priority: 6,
-            tip: '<div class="t">' + text + '</div>' + (l.tip || 'average over the visible range') });
+            tip: '<div class="t">' + esc(text) + '</div>' + esc(l.tip || 'average over the visible range') });
         }
       }
       // marks (failed tests): red x at the bottom
@@ -647,7 +661,8 @@
         ctx.strokeStyle = m.color || c.red; ctx.lineWidth = 2.5;
         ctx.beginPath(); ctx.moveTo(x - 4, y - 4); ctx.lineTo(x + 4, y + 4); ctx.moveTo(x + 4, y - 4); ctx.lineTo(x - 4, y + 4); ctx.stroke();
         this.hits.push({ x0: x - 6, x1: x + 6, y0: y - 8, y1: y + 8, priority: 5,
-          tip: '<div class="t">' + (m.label || 'Failed') + '</div>' + clock(m.ts) + ' · ' + dayLabel(m.ts) + (m.detail ? '<div class="muted">' + m.detail + '</div>' : '') });
+          // m.detail is a failed speed test's error, which can carry the raw body of the reply
+          tip: '<div class="t">' + esc(m.label || 'Failed') + '</div>' + clock(m.ts) + ' · ' + dayLabel(m.ts) + (m.detail ? '<div class="muted">' + esc(m.detail) + '</div>' : '') });
       }
 
       // hover columns: one hit per x-sample across series (nearest point by time)
@@ -662,7 +677,7 @@
         const vals = this.series.map((s) => { const p = s.points.find((q) => q[0] === t); return { name: s.name, color: s.color, v: p ? p[1] : null }; });
         let tip;
         if (this.formatTip) tip = this.formatTip(t, vals);
-        else tip = '<div class="t">' + clock(t) + ' · ' + dayLabel(t) + '</div>' + vals.map((v) => v.name + ': ' + (v.v == null ? '—' : v.v)).join('<br>');
+        else tip = '<div class="t">' + clock(t) + ' · ' + dayLabel(t) + '</div>' + vals.map((v) => esc(v.name) + ': ' + (v.v == null ? '—' : esc(v.v))).join('<br>');
         this.hits.push({ x0: left, x1: right, y0: py0, y1: py1, priority: 1, tip, x, t, vals });
       }
     }
@@ -742,11 +757,11 @@
           roundRect(ctx, x, y, bw, py1 - y, Math.min(6, bw / 2));
           ctx.fillStyle = b.color || c.purple; ctx.fill();
           ctx.strokeStyle = c.ink; ctx.lineWidth = 2; ctx.stroke();
-          this.hits.push({ x0: cx - slot / 2, x1: cx + slot / 2, y0: py0, y1: py1, priority: 1, tip: b.tip || ('<div class="t">' + b.label + '</div>' + b.value) });
+          this.hits.push({ x0: cx - slot / 2, x1: cx + slot / 2, y0: py0, y1: py1, priority: 1, tip: b.tip || ('<div class="t">' + esc(b.label) + '</div>' + esc(b.value)) });
         } else {
           ctx.fillStyle = alpha(c.ink, 0.12);
           ctx.fillRect(x, py1 - 3, bw, 3);
-          this.hits.push({ x0: cx - slot / 2, x1: cx + slot / 2, y0: py0, y1: py1, priority: 1, tip: b.tip || ('<div class="t">' + b.label + '</div><span class="muted">no data</span>') });
+          this.hits.push({ x0: cx - slot / 2, x1: cx + slot / 2, y0: py0, y1: py1, priority: 1, tip: b.tip || ('<div class="t">' + esc(b.label) + '</div><span class="muted">no data</span>') });
         }
         if (i % this.labelEvery === 0) {
           ctx.fillStyle = c.inkSoft; ctx.font = '700 12px ' + font; ctx.textAlign = 'center';
@@ -783,8 +798,10 @@
   class Throughput extends Chart {
     constructor(canvas, opts) {
       super(canvas, opts);
-      this.rx = [];                 // [[ts, bps], ...] ascending, receive
-      this.tx = [];                 // [[ts, bps], ...] ascending, send
+      // [[ts, bps, stepS?], ...] ascending. A point's own step is the seconds it stands for: 3 for
+      // a bucket of the 30-minute backlog, left out (so this.stepS, 1) for a live second.
+      this.rx = [];                 // receive
+      this.tx = [];                 // send
       this.windowS = (opts && opts.windowS) || 30;
       this.stepS = (opts && opts.stepS) || 1;
       this.windowLabel = (opts && opts.windowLabel) || '30 seconds';
@@ -820,15 +837,18 @@
       return Math.max(Throughput.MIN_TOP_BPS, niceCeil(peak * 1.15));
     }
 
-    /** The points inside the window, cut into runs with no gap wider than two steps. */
+    /** The points inside the window, cut into runs with no gap wider than two steps. The step is
+     *  the earlier point's own: the 30-minute window holds 3 s buckets and then live seconds, and
+     *  one tolerance for both would either break every bucket off on its own or draw a live hole
+     *  of a few seconds straight across. */
     runs(points) {
       const t0 = this.now - this.windowS;
-      const gap = Math.max(2, this.stepS * 2 + 0.5);
       const out = [];
       let run = null;
       for (const p of points) {
         if (p[0] < t0 || p[0] > this.now + 1) continue;
-        if (run && p[0] - run[run.length - 1][0] > gap) run = null;
+        const prev = run && run[run.length - 1];
+        if (prev && p[0] - prev[0] > Math.max(2, (prev[2] || this.stepS) * 2 + 0.5)) run = null;
         if (!run) { run = []; out.push(run); }
         run.push(p);
       }
@@ -945,20 +965,21 @@
     _hits(px0, px1, py0, py1, x) {
       const byTs = new Map();
       const t0 = this.now - this.windowS;
-      for (const p of this.rx) { if (p[0] >= t0) byTs.set(p[0], { rx: p[1], tx: 0 }); }
+      for (const p of this.rx) { if (p[0] >= t0) byTs.set(p[0], { rx: p[1], tx: 0, step: p[2] }); }
       for (const p of this.tx) {
         if (p[0] < t0) continue;
-        const row = byTs.get(p[0]) || { rx: 0, tx: 0 };
+        const row = byTs.get(p[0]) || { rx: 0, tx: 0, step: p[2] };
         row.tx = p[1];
         byTs.set(p[0], row);
       }
-      const half = Math.max(2, ((px1 - px0) * this.stepS) / (2 * Math.max(1, this.windowS)));
+      const perS = (px1 - px0) / (2 * Math.max(1, this.windowS));
       for (const [ts, row] of byTs) {
         const cx = x(ts);
         if (cx < px0 || cx > px1) continue;
+        const half = Math.max(2, perS * (row.step || this.stepS));
         this.hits.push({
           x0: cx - half, x1: cx + half, y0: py0, y1: py1, priority: 1,
-          tip: '<b>' + this.timeFmt(ts) + '</b><br>↓ ' + this.fmt(row.rx) + '<br>↑ ' + this.fmt(row.tx),
+          tip: '<b>' + esc(this.timeFmt(ts)) + '</b><br>↓ ' + esc(this.fmt(row.rx)) + '<br>↑ ' + esc(this.fmt(row.tx)),
         });
       }
     }

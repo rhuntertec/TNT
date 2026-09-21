@@ -108,8 +108,11 @@ def ids(findings: Any) -> List[str]:
 # =========================================================================================
 def test_an_error_and_a_discard_are_never_reported_as_the_same_thing():
     """The whole reason the counters are kept apart: one sends a tech to the cabling and the other
-    to whatever is saturating the link.  A page that said "3,000 problems" would help nobody."""
-    rows = [nic(errors=400, discards=4000, packets=100_000)]
+    to whatever is saturating the link.  A page that said "3,000 problems" would help nobody.
+
+    The discards are the outbound ones: an inbound discard is as often a frame nothing on this PC
+    speaks the protocol of as a full buffer, so it is never called congestion (and never graded)."""
+    rows = [nic(errors=400, packets=100_000, new_tx_discards=4000, new_tx_packets=100_000)]
     both = faults.error_findings(rows) + faults.discard_findings(rows)
     assert ids(both) == ["fault.errors", "fault.discards"]
     error, discard = both
@@ -136,10 +139,15 @@ def test_a_quiet_adapter_is_not_judged_on_a_handful_of_frames():
 
 
 def test_a_few_discards_on_a_busy_link_are_what_a_buffer_is_for():
-    assert faults.discard_findings([nic(discards=10, packets=100_000)]) == []          # 0.01%
-    assert faults.discard_findings([nic(discards=1_000, packets=100_000)])[0]["level"] == "warn"   # 1%
-    assert faults.discard_findings([nic(discards=5_000, packets=100_000)])[0]["level"] == "bad"    # 5%, the bar
-    assert faults.discard_findings([nic(discards=50_000, packets=100_000)])[0]["level"] == "bad"
+    def sent(discards: int) -> Dict[str, Any]:
+        # 100,000 frames queued to send: Windows counts the ones it discarded apart from the ones it
+        # sent (OutUcastPkts is "transmitted without errors"), so the sent count is what is left
+        return nic(packets=0, new_tx_discards=discards, new_tx_packets=100_000 - discards)
+
+    assert faults.discard_findings([sent(10)]) == []                          # 0.01%
+    assert faults.discard_findings([sent(1_000)])[0]["level"] == "warn"       # 1%
+    assert faults.discard_findings([sent(5_000)])[0]["level"] == "bad"        # 5%, the bar
+    assert faults.discard_findings([sent(50_000)])[0]["level"] == "bad"
 
 
 def test_the_worst_adapter_leads_and_the_rest_are_counted():
@@ -325,10 +333,15 @@ def test_a_counter_that_went_backwards_restarts_the_baseline():
 
 
 def test_an_adapter_that_goes_away_takes_its_counters_with_it():
+    """Once its window is over.  Until then it stays on the page marked down, because what it counted
+    before its link went is still the last few minutes' (and a link that blinks is often the fault)."""
     rows = [[counters(1, name="Ethernet"), counters(2, name="Wi-Fi")], [counters(1, name="Ethernet")]]
     w, clock, _ = watcher(rows)
     w.tick()
     clock.now += 5.0
+    w.tick()
+    assert [(n["name"], n["up"]) for n in w.view()["nics"]] == [("Ethernet", True), ("Wi-Fi", False)]
+    clock.now += faults.RATE_WINDOW_S
     w.tick()
     assert [n["name"] for n in w.view()["nics"]] == ["Ethernet"]
 

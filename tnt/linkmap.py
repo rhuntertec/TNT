@@ -27,6 +27,12 @@ asked for, so a flapping network costs one lookup per half minute) and reported 
 ``view()["public_geo"]`` is the IP location + ISP of that address (``geo_lookup``, the engine's
 ``tnt.geoip.GeoIpManager.lookup``: a local database read, computed at view time from the stored address;
 None when the feature is off, no data is loaded, there is no address or no record).  It is logged at DEBUG only.
+The lookup goes out over IPv4 only (:data:`WAN_SOURCE_ADDRESS`) and refuses an answer that is not
+IPv4: on NAT the WAN address is IPv4, and an IPv6 answer is this PC's own address.  A new or changed
+address is logged at INFO without the address (the service log is readable by every user on the PC).
+
+The internet probe resolves its host through ``tnt.icmp.resolve_routable``: IPv4 first, as the Ping
+tiles do, except on an IPv6-only host (``netinfo.prefers_ipv4()``), where the A record has no route.
 
 Network changes (:meth:`LinkMap.on_network_change`, called by the Engine for ``net.changed``):
 both probes look their address up again on their next tick (a lookup the change overtook is
@@ -71,8 +77,30 @@ WAN_HOSTS: Tuple[str, ...] = ("1.1.1.1", "www.cloudflare.com")
 WAN_TIMEOUT_S = 8.0
 
 
+#: Every lookup connection is bound to the IPv4 "any" address.  The fallback host is a name, and on a
+#: dual-stack PC Windows reaches it over IPv6 first; the trace then reports this PC's own IPv6 address,
+#: never the router's IPv4 WAN address the map, the NAT check and the port-forward test need.  An
+#: IPv6 socket cannot bind to it, so only the A records are tried.
+WAN_SOURCE_ADDRESS: Tuple[str, int] = ("0.0.0.0", 0)
+
+
+class NotIpv4Error(ValueError):
+    """The trace answered with an address that is not IPv4 (the lookup went out over IPv6)."""
+
+
+class NoIpv4PathError(OSError):
+    """A pinned lookup found no way to the host over IPv4.
+
+    Raised in place of the ``socket.gaierror`` a pinned connection reports when its last candidate
+    was an AAAA (binding an IPv6 socket to :data:`WAN_SOURCE_ADDRESS` fails in getaddrinfo), which the
+    WAN chip would otherwise show as "getaddrinfo failed" - a DNS failure - on a network whose DNS works."""
+
+
 def _fetch_public_ip(timeout_s: float = WAN_TIMEOUT_S) -> Optional[str]:
-    """``GET https://1.1.1.1/cdn-cgi/trace`` -> the ``ip=`` line, validated; None when unavailable."""
+    """``GET https://1.1.1.1/cdn-cgi/trace`` over IPv4 -> the ``ip=`` line, validated; None when unavailable.
+
+    Only an IPv4 answer counts: anything else raises (after the other hosts were tried), so the
+    caller keeps no address rather than an IPv6 one that is not the router's WAN address."""
     import ipaddress
 
     base = importlib.import_module("tnt.speedtest.base")
@@ -80,7 +108,7 @@ def _fetch_public_ip(timeout_s: float = WAN_TIMEOUT_S) -> Optional[str]:
     last_error: Optional[Exception] = None
     for host in WAN_HOSTS:
         try:
-            http_ = base.Http(host, scheme="https", timeout=timeout_s)
+            http_ = base.Http(host, scheme="https", timeout=timeout_s, source_address=WAN_SOURCE_ADDRESS)
             try:
                 reply = http_.get("/cdn-cgi/trace", max_bytes=65536)
             finally:
@@ -90,7 +118,14 @@ def _fetch_public_ip(timeout_s: float = WAN_TIMEOUT_S) -> Optional[str]:
                     pass
             ip = cloudflare.parse_trace(getattr(reply, "text", "") or "").get("ip", "").strip()
             if ip:
-                return str(ipaddress.ip_address(ip))
+                addr = ipaddress.ip_address(ip)
+                if addr.version != 4:
+                    raise NotIpv4Error(f"{host} answered over IPv6, not with this network's public IPv4 address")
+                return str(addr)
+        except socket.gaierror:
+            # the name did not resolve to an A record, or (more often) the AAAA was the last candidate
+            # and cannot bind to the IPv4 source address: either way, no IPv4 way to this host
+            last_error = NoIpv4PathError(f"{host} could not be reached over IPv4")
         except Exception as exc:  # noqa: BLE001 - try the next host
             last_error = exc
     if last_error is not None:
@@ -242,7 +277,7 @@ class LinkMap:
             p.host = host
             resolver = self._resolver
             if resolver is None:
-                resolver = importlib.import_module("tnt.icmp").resolve
+                resolver = importlib.import_module("tnt.icmp").resolve_routable   # AAAA first on an IPv6-only host
             ip = resolver(host)
             return (str(ip), None) if ip else (None, "name resolution failed")
         except Exception as exc:  # noqa: BLE001
@@ -345,7 +380,8 @@ class LinkMap:
         with self._lock:
             if ip:
                 if ip != self._wan.get("ip"):
-                    log.info("public IP: %s", ip)
+                    # never the address itself: the service log is readable by every user on this PC
+                    log.info("public IP address %s", "found" if self._wan.get("ip") is None else "changed")
                 self._wan = {"ip": ip, "ts": now, "error": None, "checked_ts": now}
             else:
                 wan = dict(self._wan, error=error, checked_ts=now)

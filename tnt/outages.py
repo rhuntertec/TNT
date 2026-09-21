@@ -65,6 +65,15 @@ Interpretations of the contract (listed as deviations in the module report):
 * Samples whose timestamp is missing or not finite are ignored with a warning
   (a NaN ``first_miss_ts`` would fail every later ``start_ts NOT NULL`` insert
   of the run and the outage would never open).
+* After :meth:`OutageTracker.on_monitoring_gap` each target's *first* sample is
+  dropped when it is stamped before the gap's end: a sample is stamped when its
+  echo request is sent, so the one in flight when the machine slept comes back
+  after the wake dated before the sleep, after the gap has already reset every
+  run.  Counted, it started a new miss run there and two misses while the Wi-Fi
+  re-associated opened an outage back-dated across the whole sleep (an 8 h outage
+  of a target that answered seconds after the wake).  Only the first sample per
+  target is looked at (a worker has one echo out at a time), so a clock set back
+  after the wake does not make the tracker ignore anything else.
 * The "active" window for total evaluation is 15 s as specified, widened to
   ``2 * ping.interval_s + ping.timeout_ms`` when the configured interval is
   long (up to 60 s is allowed): with a 20 s interval a healthy target would
@@ -305,6 +314,9 @@ class _TargetState:
     first_ok_ts: Optional[float] = None     # ts of the first success of the current recovery run
     last_sample_ts: Optional[float] = None
     outage: Optional[Dict[str, Any]] = None  # in-memory copy of the open target outage row
+    # False from a monitoring gap until this target's first sample after it: that one may be the echo
+    # that was in flight while monitoring stopped (see OutageTracker.on_sample)
+    sampled_since_gap: bool = False
 
 
 def backfill_outage_hosts(db: Any, raw_log: Any, hosts: Optional[Dict[int, str]] = None) -> int:
@@ -394,6 +406,7 @@ class OutageTracker:
         self._states: Dict[int, _TargetState] = {}
         self._totals: Dict[str, Dict[str, Any]] = {}   # group -> open total outage row
         self._last_total_end: Dict[str, float] = {}     # group -> end_ts of the last closed total
+        self._gap_end_ts: Optional[float] = None        # end of the last monitoring gap (on_sample: stale echoes)
         self._hosts: Dict[int, str] = {}                # target id -> host (kept after removal)
         self._running = False
         self._stopped = False
@@ -498,7 +511,9 @@ class OutageTracker:
         Nothing can be known about that hole, so: every open target/total outage is closed
         at *start_ts* with *note*, all miss/recovery counters are reset (the next samples
         start a fresh run), and a ``kind="gap"`` row covers the hole so the timeline shows
-        grey instead of a green bar or a spuriously long yellow/red span.
+        grey instead of a green bar or a spuriously long yellow/red span.  Each target's first
+        sample after the gap is dropped when it is stamped before *end_ts*: it is the echo that
+        was in flight while monitoring stopped (see :meth:`on_sample`).
         """
         effects: List[_Effect] = []
         info: Dict[str, Any] = {"closed": 0, "gap_id": None, "start_ts": start_ts, "end_ts": end_ts, "note": note}
@@ -506,6 +521,7 @@ class OutageTracker:
             with self._lock:
                 if self._stopped:
                     return info
+                self._gap_end_ts = _finite(end_ts)
                 for st in self._states.values():
                     if st.outage is not None:
                         self._close_target(st, start_ts, note, effects, notify_pm=True)
@@ -514,6 +530,7 @@ class OutageTracker:
                     st.consecutive_ok = 0
                     st.first_miss_ts = None
                     st.first_ok_ts = None
+                    st.sampled_since_gap = False
                 for group in list(self._totals):
                     self._close_total(group, start_ts, note, effects)
                     info["closed"] += 1
@@ -546,6 +563,21 @@ class OutageTracker:
                 prev = self._states.get(target_id)
                 prev_kind = prev.kind if prev is not None else None
                 st = self._state_for(target_id, target_view)
+                if not st.sampled_since_gap:
+                    st.sampled_since_gap = True
+                    if self._gap_end_ts is not None and ts < self._gap_end_ts:
+                        # The echo that was in flight while monitoring stopped: a sample is stamped when
+                        # its request is sent, so one that went out before a sleep comes back after the
+                        # wake dated before it, after the gap has already reset every run.  Counting it
+                        # would start a new miss run there, and two misses while the Wi-Fi re-associates
+                        # would open an outage back-dated across the whole sleep.  It says nothing about
+                        # the network after the gap.  Only the first sample per target is looked at: a
+                        # worker has one echo out at a time, so later ones are fresh whatever the clock
+                        # says (w32time setting it back after the wake must not blind the tracker).
+                        log.info("ignoring a %s from target %s sent %.0f s before the monitoring gap ended "
+                                 "(it was in flight across the gap)", "reply" if ok else "miss", target_id,
+                                 self._gap_end_ts - ts)
+                        return
                 st.last_sample_ts = ts
                 if st.outage is not None:
                     # every ping while the outage is open, answered or not: the denominator of

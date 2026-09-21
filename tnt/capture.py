@@ -994,6 +994,9 @@ class CaptureManager:
         if packet is None:
             raise CaptureFileMissing("That packet could not be read back")
         data = packet["data"]
+        # A file captured on several interfaces (Ethernet plus a VPN's raw IP) mixes link types; the packet
+        # carries its own interface's, and _read_linktype is only the last packet's.
+        linktype = int(packet.get("linktype") or linktype)
         dissect = self._dissect()
         try:
             layers = dissect.detail(data, linktype=linktype, ts=packet.get("ts"), origlen=packet.get("origlen"))

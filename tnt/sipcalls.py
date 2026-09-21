@@ -99,9 +99,15 @@ state (so the caller can raise its "call found" notification once), else None::
 ``state`` is one of :data:`CALL_STATES`: an INVITE opens a call ``"calling"``, a 180 or 183 to it makes it
 ``"ringing"``, a 2xx ``"answered"`` (with ``answer_ts``), a BYE ``"ended"``, a CANCEL ``"cancelled"`` and a 4xx/5xx/6xx
 final response ``"failed"``, all with ``end_ts``. ``status`` is the last response of 200 or more to the INVITE, so a
-cancelled call keeps its state and still records the 487. ``duration_s`` runs from ``answer_ts`` (else ``start_ts``) to
-``end_ts`` (else the last message or RTP packet seen) and is rounded to milliseconds. ``id`` is a URL-safe slug of the
-Call-ID: everything outside ``A-Za-z0-9-_`` becomes ``-``, runs of ``-`` collapse, the result is capped at
+cancelled call keeps its state and still records the 487. A newer INVITE (a higher CSeq on the same Call-ID from
+the same sender) on a ``"failed"`` call that was never answered reopens it ``"calling"``, with ``end_ts`` and
+``status`` cleared: that is the retry with credentials RFC 3261 22.2 sends after a 401 or 407, the normal start of a
+call through an authenticating PBX or trunk. A response to an INVITE older than the newest one from the end it was
+sent to is ignored, so a late copy of the challenge cannot fail the retry; the CSeq is kept per sender because each
+end numbers its own requests, and a callee's re-INVITE must not make the caller's look old. A challenge nobody
+retried leaves the call ``"failed"`` with its 401 or 407. ``duration_s`` runs from ``answer_ts`` (else ``start_ts``)
+to ``end_ts`` (else the last message or RTP packet seen) and is rounded to milliseconds. ``id`` is a URL-safe slug of
+the Call-ID: everything outside ``A-Za-z0-9-_`` becomes ``-``, runs of ``-`` collapse, the result is capped at
 :data:`MAX_ID_TEXT` characters and a short SHA-256 of the Call-ID is appended, so it can never hold ``/``, ``\`` or
 ``..`` and two Call-IDs never share one. ``note`` says why a call has no audio (no RTP seen, or a codec that cannot be
 rebuilt), else None.
@@ -136,10 +142,16 @@ a drop and which also drops the streams that were only that call's, giving their
 
 Contract gaps filled here (documented as required):
 
-* ``lost`` counts each forward sequence gap of at most :data:`MAX_SEQ_GAP` packets (a larger jump reads as a restarted
-  stream, not as loss) and is never decremented when a late packet fills the hole; ``out_of_order`` counts every
-  arrival whose sequence is behind the highest seen. A duplicate (the same sequence again) is neither, and is dropped
-  only when the audio is rebuilt.
+* ``lost`` is RFC 3550's expected minus received: each forward sequence gap of at most :data:`MAX_SEQ_GAP` packets
+  counts the packets it skipped (a larger jump reads as a restarted stream, not as loss), and a late packet that fills
+  one of those holes takes its count back off, the 16-bit sequence wrap included. ``out_of_order`` counts those late
+  arrivals. A duplicate (a sequence already received) is neither, and neither is a packet older than the first one
+  the stream saw; a duplicate is dropped only when the audio is rebuilt.
+* ``jitter_ms`` needs the RTP clock rate: :data:`PAYLOAD_TYPES` for a static type, else the rate the SDP ``rtpmap``
+  of either end gives the dynamic one (``opus/48000/2`` is 48 kHz), capped at :data:`MAX_CLOCK_RATE`. Without either
+  it is None - a dynamic number means nothing on its own, and a guess could report jitter in the wrong scale. It is
+  None as well when the rate arrived late and the estimator saw fewer than :data:`MIN_JITTER_STEPS` steps of a
+  longer stream: a few steps from zero read as smooth whatever the audio did.
 * Streams are keyed by ``(src, sport, dst, dport, ssrc)``, so the two directions of a call are two streams. A stream's
   ``payload_type`` is the first one seen on that SSRC and only packets carrying it are rebuilt, which keeps
   ``telephone-event`` (RFC 4733) and comfort noise out of the audio without losing the packet counts.
@@ -218,6 +230,9 @@ MAX_STORED_BYTES = 256 * 1024 * 1024  # RTP frames held by one tracker, per-fram
 FRAME_OVERHEAD = 170
 MAX_WAV_DATA = 200 * 1024 * 1024     # sample bytes a WAV file carries
 MAX_WAV_RATE = 192000
+MAX_CLOCK_RATE = 1_000_000           # an rtpmap clock rate past this is not one (video runs at 90 kHz)
+MAX_INVITE_SENDERS = 8               # addresses whose INVITE CSeq one call remembers (a caller, a callee, proxies)
+MIN_JITTER_STEPS = 16                # packet-to-packet steps the jitter estimator must see before it is a figure
 MAX_WAV_CHANNELS = 2
 
 PT_PCMU, PT_PCMA = 0, 8
@@ -656,7 +671,7 @@ def clock_rate(payload_type: Any) -> Optional[int]:
     """The RTP clock rate of a static payload type, or None for one this module does not know.
 
     Jitter is measured in these units, so a stream whose rate is unknown reports no jitter rather than a number in
-    the wrong scale."""
+    the wrong scale. A dynamic payload type is not here: :class:`CallTracker` takes its rate from the SDP rtpmap."""
     entry = PAYLOAD_TYPES.get(payload_type) if isinstance(payload_type, int) else None
     return entry[1] if entry else None
 
@@ -684,7 +699,7 @@ class _Stream:
 
     __slots__ = ("id", "src", "sport", "dst", "dport", "ssrc", "payload_type", "codec", "packets", "lost",
                  "out_of_order", "first_ts", "last_ts", "bytes", "highest_seq", "frames", "full", "stored",
-                 "rate", "jitter", "_last_arrival", "_last_stamp")
+                 "rate", "jitter", "jitter_steps", "_last_arrival", "_last_stamp", "_missing")
 
     def __init__(self, stream_id: str, src: str, sport: int, dst: str, dport: int, ssrc: int, payload_type: int,
                  codec: str, ts: float) -> None:
@@ -698,8 +713,12 @@ class _Stream:
         self.full = False
         self.rate = clock_rate(payload_type)
         self.jitter = 0.0                    # RFC 3550 interarrival jitter, in RTP timestamp units
+        self.jitter_steps = 0                # packet-to-packet steps that went into it
         self._last_arrival: Optional[float] = None
         self._last_stamp: Optional[int] = None
+        # One bit per 16-bit sequence number, set while that packet is counted as lost and has not turned up. It is
+        # only allocated at the first gap (8 KiB), so a stream that never loses anything never pays for it.
+        self._missing: Optional[bytearray] = None
 
     def count(self, seq: int, ts: float, size: int, stamp: Optional[int] = None) -> None:
         self.packets += 1
@@ -712,26 +731,62 @@ class _Stream:
         if self.rate and stamp is not None:
             arrival = ts * self.rate
             if self._last_arrival is not None and self._last_stamp is not None:
-                delta = (arrival - self._last_arrival) - float(stamp - self._last_stamp)
+                # the signed 32-bit step, as everywhere else in this module: the raw difference across the wrap of
+                # the timestamp field is four billion units, which the estimator turned into hours of "jitter"
+                delta = (arrival - self._last_arrival) - float(_ts_diff(stamp, self._last_stamp))
                 self.jitter += (abs(delta) - self.jitter) / 16.0
+                self.jitter_steps += 1
             self._last_arrival, self._last_stamp = arrival, stamp
         if self.highest_seq is None:
             self.highest_seq = seq
             return
+        # Loss is RFC 3550 appendix A.3's "expected minus received": a forward gap counts the packets it skipped,
+        # and a late packet that fills one of those holes gives its count back, so a path that reorders but loses
+        # nothing reports no loss. Counting the gaps alone read every reordered packet as a lost one, and 1 %
+        # reordering on a multi-link WAN then raised "Audio packets were lost" on a stream that was complete. A
+        # late packet whose number is not an open hole is a duplicate (or older than the first packet seen) and
+        # is neither lost nor out of order.
         step = _seq_diff(seq, self.highest_seq)
         if step > 0:
-            if 1 < step <= MAX_SEQ_GAP:
-                self.lost += step - 1
+            if step <= MAX_SEQ_GAP:
+                if step > 1:
+                    self.lost += step - 1
+                    if self._missing is None:
+                        self._missing = bytearray(0x2000)
+                self._open_holes(self.highest_seq, step)
+            else:
+                self._missing = None             # a restarted stream: nothing from before it will be matched now
             self.highest_seq = seq
-        elif step < 0:
-            self.out_of_order += 1
+        elif step < 0 and self._missing is not None:
+            index = seq & 0xFFFF
+            mask = 1 << (index & 7)
+            if self._missing[index >> 3] & mask:
+                self._missing[index >> 3] &= ~mask & 0xFF
+                self.lost -= 1
+                self.out_of_order += 1
+
+    def _open_holes(self, highest: int, step: int) -> None:
+        """Mark the *step* - 1 numbers after *highest* missing and clear the one that just arrived.
+
+        Every number the stream moves past is written, set or cleared, so a bit left over from the same number one
+        16-bit cycle earlier can never be taken for a hole now."""
+        missing = self._missing
+        if missing is None:
+            return
+        for offset in range(1, step + 1):
+            index = (highest + offset) & 0xFFFF
+            mask = 1 << (index & 7)
+            if offset < step:
+                missing[index >> 3] |= mask
+            else:
+                missing[index >> 3] &= ~mask & 0xFF
 
 
 class _Call:
     """One call, keyed by its SIP Call-ID."""
 
     __slots__ = ("id", "call_id", "from_uri", "to_uri", "state", "start_ts", "answer_ts", "end_ts", "last_ts",
-                 "status", "messages", "media", "order")
+                 "status", "messages", "media", "order", "invite_cseq")
 
     def __init__(self, call_id: str, msg: Dict[str, Any], ts: float, order: int) -> None:
         self.id = _slug(call_id)
@@ -746,6 +801,9 @@ class _Call:
         self.messages: List[Dict[str, Any]] = []
         self.media: Set[Tuple[str, int]] = set()
         self.order = order
+        # the CSeq of the newest INVITE from each sender on this Call-ID: each end numbers its own requests
+        # (RFC 3261 8.1.1.5), so the caller's and a callee's re-INVITE numbers do not compare
+        self.invite_cseq: Dict[str, int] = {}
 
 
 def _in_timestamp_order(frames: Sequence[Tuple[int, int, int, bytes]],
@@ -889,7 +947,7 @@ class CallTracker:
                 return None
             call = self._start(call_id, msg, when)
             changed = True
-        changed = self._advance(call, msg, when) or changed
+        changed = self._advance(call, msg, when, str(src), str(dst)) or changed
         if call.from_uri is None:
             call.from_uri = msg.get("from_uri")
         if call.to_uri is None:
@@ -936,6 +994,15 @@ class CallTracker:
             stream = _Stream(stream_id, source[0], source[1], destination[0], destination[1], ssrc, payload_type,
                              self._codec(payload_type, destination, source), when)
             self._streams[stream_id] = stream
+        if stream.rate is None:
+            # A dynamic payload type (Opus, iLBC, AMR, speex) has no clock rate of its own: the SDP's rtpmap names
+            # it. Looked up again while it is unknown, because the SDP can arrive after the first packets (early
+            # media, a capture started mid-call). Without the SDP the rate stays unknown and jitter_ms stays None:
+            # a dynamic number means nothing on its own - 111 is Opus on one phone and something else on the next -
+            # so guessing from it could report a number in the wrong scale, which is worse than none.
+            stream.rate = self._rtpmap_rate(stream.payload_type, destination, source)
+            if stream.rate is not None and stream.codec == f"PT {stream.payload_type}":
+                stream.codec = self._codec(stream.payload_type, destination, source)
         stream.count(seq, when, len(payload), timestamp)
         cost = len(payload) + FRAME_OVERHEAD          # what the frame really costs, not just the bytes in it
         if stream.full or len(stream.frames) >= self._max_stream_packets \
@@ -1042,11 +1109,31 @@ class CallTracker:
                 self._stored_bytes -= stream.stored
 
     @staticmethod
-    def _advance(call: _Call, msg: Dict[str, Any], ts: float) -> bool:
-        """Apply the call state rules to one message; True when the state changed."""
-        kind, status = msg.get("kind"), msg.get("status")
+    def _advance(call: _Call, msg: Dict[str, Any], ts: float, src: str = "", dst: str = "") -> bool:
+        """Apply the call state rules to one message; True when the state changed.
+
+        *src* and *dst* are the addresses it travelled between: an INVITE's CSeq is kept per sender, and a response
+        is matched with the INVITEs of the end it was sent to."""
+        kind, status, cseq = msg.get("kind"), msg.get("status"), msg.get("cseq")
+        if not isinstance(cseq, int) or isinstance(cseq, bool):
+            cseq = None
         if kind == "request":
             method = msg.get("method")
+            if method == "INVITE":
+                previous = call.invite_cseq.get(src)
+                if cseq is None or (previous is not None and cseq <= previous):
+                    return False             # a retransmission of an INVITE already seen
+                if previous is None and len(call.invite_cseq) >= MAX_INVITE_SENDERS:
+                    return False             # a flood of senders on one Call-ID: keep what is already known
+                call.invite_cseq[src] = cseq
+                if previous is not None and call.state == "failed" and call.answer_ts is None:
+                    # RFC 3261 22.2: a 401 or 407 is answered by sending the INVITE again, same Call-ID, next CSeq,
+                    # with credentials. That is how nearly every call through Asterisk, FreePBX, 3CX or an
+                    # authenticating trunk starts, so the challenge was a step in the call, not its end. Any other
+                    # refusal a caller retries the same way (a 422 or a 491) reopens the call just the same.
+                    call.state, call.end_ts, call.status = "calling", None, None
+                    return True
+                return False
             if method == "BYE" and call.state != "ended":
                 call.state, call.end_ts = "ended", ts
                 return True
@@ -1056,6 +1143,13 @@ class CallTracker:
             return False
         if kind != "response" or msg.get("cseq_method") != "INVITE" or not isinstance(status, int):
             return False
+        # The newest INVITE of the end this response went to; a response to an address that sent no INVITE here
+        # (a capture that missed it) is held against the newest INVITE of any sender, the best evidence there is.
+        newest = call.invite_cseq.get(dst)
+        if newest is None and call.invite_cseq:
+            newest = max(call.invite_cseq.values())
+        if cseq is not None and newest is not None and cseq < newest:
+            return False                     # a late or repeated answer to an INVITE a newer one has replaced
         if status >= 200:
             call.status = status
         if status in (180, 183) and call.state == "calling":
@@ -1102,6 +1196,19 @@ class CallTracker:
                 return name.split("/")[0][:MAX_TEXT]
         return f"PT {payload_type}"
 
+    def _rtpmap_rate(self, payload_type: int, *endpoints: Tuple[str, int]) -> Optional[int]:
+        """The RTP clock rate an SDP rtpmap gives a payload type: ``opus/48000/2`` -> 48000 (RFC 4566 section 6: the
+        field after the encoding name is the RTP timestamp clock rate), else None."""
+        for endpoint in endpoints:
+            name = (self._rtpmap.get(endpoint) or {}).get(payload_type)
+            if not isinstance(name, str):
+                continue
+            parts = name.split("/")
+            rate = _int(parts[1].strip()) if len(parts) > 1 else None
+            if rate is not None and 1 <= rate <= MAX_CLOCK_RATE:
+                return rate
+        return None
+
     def _find(self, call_id: Any) -> Optional[_Call]:
         if not isinstance(call_id, str) or not call_id:
             return None
@@ -1137,6 +1244,17 @@ def _note(streams: Sequence[_Stream]) -> Optional[str]:
     return f"the audio is {', '.join(codecs)} and cannot be rebuilt here"
 
 
+def _jitter_measured(stream: _Stream) -> bool:
+    """True when the jitter estimate stands for the stream: every step of a short one, or :data:`MIN_JITTER_STEPS`.
+
+    A dynamic payload type's clock rate can arrive late (an rtpmap first seen in a re-INVITE near the end), and the
+    estimator then ran over only the last few packets. It starts at zero and moves a sixteenth of the way per step,
+    so a handful of steps reads as a smooth stream whatever the audio did, and the call would be called clean."""
+    if not stream.rate or stream.jitter_steps < 1:
+        return False
+    return stream.jitter_steps >= min(MIN_JITTER_STEPS, stream.packets - 1)
+
+
 def _stream_dict(stream: _Stream) -> Dict[str, Any]:
     return _shaped(STREAM_KEYS, {
         "id": stream.id, "src": stream.src, "sport": stream.sport, "dst": stream.dst, "dport": stream.dport,
@@ -1144,7 +1262,7 @@ def _stream_dict(stream: _Stream) -> Dict[str, Any]:
         "lost": stream.lost, "out_of_order": stream.out_of_order, "first_ts": stream.first_ts,
         "last_ts": stream.last_ts, "duration_s": round(max(0.0, stream.last_ts - stream.first_ts), 3),
         "bytes": stream.bytes,
-        "jitter_ms": round(stream.jitter / stream.rate * 1000.0, 3) if stream.rate and stream.packets > 1 else None,
+        "jitter_ms": round(stream.jitter / stream.rate * 1000.0, 3) if _jitter_measured(stream) else None,
         "decodable": decodable(stream.payload_type)})
 
 
