@@ -391,15 +391,18 @@
     const groups = visibleGroups(a, v6);
     if (groups.length) {
       for (const g of groups) {
-        const title = h('div', { class: 'subnet-title' },
-          h('span', { class: 'badge ' + (g.family === 6 ? 'purple' : 'blue') }, g.family === 6 ? 'IPv6' : 'IPv4'),
-          g.network ? copyCode(g.network) : h('span', { class: 'muted' }, 'no subnet'));
         const skv = h('div', { class: 'kv' });
-        const srow = (k, v) => { skv.appendChild(h('span', { class: 'k' }, k)); skv.appendChild(h('span', { class: 'v' }, v)); };
-        srow(g.addresses.length > 1 ? 'Addresses' : 'Address', g.addresses.length ? g.addresses.map((ip) => copyCode(ip)) : h('span', { class: 'muted' }, '—'));
+        const srow = (k, v, cls) => { skv.appendChild(h('span', { class: 'k' + (cls || '') }, k)); skv.appendChild(h('span', { class: 'v' + (cls || '') }, v)); };
+        // the heading is this grid's own first row rather than a line above it, so the network sits in the value
+        // column with the addresses under it instead of hard against its badge
+        srow(h('span', { class: 'badge ' + (g.family === 6 ? 'purple' : 'blue') }, (g.family === 6 ? 'IPv6' : 'IPv4') + ' Subnet'),
+          g.network ? copyCode(g.network) : h('span', { class: 'muted' }, 'no subnet'), ' subnet-title');
+        // the address is what anyone opens this card for: the one value in the panel set in bold
+        srow(g.addresses.length > 1 ? 'IP Addresses' : 'IP Address',
+          g.addresses.length ? g.addresses.map((ip) => copyCode(ip)) : h('span', { class: 'muted' }, '—'), ' subnet-ip');
         if (g.mask) srow('Mask', copyCode(g.mask));
         if (g.gateways.length) srow('Gateway', g.gateways.map((gw) => copyCode(gw)));
-        subnets.appendChild(h('div', { class: 'panel subnet' }, title, skv));
+        subnets.appendChild(h('div', { class: 'panel subnet' }, skv));
       }
     } else {
       const hiddenV6 = v6 ? 0 : hiddenV6Count(a);

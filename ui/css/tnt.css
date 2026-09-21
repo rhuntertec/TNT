@@ -653,7 +653,12 @@ code.copy.stale { color: var(--ink-soft); border-style: dashed; }
    js/views/ipinfo.js puts .off on the label instead, since this stylesheet uses no parent selector */
 .adapter-tp.off { cursor: default; opacity: 0.55; }
 .adapter-tp:hover { color: var(--ink); }
-.subnet-title { display: flex; align-items: center; gap: 8px; font-weight: 800; font-size: 14px; }
+/* the subnet panel's heading is the first row of its own .kv grid, not a line above it, so the network
+   sits in the value column with the addresses under it.  Its badge is the quiet kind: sentence case and
+   not bold, because the row is a label and the address below it is the thing worth reading */
+.subnet-title { display: flex; align-items: center; }
+.k.subnet-title .badge { font-weight: 600; font-size: 12.5px; letter-spacing: 0; text-transform: none; }
+.v.subnet-ip code.copy { font-weight: 800; }
 
 /* ---------- faults (the passive watch) ---------- */
 /* the findings list first, worst first, in the same level-tinted cards the SIP and Pro AV pages use,

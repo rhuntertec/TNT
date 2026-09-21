@@ -425,7 +425,7 @@
   };
   TNT.state = state;
   const ACCENT = { ipinfo: 'var(--blue)', ping: 'var(--green)', outages: 'var(--yellow)', speed: 'var(--purple)', discovery: 'var(--orange)', tools: 'var(--red)', wifi: 'var(--teal)', reports: 'var(--grey)', capture: 'var(--pink)', proav: 'var(--lime)', sip: 'var(--sand)', faults: 'var(--rust)' };
-  const VIEW_NAMES = ['ipinfo', 'ping', 'outages', 'speed', 'discovery', 'capture', 'faults', 'wifi', 'sip', 'proav', 'tools', 'reports'];   // the tile order of index.html
+  const VIEW_NAMES = ['ipinfo', 'ping', 'outages', 'speed', 'discovery', 'capture', 'faults', 'sip', 'wifi', 'proav', 'tools', 'reports'];   // the tile order of index.html
   //: the tiles under the four full-height ones, half height with a two-line body (.tile.half in css/tnt.css)
   //: the main tools Settings can switch off, in tile order (tnt.config.TOOLS). A tool that is off has no tile
   //: and no page, and its service side takes no automated action either — the switch is one setting, not two.
@@ -457,7 +457,7 @@
   function liveViews() { return VIEW_NAMES.filter(toolOn); }
 
   //: every tile is half height now — the four that used to be tall said more than a glance needs
-  const HALF_TILES = ['ipinfo', 'ping', 'outages', 'speed', 'discovery', 'capture', 'faults', 'wifi', 'sip', 'proav', 'tools', 'reports'];
+  const HALF_TILES = ['ipinfo', 'ping', 'outages', 'speed', 'discovery', 'capture', 'faults', 'sip', 'wifi', 'proav', 'tools', 'reports'];
 
   /* ================================================================ theme */
   function setTheme(theme, opts) {

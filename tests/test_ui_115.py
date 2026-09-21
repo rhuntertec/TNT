@@ -1386,7 +1386,7 @@ def test_network_info_card_follows_the_link_map_and_checks_nat_by_itself_in_a_br
     """§5.1 / §5.3: at 1366 px the NAT & switch port card is the grid cell right after the live link map (one cell of the same
     width in the same row, no title icon, two sections; the port-forward test is a Tools card now). On network "a" it POSTs one
     check by itself once the link map has this network's public address and shows the verdict's title as a green badge, "· high
-    confidence", the explanation and folded Details; the switch port section waits to be asked."""
+    confidence", the explanation and folded Details; the switch port section is listening by itself."""
     mod, state, port = mock.mod, mock.state, mock.port
     monkeypatch.setattr(mod, "NET_RECHECK_S", 0.0)          # this network's public address is looked up at once after a change
     posts: List[Dict[str, Any]] = []
@@ -1428,7 +1428,8 @@ def test_network_info_card_follows_the_link_map_and_checks_nat_by_itself_in_a_br
     assert d["note"] == "Only forwards the router shares over UPnP; ones made in its own settings page may be missing."
     assert res["forwards"] == [[m["protocol"], f"{m['external_port']} → {m['internal_client']}:{m['internal_port']}", m["description"]] for m in entries]
     assert res["showButton"] == "Hide"
-    assert res["switch"] == {"buttons": ["Find switch port"], "options": ["Ethernet (internet)", "Ethernet 2", "Ethernet 3"], "result": False}
+    # the switch half checks itself too: a listen for this network is already under way, so Stop is the only control
+    assert res["switch"] == {"buttons": ["Stop"], "options": [], "result": False}
     assert res["portCard"] is True, "the port-forward test is a Tools card now, not a section of this card"
     assert res["wanTitle"].startswith("This network's public address as the internet sees it (behind double NAT or CGNAT this is not the "
                                       "router's own address) · "), res["wanTitle"]
@@ -1486,8 +1487,14 @@ def test_port_forward_result_is_cleared_after_a_network_change_in_a_browser(brow
 
 _SWITCH_PROBE = r"""
 async function run() {
-  const doc = await until(() => app() && app().querySelector('#view .netcheck-card [data-nc="find"]') && app(), 10000);
+  const doc = await until(() => app() && app().querySelector('#view .netcheck-card .nc-switch-body') && app(), 10000);
   const body = doc.querySelector('#view .netcheck-card .nc-switch-body');
+  // a listen nobody asked for is under way (or, on a slow machine, already answered): let it finish.  The waits
+  // are real seconds, because the page's clock is virtual and the mock listens in real time
+  await until(() => body.querySelector('[data-nc="stop"]') || body.querySelector('.nc-result'), 20000);
+  await realWait(900);
+  await until(() => body.querySelector('.nc-result') && body.querySelector('[data-nc="find"]'), 20000);
+  out.automatic = { lines: texts(body.querySelectorAll('.nc-result')), buttons: texts(body.querySelectorAll('.nc-actions button')) };
   const select = body.querySelector('select');
   out.before = { options: texts(select.options), picked: select.value, buttons: texts(body.querySelectorAll('button')) };
   select.value = 'Ethernet 2';
@@ -1515,8 +1522,9 @@ async function run() {
 
 
 def test_switch_port_listen_then_done_in_a_browser(browser_page, mock, monkeypatch):
-    """§5.4: "Find switch port" on the adapter picked in the select listens (a countdown fuse and Stop, no other control), polls
-    while the mock listens, then names the switch and the port with folded Details and the result note."""
+    """§5.4: a listen starts by itself on the internet adapter; "Find switch port" on the adapter picked in the select then
+    listens again (a countdown fuse and Stop, no other control), polls while the mock listens, then names the switch and the
+    port with folded Details and the result note."""
     mod, state = mock.mod, mock.state
     try:
         with _knobs(state, switch_listen_s=0.4, switch_found=True, switch_job=None, switch_kept={}, nat_last=None, nat_delay_s=0.0, pktmon_reason=None):
@@ -1525,7 +1533,10 @@ def test_switch_port_listen_then_done_in_a_browser(browser_page, mock, monkeypat
         state.switch_stop()
         state.nat_last = None
     n = mod.MOCK_NEIGHBOR
-    assert res["before"] == {"options": ["Ethernet (internet)", "Ethernet 2", "Ethernet 3"], "picked": "Ethernet", "buttons": ["Find switch port"]}
+    auto_line = f"{n['switch_name']} · {n['port_description'] or n['port_id']} · {n['vendor']} · VLAN {n['vlan']}"
+    assert res["automatic"] == {"lines": [auto_line], "buttons": ["Find switch port"]}, "the listen nobody asked for"
+    assert res["before"] == {"options": ["Ethernet (internet)", "Ethernet 2", "Ethernet 3"], "picked": "Ethernet",
+                             "buttons": ["Details", "Find switch port"]}
     listening = res["listening"]
     left = re.fullmatch(r"Listening for the switch… (\d+) s", listening["fuse"] or "")
     assert left and 55 <= int(left.group(1)) <= 65, listening
@@ -1541,6 +1552,129 @@ def test_switch_port_listen_then_done_in_a_browser(browser_page, mock, monkeypat
     assert len(d["via"]) == 1 and d["via"][0].startswith("via LLDP"), d["via"]
     assert d["note"].startswith("If a small switch or a phone sits between this PC and the wall jack")
     assert res["job"] == {"state": "done", "adapter": "Ethernet 2"}
+
+
+_SWITCH_AUTO_PROBE = r"""
+async function run() {
+  const win = frame.contentWindow;
+  const body = await until(() => { const d = app(); return d && d.querySelector('#view .netcheck-card .nc-switch-body'); }, 10000);
+  // nobody clicked anything: the listen is under way as soon as the card knows which network this is - or, if this
+  // machine was slow enough for the mock's 0.4 s listen to finish first, already answered
+  const phase = await until(() => (body.querySelector('[data-nc="stop"]') && 'listening') || (body.querySelector('.nc-result') && 'done'), 20000);
+  out.listening = { phase, stop: !!body.querySelector('[data-nc="stop"]'), find: !!body.querySelector('[data-nc="find"]'),
+                    fuse: text(body.querySelector('.fuse-label .l')) };
+  await realWait(900);
+  await until(() => body.querySelector('.nc-result'), 20000);
+  out.found = texts(body.querySelectorAll('.nc-result'));
+  // leaving Network info and coming back must not start a second one: the answer is already there
+  win.location.hash = '#ping';
+  await until(() => !app().querySelector('#view .netcheck-card'), 10000);
+  win.location.hash = '#ipinfo';
+  const again = await until(() => { const d = app(); return d && d.querySelector('#view .netcheck-card .nc-switch-body'); }, 10000);
+  await realWait(900);
+  out.back = { result: texts(again.querySelectorAll('.nc-result')), listening: !!again.querySelector('[data-nc="stop"]') };
+  // the select is moved off the default first: the pick belongs to this network and must not outlive it
+  const sel = again.querySelector('select');
+  sel.value = 'Ethernet 3';
+  fire(sel, 'change');
+  // the PC joins another network. This one is wireless, so there is nothing to listen on and the section says so
+  const profile = (name) => frame.contentWindow.fetch('/mock/network', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                                                         body: JSON.stringify({ profile: name }) }).then((r) => r.json());
+  await profile('b');
+  await until(() => again.textContent.indexOf('Needs a wired') >= 0, 20000);
+  out.wireless = { text: again.textContent.trim(), listening: !!again.querySelector('[data-nc="stop"]'),
+                   result: texts(again.querySelectorAll('.nc-result')) };
+  // back to the wired one: a network change is the other thing that makes it look without being asked
+  await profile('a');
+  await until(() => again.querySelector('[data-nc="stop"]') || again.querySelector('.nc-result'), 20000);
+  await realWait(900);
+  await until(() => again.querySelector('.nc-result'), 20000);
+  out.afterChange = texts(again.querySelectorAll('.nc-result'));
+}
+"""
+
+
+def test_the_switch_port_looks_by_itself_once_per_network_in_a_browser(browser_page, mock, monkeypatch):
+    """§5.4: nobody has to press "Find switch port".  The listen goes out on its own once the card knows which
+    network this is; leaving Network info and coming back shows the answer without listening again, and
+    joining another network looks again - unless that network is wireless, with nothing to listen on."""
+    mod, state = mock.mod, mock.state
+    starts = []
+    real_start = state.switch_start
+
+    def counted(adapter, seconds):
+        starts.append(adapter)
+        return real_start(adapter, seconds)
+
+    monkeypatch.setattr(state, "switch_start", counted)
+    try:
+        with _knobs(state, switch_listen_s=0.4, switch_found=True, switch_job=None, switch_kept={}, nat_last=None, nat_delay_s=0.0,
+                    pktmon_reason=None):
+            res = _run_probe(browser_page, mock, monkeypatch, "switch-auto-probe.html", "ipinfo", _SWITCH_AUTO_PROBE, budget_ms=60000)
+    finally:
+        state.switch_stop()
+        state.switch_network("a")
+        state.nat_last = None
+    n = mod.MOCK_NEIGHBOR
+    line = f"{n['switch_name']} · {n['port_description'] or n['port_id']} · {n['vendor']} · VLAN {n['vlan']}"
+    # whether the listen is still running when the probe first looks is a race with the mock's real-time worker;
+    # what is not a race is that it went out at all, which `starts` below counts
+    assert res["listening"]["phase"] in ("listening", "done"), res["listening"]
+    if res["listening"]["phase"] == "listening":
+        assert (res["listening"]["stop"], res["listening"]["find"]) == (True, False), res["listening"]
+        assert (res["listening"]["fuse"] or "").startswith("Listening for the switch…"), res["listening"]
+    assert res["found"] == [line], "the switch is named without anyone asking"
+    assert res["back"] == {"result": [line], "listening": False}, "coming back listens again"
+    assert res["wireless"] == {"text": "Needs a wired (Ethernet) connection", "listening": False, "result": []}, \
+        "a wireless network has nothing to listen on"
+    assert res["afterChange"] == [line], "a network change looks again"
+    # the select has already settled on the internet adapter by the time each listen goes out, so that is the one it
+    # names - the second one too, because a network change forgets the adapter the select had been moved to
+    assert starts == ["Ethernet", "Ethernet"], "one listen for each wired network, on the adapter the select is showing"
+
+
+_SWITCH_STOP_PROBE = r"""
+async function run() {
+  const body = await until(() => { const d = app(); return d && d.querySelector('#view .netcheck-card .nc-switch-body'); }, 10000);
+  // this listen was already running when the page opened - another window started it, or this one before a reload
+  await until(() => body.querySelector('[data-nc="stop"]'), 20000);
+  out.inherited = { stop: !!body.querySelector('[data-nc="stop"]'), find: !!body.querySelector('[data-nc="find"]') };
+  body.querySelector('[data-nc="stop"]').click();
+  await until(() => !body.querySelector('[data-nc="stop"]'), 20000);
+  // and now every chance to start another: real seconds, so the status polls and their switchDecide really run
+  for (let i = 0; i < 4; i++) await realWait(600);
+  const status = await frame.contentWindow.fetch('/api/netcheck/switch').then((r) => r.json());
+  out.after = { state: status.job.state, listening: !!body.querySelector('[data-nc="stop"]'),
+                find: !!body.querySelector('[data-nc="find"]') };
+}
+"""
+
+
+def test_stopping_a_listen_this_page_did_not_start_stops_it_for_good(browser_page, mock, monkeypatch):
+    """§5.4: the automatic listen must not undo a Stop.  A page that inherits a running listen never started one
+    itself, and a cancelled job is "no answer" - so without care the next status snapshot starts a fresh 65 s
+    listen the person just cancelled, and says nothing about it."""
+    state = mock.state
+    starts = []
+    real_start = state.switch_start
+
+    def counted(adapter, seconds):
+        starts.append(adapter)
+        return real_start(adapter, seconds)
+
+    try:
+        with _knobs(state, switch_listen_s=30.0, switch_found=True, switch_job=None, switch_kept={}, nat_last=None,
+                    nat_delay_s=0.0, pktmon_reason=None):
+            real_start(None, None)                      # the other window's listen, running before this page opens
+            monkeypatch.setattr(state, "switch_start", counted)
+            res = _run_probe(browser_page, mock, monkeypatch, "switch-stop-probe.html", "ipinfo", _SWITCH_STOP_PROBE,
+                             budget_ms=60000)
+    finally:
+        state.switch_stop()
+        state.nat_last = None
+    assert res["inherited"] == {"stop": True, "find": False}, "the page shows the listen it found running"
+    assert res["after"] == {"state": "cancelled", "listening": False, "find": True}, res["after"]
+    assert starts == [], "a listen the person stopped was started again by itself"
 
 
 _TFTP_PROBE = r"""

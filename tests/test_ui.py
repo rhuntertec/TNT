@@ -41,11 +41,11 @@ JS_FILES = [
     "js/views/faults.js",
     "js/egg.js", "js/app.js",
 ]
-VIEW_NAMES = ["ipinfo", "ping", "outages", "speed", "discovery", "capture", "faults", "wifi", "sip", "proav",
+VIEW_NAMES = ["ipinfo", "ping", "outages", "speed", "discovery", "capture", "faults", "sip", "wifi", "proav",
               "tools", "reports"]
 # the tiles of index.html, in order: the four full-height ones, then the six that carry `class="tile half"`
 # the tile order of index.html: the order the owner asked for, not a grouping the code derives
-TILE_NAMES = ["ipinfo", "ping", "outages", "speed", "discovery", "capture", "faults", "wifi", "sip", "proav",
+TILE_NAMES = ["ipinfo", "ping", "outages", "speed", "discovery", "capture", "faults", "sip", "wifi", "proav",
               "tools", "reports"]
 # every tile is half height now: the first four used to be 150 px and carried three or four lines
 HALF_TILES = list(TILE_NAMES)
@@ -207,7 +207,7 @@ def test_tools_view_markup_tile_and_danger_modal():
     assert 'class="tile half" data-view="tools" href="#tools" style="--accent: var(--red)"' in html
     assert 'data-icon="tools"' in html and 'id="tile-tools"' in html
     app = _read("js/app.js")
-    assert "tools: 'var(--red)'" in app and "'sip', 'proav', 'tools', 'reports'];" in app
+    assert "tools: 'var(--red)'" in app and "'wifi', 'proav', 'tools', 'reports'];" in app
     assert "tools:" in app and "warning:" in app and "dhcp:" in app  # icons
     # the Tools tile: the DHCP server's state, then the other tools by name as plain text
     assert "tileEls.tools" in app and "DHCP client" in app and "Tools for the field" not in app
@@ -1239,7 +1239,7 @@ def test_wifi_tile_view_and_accent():
     # the tile order of index.html, each with its own accent. SIP's --sand was the eleventh and spent
     # the original palette; Faults' --rust was added for the twelfth.
     assert [(name, accent) for _, name, accent in tiles] == list(zip(TILE_NAMES, [
-        "blue", "green", "yellow", "purple", "orange", "pink", "rust", "teal", "sand", "lime", "red", "grey"]))
+        "blue", "green", "yellow", "purple", "orange", "pink", "rust", "sand", "teal", "lime", "red", "grey"]))
     # no two tiles share an accent: two the same colour stop being tellable apart at a glance
     accents = [accent for _, _, accent in tiles]
     assert len(accents) == len(set(accents)), accents
@@ -1251,7 +1251,7 @@ def test_wifi_tile_view_and_accent():
     # that could leave the new tile out (the only reorderable tiles are the Ping page's targets)
     app = _read("js/app.js")
     assert "wifi: 'var(--teal)'" in app and "faults: 'var(--rust)'" in app
-    assert "'discovery', 'capture', 'faults', 'wifi', 'sip', 'proav', 'tools', 'reports'];" in app
+    assert "'discovery', 'capture', 'faults', 'sip', 'wifi', 'proav', 'tools', 'reports'];" in app
     # app.js names the half-height tiles too (the markup carries the class): the two lists must not drift apart
     assert "const HALF_TILES = " + repr(HALF_TILES).replace('"', "'") + ";" in app
     assert "tileEls.wifi" in app and "tileSummary(ws.last, ws.bridgeState(), ws.error)" in app
@@ -4610,7 +4610,7 @@ def test_top_bar_stays_one_row_in_a_browser(browser_page, mock, monkeypatch):
 # the tile shortcuts: the small squares that ride up into the header row once the tiles are scrolled away
 # ---------------------------------------------------------------------------
 #: the one word under each icon, in tile order
-JUMP_LABELS = ["Network", "Ping", "Outages", "Speed", "Discovery", "Capture", "Faults", "WiFi", "SIP", "ProAV",
+JUMP_LABELS = ["Network", "Ping", "Outages", "Speed", "Discovery", "Capture", "Faults", "SIP", "WiFi", "ProAV",
                "Tools", "Reports"]
 
 

@@ -6,10 +6,12 @@
      after the change). While a check runs (ours, another window's, a 409 or a request that timed out on this side) the
      badge reads "Checking…" and GET is polled every 2 s. Details (folded): the router's own internet address, the public
      address, UPnP, the forwards the router shares over UPnP (a "Show" table) and the self-traceroute path.
-   * Switch port - LLDP: "Find switch port" (with a select when two or more wired adapters are up) asks the service to
-     listen for LLDP / CDP (POST /api/netcheck/switch). While it listens a fuse counts the seconds down, and GET is polled
-     every 2 s besides the netcheck.switch events. The result line names the switch, the port, its manufacturer and the
-     VLAN; Details (folded) the rest.
+   * Switch port - LLDP: the service listens for LLDP / CDP (POST /api/netcheck/switch) on a wired adapter. The listen
+     starts by itself once the status names this network, when the network has no answer on the card and none has been
+     asked for yet, so opening the page or changing network looks without anyone clicking; "Find switch port" (with a
+     select when two or more wired adapters are up) is the same request by hand. While it listens a fuse counts the
+     seconds down, and GET is polled every 2 s besides the netcheck.switch events. The result line names the switch, the
+     port, its manufacturer and the VLAN; Details (folded) the rest.
    The port-forward test moved to its own Tools card (js/tools/portforward.js). A new network generation clears every
    result on screen at once and starts over. Whatever comes from the router or the switch is inserted as text, never as markup.
    Loaded before app.js: TNT.util / TNT.ui / TNT.state are only touched inside functions. */
@@ -25,6 +27,12 @@
   const NO_PUBLIC_IP = 'no public address yet';
   const IPV4_RE = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/;
   let seq = 0;                          // ids for aria-controls, one set per card
+  /* The switch port looks for itself: once when the page opens and once on every network change, so the answer is
+     already on the card. This is the network a listen has gone out for (autoKey(): the service instance and the
+     generation), kept outside create() so that leaving Network info and coming back does not start another one.
+     A packet capture is unaffected either way: it runs its own ETW session and does not share Packet Monitor with
+     this (tnt/capture.py). */
+  let autoGen = '';
 
   /** The service's NAT_TEXT (tnt/natcheck.py): verdict -> [title, explanation], shown as they are. */
   const NAT_TEXT = {
@@ -377,6 +385,7 @@
     /* ==================================================== switch port */
     let sw = null;                  // SWITCH_STATUS: { job, adapters, available, reason }
     let swError = '';               // why the section cannot look (a request that failed)
+    let swLoaded = false;           // this network's first GET answered
     let swBusy = false;             // a start or stop request is in flight
     let swAdapter = '';             // the adapter picked in the select (two or more wired adapters)
     let swOpen = false, swKey = null;
@@ -395,6 +404,29 @@
       if (!j || j.state === 'idle' || j.state === 'cancelled') return null;
       return j.state === 'listening' || sameGen(j) ? j : null;
     }
+    /** What a listen is remembered against: this service instance and this network. The generation alone would not do
+     *  — it counts from the same number again when the service restarts, which is exactly when its kept answer is gone
+     *  and the listen is wanted. '' while the status does not name a network yet (nothing starts then). */
+    function autoKey() {
+      if (gen == null) return '';
+      const st = status();
+      return (st && st.started_ts != null ? String(st.started_ts) : '') + '#' + String(gen);
+    }
+
+    /** Whether to listen without being asked: once the status names this network, when nothing is running, the network
+     *  has no answer on the card, a wired adapter exists and no listen has gone out for it yet. A listen the user stopped
+     *  counts as gone out, whoever started it, so opening the page again does not undo the stop. */
+    function switchDecide() {
+      if (!alive || !swLoaded || swBusy || swError) return;
+      if (!sw || sw.available === false) return;
+      if (listening() || shownJob()) return;
+      const adapters = Array.isArray(sw.adapters) ? sw.adapters.filter(isObj) : [];
+      if (!adapters.length) return;
+      const key = autoKey();
+      if (!key || autoGen === key) return;
+      switchStart(false);
+    }
+
     /** How far a listen is: the service's elapsed_s moved on by the time since that snapshot (at most 5 s, so a stalled poll
      *  does not run the countdown out) -> { left (whole seconds), pct }. */
     function listenTime(j) {
@@ -468,7 +500,7 @@
             sel.value = swAdapter;
             row.appendChild(sel);
           }
-          row.appendChild(h('button', { class: 'btn btn-sm', type: 'button', disabled: swBusy, data: { nc: 'find' }, on: { click: switchStart },
+          row.appendChild(h('button', { class: 'btn btn-sm', type: 'button', disabled: swBusy, data: { nc: 'find' }, on: { click: () => switchStart(true) },
             title: 'Listen for the switch\'s LLDP or CDP announcement on this wired adapter (about a minute at most)' },
             TNT.ui.icon('search'), retry ? TEXTS.tryAgain : TEXTS.findSwitch));
         }
@@ -504,24 +536,31 @@
         else if (!sw) swError = 'Could not read the switch port: ' + (err.message || 'unknown error');
         // a failed poll keeps what is on screen and tries again
       }
+      swLoaded = true;
       renderSwitch();
       followSwitch();
+      switchDecide();
     }
 
-    async function switchStart() {
+    /** POST: the automatic listen, or "Find switch port" (manual: a request that fails says so in a toast). */
+    async function switchStart(manual) {
       if (!alive || swBusy) return;
       const mine = swSeq;
+      autoGen = autoKey() || autoGen;            // looked for on this network: the automatic listen stays out of it now
       swBusy = true;
       renderSwitch();
       try {
-        const r = await TNT.api.switchStart({ adapter: swAdapter || null, seconds: null });
+        // the select's adapter, but only while this network still has it: a name left over from the network before
+        // is a 400 the automatic listen would swallow, so let the service pick instead
+        const names = sw && Array.isArray(sw.adapters) ? sw.adapters.filter(isObj).map((a) => String(a.name || '')) : [];
+        const r = await TNT.api.switchStart({ adapter: names.indexOf(swAdapter) >= 0 ? swAdapter : null, seconds: null });
         if (!alive || mine !== swSeq) return;
         if (r && isObj(r.job)) sw = Object.assign({}, sw || {}, { job: r.job });
         swOpen = false;
       } catch (err) {
         if (!alive || mine !== swSeq) return;
         if (err.status === 404 || err.status === 503) swError = err.status === 503 && err.message ? err.message : TEXTS.switchUnavailable;
-        else TNT.ui.toast(err.message || 'Could not start listening for the switch', 'warn');
+        else if (manual) TNT.ui.toast(err.message || 'Could not start listening for the switch', 'warn');
         if (err.status === 409) switchLoad();            // Packet Monitor is busy or cannot run: read the status again
       } finally {
         if (alive && mine === swSeq) { swBusy = false; renderSwitch(); followSwitch(); }
@@ -531,6 +570,9 @@
     async function switchStop() {
       if (!alive || swBusy) return;
       const mine = swSeq;
+      // a listen this page inherited (a reload, another window, a network change mid-listen) never wrote the key, and a
+      // cancelled job is "no answer" to shownJob(): without this the next status snapshot would start another one
+      autoGen = autoKey() || autoGen;
       swBusy = true;
       renderSwitch();
       try {
@@ -556,7 +598,7 @@
     function switchReset() {
       swSeq++;
       stopSwitchTimers();
-      swBusy = false; swOpen = false;
+      swBusy = false; swOpen = false; swLoaded = false; swAdapter = '';
       if (sw) sw = Object.assign({}, sw, { job: null });
     }
 
@@ -593,6 +635,7 @@
         renderNat();          // the waiting line follows the link map's public address
         renderSwitch();       // "via LLDP · 2 min ago"
         natDecide();
+        switchDecide();       // the snapshot is what names this network, and the automatic listen waits for it
       },
       unmount() {
         alive = false;

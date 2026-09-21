@@ -66,14 +66,14 @@ def _node(tmp_path: Path, body: str, files: List[str], payload: Any = None) -> A
 # ---------------------------------------------------------------------------
 # markup, registries and CSS
 # ---------------------------------------------------------------------------
-def test_the_tile_sits_between_wifi_and_pro_av():
+def test_the_tile_sits_between_faults_and_wifi():
     html = _read("index.html")
-    assert TILE_NAMES[TILE_NAMES.index("sip") - 1] == "wifi"
-    assert TILE_NAMES[TILE_NAMES.index("sip") + 1] == "proav"
+    assert TILE_NAMES[TILE_NAMES.index("sip") - 1] == "faults"
+    assert TILE_NAMES[TILE_NAMES.index("sip") + 1] == "wifi"
     assert '<a class="tile half" data-view="sip" href="#sip" style="--accent: var(--sand)">' in html
     assert '<span class="tile-icon" data-icon="sip"></span><span class="tile-title">SIP</span>' in html
     assert '<div class="tile-body" id="tile-sip">' in html
-    assert html.index('data-view="wifi"') < html.index('data-view="sip"') < html.index('data-view="proav"')
+    assert html.index('data-view="faults"') < html.index('data-view="sip"') < html.index('data-view="wifi"')
     # the scripts load in dependency order, which is not the tile order and never was
     assert html.index("js/views/proav.js") < html.index("js/views/sip.js") < html.index("js/app.js")
 
