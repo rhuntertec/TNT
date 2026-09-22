@@ -158,6 +158,18 @@ Contract gaps resolved here (documented deviations):
   that is not an IPv4/IPv6 address); ``POST /api/geoip/check`` (Retry now, no body) is STATUS, or 409 ``conflict``
   when the setting is off.  All three are 503 without the component.  The lazily built tracer gets the manager
   as its ``geo`` provider, so every traceroute HOP carries ``"location"`` (LOCATION or null).
+* Clear history (Settings, :mod:`tnt.history`): ``GET /api/history`` is ``{"ranges": [{"key","label"}...], "last":
+  {"since_ts","at","range"}|null}``.  ``POST /api/history/clear`` ``{"range": key}`` runs ``engine.clear_history(key,
+  captures_allowed=, captures_reason=)`` and answers its result (``{"range","label","since_ts","ts","cleared","stopped",
+  "skipped"}``, also the ``history.cleared`` event).  It refuses a browser page of another origin (403 ``forbidden``), a
+  key that is not one of the eight or a body that is not an object (400 ``bad_range``), a clear while a Full Scan runs
+  (409 ``full_scan_running``) or while another clear runs (409 ``clear_running``); 503 when the engine cannot clear.
+  Packet captures are cleared only for a Windows administrator (``_admin_decision(req, api, "clear packet captures")``,
+  failing closed): anyone else gets them in ``skipped`` (:data:`CLEAR_CAPTURES_ADMIN_REQUIRED_MSG` /
+  :data:`CLEAR_CAPTURES_ADMIN_UNVERIFIED_MSG`) and the rest cleared; the administrator's answer names each capture file
+  left alone, the published event only counts them.  ``GET /api/outages/timeline`` carries ``"cleared":
+  [{"start_ts","end_ts"}]``.  ``POST /api/reports/scan`` goes through ``engine.outside_clear`` when there is one: 409
+  ``clear_running`` while a clear runs.
 """
 from __future__ import annotations
 
@@ -891,6 +903,12 @@ UPDATE_ADMIN_UNVERIFIED_MSG = ("Installing an update needs a Windows administrat
 CAPTURE_ADMIN_REQUIRED_MSG = "Packet capture needs a Windows administrator account."
 CAPTURE_ADMIN_UNVERIFIED_MSG = ("Packet capture needs a Windows administrator account; "
                                 "this request could not be verified as one.")
+#: ``skipped`` reasons of POST /api/history/clear when the caller may not clear packet captures (a standard user, and a
+#: caller that could not be verified): the rest of the history is still cleared.
+#: (No closing period: the page adds one after every reason.)
+CLEAR_CAPTURES_ADMIN_REQUIRED_MSG = "Packet captures need a Windows administrator account, so they were left alone"
+CLEAR_CAPTURES_ADMIN_UNVERIFIED_MSG = ("This request could not be verified as a Windows administrator's, so packet captures "
+                                       "were left alone")
 #: Event types GET /api/events sends only to a Windows administrator, as every packet capture route answers only one:
 #: ``capture.state`` carries the open capture (adapter, counts, file name) and ``capture.sip`` a SIP call that was found
 #: (the numbers that called each other).
@@ -930,6 +948,20 @@ def _wifi_reveal_check(api: Any) -> Optional[Callable[[Any, Any], str]]:
         log.warning("tnt.peer could not be imported; refusing to reveal Wi-Fi keys", exc_info=True)
         return None
     return reveal_allowed
+
+
+def _full_scan_running(engine: Any) -> bool:
+    """Whether a Full Scan runs now: ``engine.full_scan_running()``, else the status of ``engine.reports.job()``."""
+    fn = getattr(engine, "full_scan_running", None)
+    try:
+        if callable(fn):
+            return bool(fn())
+        job_fn = getattr(getattr(engine, "reports", None), "job", None)
+        job = job_fn() if callable(job_fn) else None
+    except Exception:  # noqa: BLE001
+        log.exception("reading the Full Scan job failed")
+        return False
+    return isinstance(job, dict) and job.get("status") == "running"
 
 
 def _admin_decision(req: Request, api: Any, what: str) -> str:
@@ -1213,6 +1245,47 @@ def build_routes(engine: Any, api: Any) -> Router:
         hours = req.query_float("hours", 24.0) or 24.0
         hours = max(0.25, min(24.0 * 366, float(hours)))
         return tracker.timeline(hours)
+
+    # -- clear history (Settings) ---------------------------------------------
+    @r.get("/api/history")
+    def history_status(req: Request) -> Any:
+        """``{"ranges": [{"key","label"}...], "last": {"since_ts","at","range"}|null}`` for the Settings status line."""
+        hist = _lazy("tnt.history", "clear history")
+        return hist.history_view(getattr(engine, "db", None))
+
+    @r.post("/api/history/clear")
+    def history_clear(req: Request) -> Any:
+        """``{"range": key}`` -> the clear's result (``Engine.clear_history``), also published as ``history.cleared``.  A
+        browser page of another origin is refused first (403 ``forbidden``), then anything but the eight range keys or a
+        non-object body (400 ``bad_range``), then 409 ``full_scan_running`` / ``clear_running``.  Packet captures are only
+        cleared for a Windows administrator (the capture routes' check, failing closed): for anyone else they are left
+        alone and named in ``skipped`` while the rest clears."""
+        _quick_tool_origin(req, "Clear history")
+        hist = _lazy("tnt.history", "clear history")
+        try:
+            body = req.json()
+        except ApiError:
+            body = None
+        key = body.get("range") if isinstance(body, dict) else None
+        if not hist.valid_range(key):
+            raise ApiError(400, "bad_range", hist.BAD_RANGE_MSG)
+        clear = getattr(engine, "clear_history", None)
+        if not callable(clear):
+            raise ApiError(503, "unavailable", "Clearing history is not available")
+        if _full_scan_running(engine):
+            raise ApiError(409, "full_scan_running", hist.FULL_SCAN_RUNNING_MSG)
+        running = getattr(engine, "clear_running", None)
+        if callable(running) and running():
+            raise ApiError(409, "clear_running", hist.CLEAR_RUNNING_MSG)
+        decision = _admin_decision(req, api, "clear packet captures")
+        reason = None if decision == "allowed" else (
+            CLEAR_CAPTURES_ADMIN_REQUIRED_MSG if decision == "denied" else CLEAR_CAPTURES_ADMIN_UNVERIFIED_MSG)
+        try:
+            return clear(key, captures_allowed=decision == "allowed", captures_reason=reason)
+        except hist.ClearConflict as exc:
+            raise ApiError(409, exc.code, exc.message) from None
+        except ValueError as exc:
+            raise ApiError(400, "bad_range", str(exc)) from None
 
     # -- speed tests --------------------------------------------------------
     @r.get("/api/speedtests")
@@ -1994,12 +2067,22 @@ def build_routes(engine: Any, api: Any) -> Router:
         mod = _reports_mod()
         body = req.json_object() if req.body and req.body.strip() else {}
         site = _site_field(body, required=False)
+        # a Full Scan reads the history as it goes: none starts while Settings > "Clear history" runs (409
+        # clear_running), through the Engine's gate, so the clear sees this scan running once it has started
+        outside_clear = getattr(engine, "outside_clear", None)
+        cleared_conflict: Any = ()                  # catches nothing without the gate
+        if callable(outside_clear):
+            cleared_conflict = _lazy("tnt.history", "Full Scan").ClearConflict
         try:
+            if callable(outside_clear):
+                return {"job": outside_clear(lambda: mgr.start_scan(site))}
             return {"job": mgr.start_scan(site)}
         except mod.ScanBusy as exc:
             return _scan_conflict(exc)
         except mod.ScanConflict as exc:
             raise ApiError(503, "unavailable", str(exc)) from exc
+        except cleared_conflict as exc:
+            raise ApiError(409, exc.code, exc.message) from None
 
     def scan_name(req: Request) -> Any:
         mgr = _reports()

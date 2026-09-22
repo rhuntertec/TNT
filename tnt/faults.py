@@ -74,6 +74,9 @@ Shapes
 * :meth:`FaultWatcher.tile` -> ``status.faults``: the worst level, how many of each, and one line.
 * A ``faults.state`` event is published when the **level changes**, not every tick - a tile that is
   green does not need to say so once a second.
+* :meth:`FaultWatcher.clear_history` (Settings > Clear history) starts the whole watch again from
+  now, whatever the range, because every figure is a difference of cumulative counters; it
+  publishes ``faults.state`` too.
 """
 from __future__ import annotations
 
@@ -629,6 +632,16 @@ class _Nic:
         self.latest_ts = ts
         self.history: Deque[Tuple[float, Any]] = deque([(ts, counters)])
 
+    def restart(self, since: float, counters: Any = None, ts: Optional[float] = None) -> None:
+        """History cleared: the latest reading (or *counters* read at *ts*, a reading that was taken while the
+        clear ran) becomes the baseline and the only reading kept, and this adapter's watch counts from *since*.
+        Unlike :meth:`rebase` the reading keeps its own time, so "last read" stays true."""
+        if counters is not None:
+            self.latest, self.latest_ts = counters, float(self.latest_ts if ts is None else ts)
+        self.first = self.latest
+        self.first_ts = float(since)
+        self.history = deque([(self.latest_ts, self.latest)])
+
     def advance(self, counters: Any, ts: float) -> None:
         """A new reading.  The history keeps every reading inside :data:`RATE_WINDOW_S` of it plus the
         newest one at or before the window's start, so the window always spans the whole of it (and,
@@ -691,6 +704,8 @@ class FaultWatcher:
         self._gateway: Optional[str] = None
         self._level = "good"
         self._good_since: Optional[float] = None       # when the level last turned "good"
+        # how many times the history has been cleared: a tick whose readings straddle a clear sees it change
+        self._cleared = 0
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -790,6 +805,7 @@ class FaultWatcher:
         wall = float(self._clock() if now is None else now)
         problems: List[str] = []
         blind = set()
+        cleared = self._cleared                   # before anything is read: see clear_history
 
         try:
             counters = list(self._read_counters())
@@ -836,8 +852,20 @@ class FaultWatcher:
             self._gateway = gateway
             for luid in [k for k, n in self._gone.items() if now - n.latest_ts >= RATE_WINDOW_S]:
                 del self._gone[luid]          # its window is empty: a new adapter if it returns
+            # The history was cleared while this tick was reading.  What it read may be from before the clear, so
+            # it is only the new baseline: folded in as a reading, the errors the clear removed would come back.
+            straddled = self._cleared != cleared
             for c in counters:
                 nic = self._nics.get(c.luid)
+                if straddled:
+                    if nic is None:
+                        nic = self._gone.pop(c.luid, None)
+                    if nic is None:
+                        nic = _Nic(c, now)
+                    else:
+                        nic.restart(self._started_ts if self._started_ts is not None else now, c, now)
+                    self._nics[c.luid] = nic
+                    continue
                 if nic is None:
                     # An adapter that went down and came back inside a window takes up where it left
                     # off.  A bad cable is exactly what makes a link drop and return; starting it
@@ -862,8 +890,8 @@ class FaultWatcher:
                     # minutes' until it ages out, so it stays judged (and on the page, marked down):
                     # dropping it at once turned a bad cable's tile green every time the link blinked.
                     self._gone[luid] = self._nics.pop(luid)
-            if table is None:
-                self._arp.expire(now)         # nothing new was read; old answers still age out
+            if table is None or straddled:
+                self._arp.expire(now)         # nothing new was read (or nothing from after the clear); answers age out
             else:
                 self._arp.observe(table, now)
             level_before = self._level
@@ -885,6 +913,40 @@ class FaultWatcher:
             log.info("fault watch: %s (%d bad, %d warn)", tile["level"], tile["bad"], tile["warn"])
             return tile
         return None
+
+    # -- clearing -------------------------------------------------------------------------
+    def clear_history(self, since_ts: Optional[float] = None) -> int:
+        """Settings > Clear history: the watch starts again from now, whatever the range.  Returns 1.
+
+        Nothing here is kept per reading that a range could be cut out of: every figure is a difference between
+        cumulative counters, the since-start one from the first reading and the last-five-minutes one from the
+        reading at the window's start, so removing even the last five minutes means both baselines move to the
+        latest reading.  So every adapter (the ones whose link has gone down too) is restarted on its latest
+        reading, the ARP watch forgets every answer, the watch's start is now (the tile says "Watching" again for
+        :data:`MIN_WATCH_S`) and how long it has been clean starts again.  The address findings are read from the
+        live configuration, not recorded, so one that is still true is still reported.  A tick that was reading
+        while this ran takes what it read as the new baseline only (see :meth:`tick`), so nothing from before the
+        clear comes back.  ``faults.state`` is published with the new tile."""
+        wall = float(self._clock())
+        with self._lock:
+            now = self._steady_locked(wall)
+            self._cleared += 1
+            for nic in list(self._nics.values()) + list(self._gone.values()):
+                nic.restart(now)
+            self._arp = ArpWatch()
+            self._started_ts = now
+            self._good_since = None
+            self._level = worst_level(self._findings_locked(now))
+            if self._level == "good":
+                self._good_since = now
+        tile = self.tile()
+        if self._bus is not None:
+            try:
+                self._bus.publish("faults.state", tile)
+            except Exception:  # noqa: BLE001
+                log.exception("publishing faults.state failed")
+        log.info("fault watch: history cleared, watching again from now")
+        return 1
 
     # -- findings -------------------------------------------------------------------------
     def _nic_rows_locked(self, now: float) -> List[Dict[str, Any]]:

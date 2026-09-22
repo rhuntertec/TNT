@@ -101,6 +101,14 @@ Contract gaps and small additions (documented as required by the contract):
   per sample, and a minute aggregate carries it: when it differs from the aggregate's, the partial
   minute is flushed and a new aggregate starts, so a minute that spans a network change is written as
   two rows (``upsert_ping_minute(..., network_id)``). Without *network_fn* nothing is tagged.
+* Clear history (Settings, :mod:`tnt.history`): ``PingManager.clear_history(since_ts) -> int`` forgets what was recorded
+  in ``[since_ts, now]`` (None: everything) - the minute rows (``Database.delete_ping_minutes_since``), the in-progress
+  minute aggregates, the rings' samples, ``last``, the run counters, the 24 h figure and the raw CSV rows
+  (``RawPingLog.clear_since(since_ts, until_ts=None) -> int``).  A clear generation makes every minute begun before the
+  clear that overlaps its span a no-op wherever it is (being built, queued in the writer, between a worker and the
+  writer); each sample's check is one step with the clear's bump, and the clear waits for the samples already past their
+  check to be recorded everywhere before it removes anything, so nothing cleared comes back.  ``publish_targets()``
+  publishes ``ping.targets`` afterwards.
 """
 from __future__ import annotations
 
@@ -112,8 +120,10 @@ import importlib
 import ipaddress
 import logging
 import math
+import os
 import re
 import shutil
+import stat
 import queue
 import threading
 import time
@@ -169,7 +179,27 @@ class _Throttle:
 _HOST_RE = re.compile(r"^(?=.{1,253}$)(?:[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?\.)*"
                       r"[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?$")
 _DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})\.csv(\.gz)?$")
+_CLEARING_RE = re.compile(r"^\.\d{4}-\d{2}-\d{2}\.csv(\.gz)?\.clearing$")    # RawPingLog.clear_since's temporary file
 _NUMERIC_RE = re.compile(r"^[0-9.]+$")
+#: after a clear, a sample stamped before it but recorded after it (its echo was out while the history was cleared) is
+#: dropped for this long (monotonic): later, an earlier stamp is a wall clock that was set back, and it is kept
+_CLEAR_INFLIGHT_S = 60.0
+#: a clear waits at most this long (real seconds) for the samples already past their check to be fully recorded before it
+#: removes anything (PingManager.clear_history); one that takes longer is still kept out of the ring and the minutes
+_CLEAR_DRAIN_S = 5.0
+#: the clears PingManager remembers (their generation and span), to judge a minute begun before one of them
+_CLEARS_KEPT = 32
+
+
+def _plain_file(path: Path) -> bool:
+    """Whether *path* is a regular file itself: never a symbolic link, a junction or another reparse point."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if not stat.S_ISREG(st.st_mode):
+        return False
+    return not (getattr(st, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
 
 
 # ---------------------------------------------------------------------------------------
@@ -397,7 +427,8 @@ class RawPingLog:
     Header ``ts,target_id,host,ok,rtt_ms,bytes``. Buffered writes, flushed at least
     every ``flush_interval_s`` (checked on write) and on :meth:`close`. On the first row
     of a new day the previous file is closed and gzipped to ``.csv.gz`` in a background
-    thread. :meth:`trim` deletes ``.csv``/``.csv.gz`` files older than *days*.
+    thread. :meth:`trim` deletes ``.csv``/``.csv.gz`` files older than *days*; :meth:`clear_since` removes what was
+    logged at or after a moment (Settings > "Clear history").
     """
 
     HEADER = ["ts", "target_id", "host", "ok", "rtt_ms", "bytes"]
@@ -416,6 +447,7 @@ class RawPingLog:
         self._bg: List[threading.Thread] = []
         self._gz_lock = threading.Lock()
         self._write_errors = _Throttle()
+        self.last_clear_failed: List[str] = []      # the files the last clear_since() could not change
         try:
             self.directory.mkdir(parents=True, exist_ok=True)
         except OSError:
@@ -599,6 +631,115 @@ class RawPingLog:
         if still:
             log.info("ping log compression still running in the background: %s", ", ".join(still))
 
+    # -- clear history (Settings) ---------------------------------------------------------
+    def clear_since(self, since_ts: Optional[float], until_ts: Optional[float] = None) -> int:
+        """Remove what was logged at or after *since_ts* (None: from the first row), and before *until_ts* when it is
+        given (PingManager passes the moment its clear began: a row stamped since then was recorded after the clear);
+        None for both removes every daily file.
+
+        Only ``YYYY-MM-DD.csv`` / ``.csv.gz`` names in this directory are touched (regular files: never a link or a
+        reparse point), and a ``.YYYY-MM-DD.csv(.gz).clearing`` left by an interrupted rewrite, also only when it is a
+        regular file.  A file dated after the local date of *since_ts* (and before that of *until_ts*) is deleted, the file
+        of either date is rewritten without its rows in the span (deleted when none is left), earlier days are left alone
+        (a row never goes into an earlier day's file).  A gzip of an earlier day that is running is waited for, and none
+        starts meanwhile (``_gz_lock``); the open file is flushed and closed first and no row is written meanwhile
+        (``_lock``): the next write reopens it, with the header when the file is new.  A file that cannot be rewritten or
+        deleted is logged and named in ``last_clear_failed``; the rest are still cleared.  Returns the rows removed from
+        rewritten files plus the files deleted."""
+        removed = 0
+        failed: List[str] = []
+        since = None if since_ts is None else float(since_ts)
+        until = None if until_ts is None else float(until_ts)
+        since_date = None if since is None else _dt.date.fromtimestamp(since)
+        until_date = None if until is None else _dt.date.fromtimestamp(until)
+        with self._gz_lock:
+            with self._lock:
+                self._close_file()
+                try:
+                    names = sorted(os.listdir(self.directory))
+                except OSError:
+                    log.warning("the ping log folder %s cannot be read; nothing cleared there", self.directory, exc_info=True)
+                    names = []
+                for name in names:
+                    if _CLEARING_RE.match(name):                # a rewrite a crash interrupted
+                        if _plain_file(self.directory / name):
+                            self._unlink_quietly(self.directory / name)
+                        continue
+                    m = _DATE_RE.match(name)
+                    if not m:
+                        continue
+                    path = self.directory / name
+                    if not _plain_file(path):
+                        continue
+                    try:
+                        fdate = _dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                    except ValueError:
+                        continue
+                    after_since = since_date is None or fdate > since_date
+                    before_until = until_date is None or fdate < until_date
+                    try:
+                        if after_since and before_until:
+                            path.unlink()               # every row of it lies in the span
+                            removed += 1
+                        elif after_since or fdate == since_date:
+                            removed += self._filter_file(path, since, until)
+                    except Exception:  # noqa: BLE001 - one file must not keep the others
+                        log.exception("clearing the ping log %s failed", name)
+                        failed.append(name)
+        self.last_clear_failed = failed
+        log.info("ping logs cleared %s: %d row(s)/file(s) removed%s",
+                 "entirely" if since is None else f"from {since:.0f}", removed,
+                 f", {len(failed)} could not be changed" if failed else "")
+        return removed
+
+    def _filter_file(self, path: Path, since: Optional[float], until: Optional[float] = None) -> int:
+        """Rewrite *path* without its rows at or after *since* (None: from the first) and before *until* (None: to the
+        last), through a temporary file replaced in one step; delete it when no row is left.  Returns the rows removed,
+        plus 1 when the file itself was deleted."""
+        gz = path.name.endswith(".gz")
+        tmp = path.with_name("." + path.name + ".clearing")
+        kept = dropped = 0
+        try:
+            src_open = gzip.open if gz else open
+            with src_open(path, "rt", encoding="utf-8", newline="") as src:   # type: ignore[operator]
+                dst = gzip.open(tmp, "wt", encoding="utf-8", newline="") if gz else open(tmp, "w", encoding="utf-8", newline="")
+                with dst:
+                    writer = csv.writer(dst, lineterminator="\n")
+                    for row in csv.reader(src):
+                        if not row:
+                            continue
+                        try:
+                            ts = float(row[0])
+                        except ValueError:
+                            writer.writerow(row)                # the header
+                            continue
+                        if math.isfinite(ts) and (since is None or ts >= since) and (until is None or ts < until):
+                            dropped += 1
+                        else:
+                            writer.writerow(row)
+                            kept += 1
+            if not dropped:
+                self._unlink_quietly(tmp)
+                return 0
+            if not kept:
+                self._unlink_quietly(tmp)
+                path.unlink()
+                return dropped + 1
+            os.replace(tmp, path)
+            return dropped
+        except BaseException:
+            self._unlink_quietly(tmp)
+            raise
+
+    @staticmethod
+    def _unlink_quietly(path: Path) -> None:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            log.warning("could not delete %s", path, exc_info=True)
+
     # -- retention -----------------------------------------------------------------------
     def trim(self, days: int) -> int:
         """Delete ``.csv``/``.csv.gz`` files dated more than *days* days before today."""
@@ -633,11 +774,13 @@ class RawPingLog:
 # Per-target state
 # ---------------------------------------------------------------------------------------
 class _MinuteAgg:
-    __slots__ = ("minute_ts", "network_id", "sent", "received", "sum", "min", "max", "last_rtt", "jitter_acc", "jitter_n")
+    __slots__ = ("minute_ts", "network_id", "gen", "sent", "received", "sum", "min", "max", "last_rtt", "jitter_acc",
+                 "jitter_n")
 
-    def __init__(self, minute_ts: int, network_id: Optional[int] = None) -> None:
+    def __init__(self, minute_ts: int, network_id: Optional[int] = None, gen: int = 0) -> None:
         self.minute_ts = minute_ts
         self.network_id = network_id            # the network current for these samples (None: untagged)
+        self.gen = gen                          # PingManager._clear_gen when it began: a clear since then voids it
         self.sent = 0
         self.received = 0
         self.sum = 0.0
@@ -830,6 +973,21 @@ class PingManager:
         self._running = False
         self._live_workers = 0                  # worker threads started and not yet exited
         self._close_pinger_pending = False      # stop() found a worker still inside ping()
+        # Clear history (clear_history): every minute aggregate carries the generation it began in, and a minute of an
+        # older generation that overlaps a span cleared since is never written - whether it is still being built, queued
+        # in the writer or on its way there (_voided).  _gen_lock (with _gen_cond) orders a sample's check, and a worker's
+        # check-and-queue of a minute, against the bump; _inflight counts the samples past their check, per thread, so the
+        # clear can wait for them to be fully recorded before it removes anything; _write_lock serialises every minute
+        # write with the clear's delete, so a write that passed its check lands before the delete, and one that did not
+        # sees the bump.
+        self._clear_gen = 0
+        self._gen_lock = threading.Lock()
+        self._gen_cond = threading.Condition(self._gen_lock)
+        self._inflight: Dict[int, int] = {}     # thread ident -> the generation its sample was checked under
+        self._write_lock = threading.RLock()
+        # the recent clears, oldest first: (generation after the bump, since_ts, at, monotonic at)
+        self._clears: List[Tuple[int, Optional[float], float, float]] = []
+        self.last_clear_info: Dict[str, Any] = {}
 
     # -- lifecycle -----------------------------------------------------------------------
     @property
@@ -1123,18 +1281,70 @@ class PingManager:
             # timeout: the target is gone from the db, don't publish or persist for it
             log.debug("dropping late sample for removed target %s", st.host)
             return
+        # Clear history: the check and the count are one step against clear_history's bump (both under _gen_lock).  A
+        # sample checked before a clear is fully recorded before that clear removes anything (it waits for _inflight), so
+        # the clear removes it from every store; one checked after it is judged against its span.
+        me = threading.get_ident()
+        with self._gen_cond:
+            if self._cleared_span_locked(sample.ts):
+                # its echo was out while the history was cleared: stamped inside the cleared span, it must not come back
+                log.debug("dropping a sample of %s stamped before the history was cleared", st.host)
+                return
+            gen = self._clear_gen
+            self._inflight[me] = gen
+        try:
+            self._record_checked(st, sample, size, gen)
+        finally:
+            with self._gen_cond:
+                self._inflight.pop(me, None)
+                self._gen_cond.notify_all()
+
+    def _cleared_span_locked(self, ts: float) -> bool:
+        """Whether a sample stamped *ts* lies in a span cleared less than ``_CLEAR_INFLIGHT_S`` ago (``_gen_lock`` held,
+        or a read of ``_clears``, which is only ever replaced whole)."""
+        clears = self._clears
+        if not clears:
+            return False
+        mono = float(self._monotonic())
+        return any(mono - m < _CLEAR_INFLIGHT_S and ts < at and (since is None or ts >= since)
+                   for _g, since, at, m in clears)
+
+    def _voided(self, gen: int, minute_ts: int) -> bool:
+        """Whether a minute begun in generation *gen* was cleared since: a clear after it whose span it overlaps
+        (``minute_ts > since_ts - 60``; every minute for an all-time clear).  A minute from before every clear still
+        remembered is voided (it cannot be judged)."""
+        if gen == self._clear_gen:
+            return False
+        clears = self._clears
+        if not clears or gen < clears[0][0] - 1:
+            return True
+        return any(g > gen and (since is None or minute_ts > since - 60.0) for g, since, _at, _m in clears)
+
+    def _record_checked(self, st: _TargetState, sample: Sample, size: int, gen: int) -> None:
         minute_ts = _minute_of(sample.ts)
         network_id = self._network_id()         # once per sample, outside every lock
         finished: Optional[_MinuteAgg] = None
         with st.lock:
+            if self._clear_gen != gen and self._cleared_span_locked(sample.ts):
+                # a clear landed between the check and here (it waits for this sample only so long, or it runs on this
+                # very thread): stamped inside its span, the sample goes nowhere
+                log.debug("dropping a sample of %s stamped inside a span cleared while it was recorded", st.host)
+                return
+            if st.minute is not None and self._voided(st.minute.gen, st.minute.minute_ts):
+                st.minute = None                # a clear since it began covers it: it is never written
             if st.minute is not None and (st.minute.minute_ts != minute_ts or st.minute.network_id != network_id):
                 # a new minute, or the same minute on another network: that part is a row of its own
                 finished, st.minute = st.minute, None
         if finished is not None:
             self._upsert(st, finished)          # db write outside the lock, before the view is built
         with st.lock:
+            if self._clear_gen != gen and self._cleared_span_locked(sample.ts):
+                log.debug("dropping a sample of %s stamped inside a span cleared while it was recorded", st.host)
+                return
             if finished is not None:
                 st.day_cache = None             # the 24 h db summary just changed
+            if st.minute is not None and self._voided(st.minute.gen, st.minute.minute_ts):
+                st.minute = None
             st.samples.append(sample)
             st.last = sample
             if sample.ok:
@@ -1144,7 +1354,7 @@ class PingManager:
                 st.consecutive_missed += 1
                 st.consecutive_ok = 0
             if st.minute is None:
-                st.minute = _MinuteAgg(minute_ts, network_id)
+                st.minute = _MinuteAgg(minute_ts, network_id, self._clear_gen)
             st.minute.add(sample)
             view = self._view_locked(st, sample.ts)
             light = view["light"]
@@ -1343,12 +1553,23 @@ class PingManager:
             args += (agg.network_id,)
         # off the ping worker's thread whenever the writer runs (a locked database must
         # stall the writer, never the pings); synchronous fallback otherwise (tests, shutdown)
-        if self._writer.submit(self._db.upsert_ping_minute, *args):
-            return
+        with self._gen_lock:
+            if self._voided(agg.gen, agg.minute_ts):
+                return                          # the history was cleared while it was built: never written
+            if self._writer.submit(self._write_minute, agg.gen, args):
+                return
         try:
-            self._db.upsert_ping_minute(*args)
+            self._write_minute(agg.gen, args)
         except Exception:  # noqa: BLE001
             log.exception("upsert_ping_minute failed for %s minute %s", st.host, minute_ts)
+
+    def _write_minute(self, gen: int, args: Tuple[Any, ...]) -> None:
+        """Write one finished minute unless a clear after it began covers it (on the writer thread, or synchronously).
+        ``args[1]`` is its minute_ts."""
+        with self._write_lock:
+            if self._voided(gen, int(args[1])):
+                return
+            self._db.upsert_ping_minute(*args)
 
     def _flush_minute(self, st: _TargetState) -> None:
         with st.lock:
@@ -1726,6 +1947,94 @@ class PingManager:
                     self.raw_log.flush()
                 except Exception:  # noqa: BLE001
                     log.exception("flushing the raw ping log failed")
+        self._publish_targets()
+
+    # -- clear history (Settings; Engine.clear_history) --------------------------------------
+    def clear_history(self, since_ts: Optional[float]) -> int:
+        """Forget the ping history recorded in ``[since_ts, now]`` (None: all of it).  Returns the minute rows deleted.
+
+        In this order: the clear generation is bumped, so no minute aggregate begun before now that overlaps the span is
+        ever written - the one still being built, one queued in the writer, one a worker has just taken out of its
+        target's lock (``_upsert`` and ``_write_minute`` check it; a minute that ended before *since_ts* is still written);
+        from the bump on, a sample stamped inside the span goes nowhere, and every sample that passed its check just before
+        the bump is waited for (up to ``_CLEAR_DRAIN_S``) until it is in the ring, its minute, the raw log and the
+        listeners, so what follows removes it from all of them; every in-progress aggregate that overlaps the span is
+        dropped; the minute rows overlapping the span go (``Database.delete_ping_minutes_since``, serialised with every
+        minute write, so one that passed its check a moment ago lands first and is deleted with the rest); then each
+        target's ring loses its samples from *since_ts* on (the ones stamped from this call's start on stay), ``last`` and
+        the miss/answer run follow what is left, the 24 h figure is recomputed; and the raw CSV log loses its rows from
+        *since_ts* up to this call's start (``RawPingLog.clear_since``).  A sample stamped inside the span that comes back
+        after the clear (its echo was out) is dropped for ``_CLEAR_INFLIGHT_S``.  A failing database delete raises (after
+        the aggregates were dropped: their data is gone either way) and leaves the rings alone.  ``last_clear_info`` is
+        ``{"minutes", "raw_log", "raw_log_failed", "earliest_ts"}``: ``earliest_ts`` is where the earliest minute it removed
+        began (a bucket that straddles *since_ts* starts before it), None when it removed none.  The caller publishes
+        ``ping.targets`` (:meth:`publish_targets`)."""
+        since = None if since_ts is None else float(since_ts)
+        at = float(self._clock())
+        me = threading.get_ident()
+        with self._gen_cond:
+            self._clear_gen += 1
+            gen = self._clear_gen
+            self._clears = (self._clears + [(gen, since, at, float(self._monotonic()))])[-_CLEARS_KEPT:]
+            # the samples already past their check finish first (never this thread's own: it would wait for itself)
+            deadline = time.monotonic() + _CLEAR_DRAIN_S
+            while any(g < gen for ident, g in self._inflight.items() if ident != me):
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    log.warning("clear history: %d ping sample(s) still being recorded after %.0f s; clearing anyway",
+                                sum(1 for ident, g in self._inflight.items() if ident != me and g < gen), _CLEAR_DRAIN_S)
+                    break
+                self._gen_cond.wait(left)
+        with self._lock:
+            states = list(self._targets.values())
+        earliest: List[float] = []
+        for st in states:
+            with st.lock:
+                if st.minute is not None and self._voided(st.minute.gen, st.minute.minute_ts):
+                    if st.minute.sent > 0:
+                        earliest.append(float(st.minute.minute_ts))
+                    st.minute = None
+                st.day_cache = None
+        info: Dict[str, Any] = {}
+        with self._write_lock:
+            deleted = int(self._db.delete_ping_minutes_since(since, info=info))
+        if info.get("earliest_ts") is not None:
+            earliest.append(float(info["earliest_ts"]))
+        for st in states:
+            with st.lock:
+                kept = [s for s in st.samples if (since is not None and s.ts < since) or s.ts >= at]
+                if len(kept) != len(st.samples):
+                    st.samples.clear()
+                    st.samples.extend(kept)
+                st.last = kept[-1] if kept else None
+                missed = answered = 0
+                for s in reversed(kept):
+                    if s.ok and not missed:
+                        answered += 1
+                    elif not s.ok and not answered:
+                        missed += 1
+                    else:
+                        break
+                st.consecutive_missed, st.consecutive_ok = missed, answered
+                st.day_cache = None
+                st.day_cache_ts = 0.0
+        raw_removed, raw_failed = 0, []  # type: int, List[str]
+        if self.raw_log is not None:
+            try:
+                # up to this call's start: a row stamped since then was recorded after the clear, as the ring keeps it
+                raw_removed = int(self.raw_log.clear_since(since, until_ts=at))
+                raw_failed = list(getattr(self.raw_log, "last_clear_failed", []) or [])
+            except Exception as exc:  # noqa: BLE001 - the minutes are cleared; the caller reports the log
+                log.exception("clearing the raw ping log failed")
+                raw_failed = [f"{type(exc).__name__}: {exc}"]
+        self.last_clear_info = {"minutes": deleted, "raw_log": raw_removed, "raw_log_failed": raw_failed,
+                                "earliest_ts": min(earliest) if earliest else None}
+        log.info("ping history cleared %s: %d minute row(s), %d raw log row(s)/file(s)",
+                 "entirely" if since is None else f"from {since:.0f}", deleted, raw_removed)
+        return deleted
+
+    def publish_targets(self) -> None:
+        """Publish ``ping.targets`` with every target's current view (after a clear, the lights and figures)."""
         self._publish_targets()
 
     # -- listeners -----------------------------------------------------------------------

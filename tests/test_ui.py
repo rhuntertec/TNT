@@ -1869,7 +1869,7 @@ def test_mock_wifi_bridge_matches_the_survey_contract(tmp_path, mock):
     r = subprocess.run(["node", str(driver), str(MOCK_BRIDGE)], capture_output=True, text=True, encoding="utf-8", timeout=60)
     assert r.returncode == 0, r.stderr
     out = json.loads(r.stdout)
-    assert out["methods"] == ["open_location_settings", "wifi_clear", "wifi_scan_now", "wifi_set_enabled", "wifi_survey"]
+    assert out["methods"] == ["open_location_settings", "wifi_clear", "wifi_clear_since", "wifi_scan_now", "wifi_set_enabled", "wifi_survey"]
     assert out["events"] == ["pywebviewready"] and out["errorsAttr"] == "[]"
     s = out["full"]
     assert set(s) == SURVEY_KEYS
@@ -2348,7 +2348,7 @@ def test_outages_and_timeline(mock):
     assert set(o["status"]) == {"active", "total_active", "count_24h", "last", "monitoring"}
     st, _, tl = _req(mock.port, "GET", "/api/outages/timeline?hours=24")
     assert st == 200
-    assert set(tl) == {"start_ts", "end_ts", "hours", "segments", "total_segments", "gaps", "targets"}
+    assert set(tl) == {"start_ts", "end_ts", "hours", "segments", "total_segments", "gaps", "cleared", "targets"}
     assert tl["hours"] == 24 and tl["end_ts"] - tl["start_ts"] == pytest.approx(86400, abs=5)
     assert len(tl["total_segments"]) == 1 and tl["total_segments"][0]["kind"] == "total_internet"
     assert len(tl["segments"]) >= 3 and all(s["kind"] == "target" for s in tl["segments"])

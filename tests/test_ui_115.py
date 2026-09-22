@@ -2130,7 +2130,8 @@ def test_shared_ui_wiring_keeps_the_contract():
     lines = [ln.strip() for ln in events.splitlines()[1:] if ln.strip()]
     assert "'dhcp.state', 'dhcp.lease', 'dhcp.scan', 'map.sample', 'throughput.sample', 'faults.state', 'geoip.state'," in lines, "the pinned line is unchanged"
     report = lines.index("'report.progress', 'report.saved', 'report.deleted', 'report.updated',")
-    assert lines[report + 1:] == ["'netcheck.switch',", "'tftp.state', 'tftp.transfer',", "'capture.state', 'capture.sip',"], lines[report:]
+    assert lines[report + 1:] == ["'netcheck.switch',", "'tftp.state', 'tftp.transfer',", "'capture.state', 'capture.sip',",
+                                  "'history.cleared',"], lines[report:]
     known = set(re.findall(r"'([\w.]+)'", events))
     for rel, heard in (("js/netcheck.js", {"netcheck.switch", "hello"}), ("js/tools/tftp.js", {"tftp.state", "tftp.transfer", "hello"}),
                        ("js/views/capture.js", {"capture.state", "capture.sip", "hello"})):

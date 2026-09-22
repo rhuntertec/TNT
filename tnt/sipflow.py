@@ -54,7 +54,10 @@ Shapes (keys in this order)::
 from __future__ import annotations
 
 import logging
+import math
 import os
+import threading
+import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from . import sipalg, sipcalls
@@ -63,7 +66,7 @@ log = logging.getLogger(__name__)
 
 __all__ = ["SOURCE_KEYS", "LADDER_KEYS", "FLOWCALL_KEYS", "FINDING_KEYS", "SKEW_KEYS", "FLOW_KEYS", "STREAM_KEYS",
            "SLOTS", "FINDING_LEVELS", "FINDING_IDS", "REWRITE_HEADERS", "MAX_SOURCE_BYTES", "MAX_CALLS",
-           "JITTER_WARN_MS", "JITTER_BAD_MS", "LOSS_WARN_PCT", "LOSS_BAD_PCT",
+           "JITTER_WARN_MS", "JITTER_BAD_MS", "LOSS_WARN_PCT", "LOSS_BAD_PCT", "CLEARED_TEXT",
            "estimate_skew", "pair_across_sbc", "build_ladder", "call_findings", "FlowReader", "FlowError"]
 
 SOURCE_KEYS = ("slot", "name", "path", "size", "packets", "sip_messages", "rtp_packets", "calls", "first_ts",
@@ -112,6 +115,9 @@ LOSS_BAD_PCT = 5.0
 SHORT_CALL_S = 5.0
 #: Skew samples needed before the measured offset is called confident.
 MIN_SKEW_SAMPLES = 3
+#: FlowReader.open when Settings > Clear history ran while the file was being read: it was loaded inside the cleared
+#: time, so it is not kept (FlowError, which the route answers 400 with this text).
+CLEARED_TEXT = "The history was cleared while that capture was being read, so it was not kept. Load it again."
 
 
 class FlowError(RuntimeError):
@@ -489,14 +495,47 @@ def _failure_advice(status: Any) -> Optional[str]:
 
 
 # --------------------------------------------------------------------------- reading the files
+_SINCE_TEXT = "since_ts must be a time in seconds, or None for everything"
+
+
+def _clear_since(value: Any) -> Optional[float]:
+    """*value* as the start of a history clear: None (everything) or a finite time in seconds, else ``ValueError``.
+    A NaN compares false with every time, so taken as it is a clear would silently keep everything."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(_SINCE_TEXT)
+    try:
+        since = float(value)
+    except OverflowError:
+        raise ValueError(_SINCE_TEXT) from None
+    if not math.isfinite(since):
+        raise ValueError(_SINCE_TEXT)
+    return since
+
+
+def _real_key(path: Any) -> str:
+    """*path* as the file it names, for comparing two spellings of one file: case-folded, with any links resolved
+    (only its absolute form when it cannot be resolved)."""
+    text = str(path or "")
+    try:
+        return os.path.normcase(os.path.realpath(text))
+    except (OSError, ValueError):
+        return os.path.normcase(os.path.abspath(text)) if text else ""
+
+
 class _Source:
     """One loaded capture: its own CallTracker, and where in the file each SIP message came from."""
 
     __slots__ = ("slot", "path", "name", "size", "tracker", "packets", "offsets", "linktype", "first_ts",
-                 "last_ts", "error")
+                 "last_ts", "error", "loaded_ts", "real")
 
-    def __init__(self, slot: str, path: str, name: str, size: int) -> None:
+    def __init__(self, slot: str, path: str, name: str, size: int, loaded_ts: Optional[float] = None) -> None:
         self.slot, self.path, self.name, self.size = slot, path, name, size
+        #: when the file was read into the slot (a clear of the history from then on closes the slot), and the
+        #: file's real path at that moment, which is how a capture the same clear deleted is recognised
+        self.loaded_ts = loaded_ts
+        self.real = _real_key(path)
         self.tracker = sipcalls.CallTracker(max_calls=MAX_CALLS, max_messages=MAX_LADDER)
         self.packets = 0
         #: packet number -> the byte offset of its block, so a header view is one seek rather than a second walk
@@ -524,9 +563,14 @@ class FlowReader:
 
     Module-level seams tests monkeypatch: ``_iter_packets``, ``_read_packet_at`` and ``_summarize``."""
 
-    def __init__(self, *, max_bytes: int = MAX_SOURCE_BYTES) -> None:
+    def __init__(self, *, max_bytes: int = MAX_SOURCE_BYTES, clock: Any = None) -> None:
         self._max_bytes = int(max_bytes)
+        self._clock = clock or time.time
         self._sources: Dict[str, _Source] = {}
+        #: guards _sources against a clear of the history, and counts the clears: a file being read while one ran is
+        #: not kept (it was loaded inside the cleared time)
+        self._lock = threading.Lock()
+        self._cleared = 0
 
     # -- loading ---------------------------------------------------------------------------------
     def open(self, path: Any, slot: str = "a") -> Dict[str, Any]:
@@ -546,9 +590,17 @@ class FlowReader:
             raise FlowError("that path is not a file")
         if info.st_size > self._max_bytes:
             raise FlowError(f"that capture is larger than {self._max_bytes // (1024 * 1024)} MB")
-        source = _Source(slot, text, os.path.basename(text), int(info.st_size))
+        with self._lock:
+            cleared = self._cleared
+        source = _Source(slot, text, os.path.basename(text), int(info.st_size), float(self._clock()))
         self._read_into(source)
-        self._sources[slot] = source
+        with self._lock:
+            kept = self._cleared == cleared
+            if kept:
+                self._sources[slot] = source
+        if not kept:
+            log.info("SIP flow: the history was cleared while a capture was being read into slot %s; not kept", slot)
+            raise FlowError(CLEARED_TEXT)
         log.info("SIP flow: read %s (%d packets, %d call(s)) into slot %s",
                  source.name, source.packets, source.tracker.stats().get("calls", 0), slot)
         return source.view()
@@ -602,19 +654,49 @@ class FlowReader:
             log.debug("a packet of %s could not be tracked", source.name, exc_info=True)
 
     def close(self, slot: str) -> None:
-        self._sources.pop(slot, None)
+        with self._lock:
+            self._sources.pop(slot, None)
 
     def clear(self) -> None:
-        self._sources.clear()
+        with self._lock:
+            self._sources.clear()
+
+    def clear_history(self, since_ts: Optional[float], deleted_paths: Iterable[Any] = ()) -> int:
+        """Settings > Clear history: close every slot loaded at or after *since_ts* (None: every slot), and every slot
+        whose file is one of *deleted_paths* (the captures the same clear deleted, full paths); the number of slots
+        closed.  Closing only drops the in-memory reading, exactly as :meth:`close` does: the files are never touched,
+        wherever they are, because a slot holds whatever path the user typed.  A file being read into a slot while
+        this runs is not kept either: :meth:`open` answers it with :data:`CLEARED_TEXT`.  A *since_ts* that is neither
+        None nor a finite time is refused with ``ValueError`` and closes nothing."""
+        since = _clear_since(since_ts)
+        named = [str(p) for p in (deleted_paths or ()) if p]
+        gone = {key for key in (_real_key(p) for p in named) if key}
+        gone |= {os.path.normcase(os.path.abspath(p)) for p in named}
+        closed = 0
+        with self._lock:
+            self._cleared += 1
+            for slot, source in list(self._sources.items()):
+                loaded = source.loaded_ts
+                in_range = since is None or loaded is None or float(loaded) >= since
+                deleted = bool(gone) and (source.real in gone
+                                          or os.path.normcase(os.path.abspath(source.path)) in gone)
+                if in_range or deleted:
+                    del self._sources[slot]
+                    closed += 1
+        if closed:
+            log.info("SIP flow: history cleared, %d slot(s) closed (the files themselves were not touched)", closed)
+        return closed
 
     def sources(self) -> List[Dict[str, Any]]:
-        return [self._sources[slot].view() for slot in SLOTS if slot in self._sources]
+        found = [self._sources.get(slot) for slot in SLOTS]     # .get: a clear may close a slot from another thread
+        return [source.view() for source in found if source is not None]
 
     # -- the merged reading ----------------------------------------------------------------------
     def _merge(self) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """Every call, each as the sides it was seen on, plus the measured clock offset between the captures."""
-        calls_a = self._sources["a"].tracker.calls() if "a" in self._sources else []
-        calls_b = self._sources["b"].tracker.calls() if "b" in self._sources else []
+        source_a, source_b = self._sources.get("a"), self._sources.get("b")
+        calls_a = source_a.tracker.calls() if source_a is not None else []
+        calls_b = source_b.tracker.calls() if source_b is not None else []
         skew = estimate_skew(calls_a, calls_b)
         offset = skew["seconds"] or 0.0
         by_id_b = {call.get("call_id"): call for call in calls_b if call.get("call_id")}
@@ -733,7 +815,7 @@ class FlowReader:
         if len(self._sources) > 1:
             return []
         out: List[Dict[str, Any]] = []
-        for source in self._sources.values():
+        for source in list(self._sources.values()):
             try:
                 tells = sipalg.passive_tells(source.tracker.calls())
             except Exception:               # noqa: BLE001 - a tell is a bonus; the flow stands without it

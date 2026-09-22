@@ -118,6 +118,14 @@ Interpretations of the contract (listed as deviations in the module report):
   sites behind the same address): every outage that opened before ``event["ts"]``
   closes then with ``"network changed"``, and on an immediate switch every
   miss/recovery run starts afresh.
+* Clear history (Settings, :mod:`tnt.history`): ``clear_history(since_ts) -> int``
+  deletes the outage rows overlapping ``[since_ts, now]`` (open ones included) and the
+  ``outage`` events rows from then on, then forgets every open outage and run (see the
+  method).  The PingManager's ``in_outage`` flag is only ever set to what the tracker
+  holds at that moment (``_apply_in_outage``), so a flag computed before a clear cannot
+  turn a light red again after it.  ``timeline()`` carries ``"cleared": [{"start_ts",
+  "end_ts"}]``: the cleared spans (``tnt.history.timeline_spans``) clipped to its range,
+  which the Outages view paints like a monitoring gap, never as "fine".
 """
 from __future__ import annotations
 
@@ -127,6 +135,8 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Tuple
+
+from . import history as _history
 
 if TYPE_CHECKING:  # pragma: no cover - typing only; tnt.pinger may not exist yet
     from .config import Config
@@ -152,8 +162,8 @@ TOTAL_KINDS: Tuple[str, ...] = tuple(f"total_{g}" for g in GROUPS)
 OUTAGE_KINDS: Tuple[str, ...] = ("target",) + TOTAL_KINDS
 
 # Deferred side effects computed under the lock and executed after releasing it:
-# ("in_outage", target_id, flag) or ("event", event_type, data).
-_Effect = Tuple[str, Any, Any]
+# ("in_outage", target_id, flag) or ("event", event_type, data, clear generation).
+_Effect = Tuple[Any, ...]
 
 #: Notes of outages that end because of (or across) a network change.
 NETWORK_CHANGED_NOTE = "network changed"
@@ -412,6 +422,10 @@ class OutageTracker:
         self._stopped = False
         self._unsubs: List[Callable[[], None]] = []
         self.startup_info: Dict[str, Any] = {}
+        # clear_history: bumped by every clear; an outage.start/end computed before it is not published after it
+        self._clear_gen = 0
+        self._flag_lock = threading.Lock()              # serialises PingManager.set_in_outage (_apply_in_outage)
+        self.last_clear_info: Dict[str, Any] = {}       # what the last clear_history() deleted (rows, earliest_ts)
 
     def _backfill_hosts(self) -> None:
         try:
@@ -858,6 +872,43 @@ class OutageTracker:
             return NETWORK_CHANGED_NOTE
         return NO_NETWORK_NOTE if mark.get("offline") else None
 
+    # -- clear history (Settings; Engine.clear_history) ---------------------
+    def clear_history(self, since_ts: Optional[float]) -> int:
+        """Forget the outages recorded in ``[since_ts, now]`` (None: all of them).  Returns the outage rows deleted.
+
+        Under the tracker's lock, database first (``Database.delete_outages_since``: every row of every kind that is open
+        or ended at or after *since_ts*, and the ``outage`` events rows from *since_ts* on, in one transaction; a failure
+        raises and leaves the tracker as it was), then the memory of every open outage: each target's open outage and
+        its miss/recovery run, the open totals, the network marks and the last total ends.  An open outage is always in
+        the span, so it goes: nothing is closed or updated afterwards (no write into a missing row), the PingManager
+        is told the target is no longer in an outage (its light stops being red), and an ``outage.start``/``outage.end``
+        computed before the clear is not published after it.  A target still down simply opens a fresh outage after
+        ``outage.miss_threshold`` more misses.  ``last_clear_info`` is ``{"rows", "earliest_ts"}``: ``earliest_ts`` is the
+        earliest start of an outage it deleted (one that straddles *since_ts* began before it), None when none was."""
+        since = None if since_ts is None else float(since_ts)
+        info: Dict[str, Any] = {}
+        with self._lock:
+            affected = [tid for tid, st in self._states.items() if st.outage is not None]
+            deleted = int(self._db.delete_outages_since(since, info=info))
+            self.last_clear_info = {"rows": deleted, "earliest_ts": info.get("earliest_ts")}
+            self._clear_gen += 1
+            for st in self._states.values():
+                st.outage = None
+                st.consecutive_missed = st.consecutive_ok = 0
+                st.first_miss_ts = st.first_ok_ts = None
+            totals = len(self._totals)
+            self._totals.clear()
+            self._outage_net.clear()
+            self._last_total_end.clear()
+        for tid in affected:
+            try:
+                self._apply_in_outage(tid)
+            except Exception:  # noqa: BLE001
+                log.exception("turning off the outage flag of target %s failed", tid)
+        log.info("outage history cleared %s: %d row(s); %d open target and %d open total outage(s) forgotten",
+                 "entirely" if since is None else f"from {since:.0f}", deleted, len(affected), totals)
+        return deleted
+
     # -- queries -----------------------------------------------------------
     def status(self) -> Dict[str, Any]:
         """Summary for the status endpoint / Outages tile."""
@@ -975,6 +1026,11 @@ class OutageTracker:
         for tid in seen_targets:
             if tid not in listed:
                 targets.append({"id": tid, "host": self._host_for(tid, hosts), "kind": self._kind_for(tid)})
+        try:
+            cleared = _history.timeline_spans(self._db, start, now)
+        except Exception:  # noqa: BLE001 - never fails the timeline over its bookkeeping
+            log.exception("reading the cleared history spans failed")
+            cleared = []
         return {
             "start_ts": start,
             "end_ts": now,
@@ -983,6 +1039,7 @@ class OutageTracker:
             "total_segments": total_segments,
             "gaps": gaps,
             "targets": targets,
+            "cleared": cleared,
         }
 
     # -- internals: state changes (call with the lock held) ----------------
@@ -1032,7 +1089,7 @@ class OutageTracker:
         log.warning("outage started: %s (target %d) since %.0f", st.host, st.target_id, start_ts)
         self._db_event("warning", f"Outage started: {st.host}", self._clock())
         effects.append(("in_outage", st.target_id, True))
-        effects.append(("event", "outage.start", self._decorate(st.outage, self._clock())))
+        effects.append(("event", "outage.start", self._decorate(st.outage, self._clock()), self._clear_gen))
 
     def _close_target(self, st: _TargetState, end_ts: float, note: Optional[str],
                       effects: List[_Effect], notify_pm: bool, recovery_samples: int = 0) -> None:
@@ -1059,7 +1116,7 @@ class OutageTracker:
                        + (f" - {note}" if note else ""), self._clock())
         if notify_pm:
             effects.append(("in_outage", st.target_id, False))
-        effects.append(("event", "outage.end", self._decorate(o, self._clock())))
+        effects.append(("event", "outage.end", self._decorate(o, self._clock()), self._clear_gen))
 
     def _open_total(self, group: str, start_ts: float, effects: List[_Effect]) -> None:
         kind = f"total_{group}"
@@ -1071,7 +1128,7 @@ class OutageTracker:
         self._outage_net[oid] = {"gateway": self._net_gateway, "offline": self._offline}
         log.warning("%s outage started: all %s targets down since %.0f", kind, group, start_ts)
         self._db_event("warning", f"All {group} targets are down", self._clock())
-        effects.append(("event", "outage.start", self._decorate(self._totals[group], self._clock())))
+        effects.append(("event", "outage.start", self._decorate(self._totals[group], self._clock()), self._clear_gen))
 
     def _close_total(self, group: str, end_ts: float, note: Optional[str], effects: List[_Effect]) -> None:
         o = self._totals.get(group)
@@ -1090,7 +1147,7 @@ class OutageTracker:
         log.warning("%s outage ended after %s%s", o["kind"], dur, f" ({note})" if note else "")
         self._db_event("info", f"{group.capitalize()} connectivity restored after {dur}"
                        + (f" - {note}" if note else ""), self._clock())
-        effects.append(("event", "outage.end", self._decorate(o, self._clock())))
+        effects.append(("event", "outage.end", self._decorate(o, self._clock()), self._clear_gen))
 
     def _evaluate_totals(self, views: List[Dict[str, Any]], ref_ts: float, recovered_ts: Optional[float],
                          recovered_group: Optional[str], note: Optional[str], effects: List[_Effect],
@@ -1278,14 +1335,27 @@ class OutageTracker:
             log.exception("recording outage event failed")
 
     def _run_effects(self, effects: List[_Effect]) -> None:
-        for kind, a, b in effects:
+        for effect in effects:
+            kind, a, b = effect[0], effect[1], effect[2]
             try:
                 if kind == "in_outage":
-                    self._pm.set_in_outage(a, b)
+                    self._apply_in_outage(a)
                 elif kind == "event":
+                    if len(effect) > 3 and effect[3] != self._clear_gen:
+                        continue                # the outage it announces was cleared meanwhile (clear_history)
                     self._bus.publish(a, b, ts=float(self._clock()))
             except Exception:  # noqa: BLE001
                 log.exception("outage effect %s failed", kind)
+
+    def _apply_in_outage(self, target_id: Any) -> None:
+        """Tell the PingManager whether *target_id* is in an open outage *now* (its red light).  The flag is read and
+        handed over under ``_flag_lock``: an effect computed before a clear can never turn the light red again after
+        :meth:`clear_history` turned it off.  The tracker's own lock is not held while calling into the PingManager."""
+        with self._flag_lock:
+            with self._lock:
+                st = self._states.get(int(target_id))
+                flag = bool(st is not None and st.outage is not None)
+            self._pm.set_in_outage(target_id, flag)
 
 
 def _view_id(view: Dict[str, Any]) -> Optional[int]:

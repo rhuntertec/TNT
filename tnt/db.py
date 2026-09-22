@@ -20,6 +20,11 @@ Design notes
   database gains the columns by ``ALTER TABLE`` and ``ping_minutes`` is rebuilt once to the new key
   (:meth:`Database._migrate_networks`, after a one-time copy ``tnt.db.pre-networks.bak``); a failed
   rebuild leaves ``networks_ready`` false and the database working as before.
+* Clear history (Settings, :mod:`tnt.history`): :meth:`Database.delete_ping_minutes_since`,
+  :meth:`Database.delete_outages_since` and :meth:`Database.clear_history` delete what overlaps ``[since_ts, now]``
+  (None: everything), each in one BEGIN IMMEDIATE transaction.  They never delete or change ``reports``,
+  ``networks``, ``targets``, ``network_offline``, ``dhcp_leases``, ``meta`` or events rows other than category
+  ``outage``.
 """
 from __future__ import annotations
 
@@ -1338,6 +1343,106 @@ class Database:
             out["network_offline"] = self._conn.execute(
                 "DELETE FROM network_offline WHERE end_ts IS NOT NULL AND end_ts<?", (cutoff,)).rowcount
         return out
+
+    # -- clear history (tnt.history, Engine.clear_history) ------------------
+    # Settings > "Clear history" removes what was recorded in [since_ts, now]; since_ts None is everything.  A record that
+    # overlaps since_ts goes whole (a minute bucket or an outage cannot be cut without inventing numbers).  Never deleted or
+    # changed: reports, networks, targets, network_offline, dhcp_leases, meta, and events rows other than category 'outage'.
+    def delete_ping_minutes_since(self, since_ts: Optional[float], info: Optional[Dict[str, Any]] = None) -> int:
+        """Delete every minute bucket overlapping ``[since_ts, now]`` on every network (``minute_ts > since_ts - 60``: a bucket
+        that began up to 59 s before *since_ts* goes whole); None deletes every row.  One BEGIN IMMEDIATE transaction, so
+        all or nothing.  ``PingManager.clear_history`` calls it on the caller's own thread (not the ping writer's), holding
+        its ``_write_lock``, which every minute write also holds: a write that already passed its check lands first and is
+        deleted with the rest.  Minutes still queued in the writer or on their way to it are not flushed first: the clear
+        generation it bumped beforehand turns each of them into a no-op.  When *info* is a dict it gets ``earliest_ts``,
+        where the earliest bucket deleted began (None when none was): the cleared span on the timeline starts there.
+        Returns the rows deleted."""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                if since_ts is None:
+                    first = self._conn.execute("SELECT MIN(minute_ts) FROM ping_minutes").fetchone()[0]
+                    n = self._conn.execute("DELETE FROM ping_minutes").rowcount
+                else:
+                    cut = float(since_ts) - 60.0
+                    first = self._conn.execute("SELECT MIN(minute_ts) FROM ping_minutes WHERE minute_ts>?", (cut,)).fetchone()[0]
+                    n = self._conn.execute("DELETE FROM ping_minutes WHERE minute_ts>?", (cut,)).rowcount
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+        if isinstance(info, dict):
+            info["earliest_ts"] = None if first is None else float(first)
+        return int(n)
+
+    def delete_outages_since(self, since_ts: Optional[float], info: Optional[Dict[str, Any]] = None) -> int:
+        """Delete the outage rows of every kind (gaps too) overlapping ``[since_ts, now]`` - open ones (``end_ts`` NULL) and those
+        that ended at or after *since_ts*, the overlap rule ``list_outages`` reads with - and the ``events`` rows of category
+        ``outage`` from *since_ts* on, in one BEGIN IMMEDIATE transaction; None deletes every outage row and every ``outage``
+        events row.  A failure rolls both back and raises.  ``OutageTracker.clear_history`` calls it under its own lock, before
+        it forgets the open outages.  When *info* is a dict it gets ``earliest_ts``, the earliest ``start_ts`` deleted (an
+        outage that straddles *since_ts* goes whole, from its start; None when none was).  Returns the outage rows deleted."""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                if since_ts is None:
+                    first = self._conn.execute("SELECT MIN(start_ts) FROM outages").fetchone()[0]
+                    n = self._conn.execute("DELETE FROM outages").rowcount
+                    self._conn.execute("DELETE FROM events WHERE category='outage'")
+                else:
+                    since = float(since_ts)
+                    first = self._conn.execute("SELECT MIN(start_ts) FROM outages WHERE end_ts IS NULL OR end_ts>=?",
+                                               (since,)).fetchone()[0]
+                    n = self._conn.execute("DELETE FROM outages WHERE end_ts IS NULL OR end_ts>=?", (since,)).rowcount
+                    self._conn.execute("DELETE FROM events WHERE category='outage' AND ts>=?", (since,))
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+        if isinstance(info, dict):
+            info["earliest_ts"] = None if first is None else float(first)
+        return int(n)
+
+    def clear_history(self, since_ts: Optional[float], until_ts: Optional[float] = None) -> Dict[str, int]:
+        """Delete the speed tests started at or after *since_ts*, the Discovery runs started at or after it with their hosts
+        (hosts first, by run id: there is no foreign key) and the ``outage`` events rows from it on, all in one BEGIN
+        IMMEDIATE transaction; None deletes every row of those.  The outage tracker has deleted its events already
+        (:meth:`delete_outages_since`); this repeats it as a safety net, bounded by *until_ts* when given (the Engine
+        passes the moment its clear began): an ``outage`` row written after the clear began is of an outage that began
+        after it, and stays.  A failure rolls every one of them back and raises: never half applied.  The ping minutes
+        and outages are cleared by their owners first (:meth:`delete_ping_minutes_since`, :meth:`delete_outages_since`).
+        Returns ``{"speedtests", "discovery_runs", "discovery_hosts", "events"}``."""
+        out: Dict[str, int] = {}
+        until = None if until_ts is None else float(until_ts)
+        ev_until, ev_args = ("", ()) if until is None else (" AND ts<?", (until,))
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                if since_ts is None:
+                    out["speedtests"] = self._conn.execute("DELETE FROM speedtests").rowcount
+                    out["discovery_hosts"] = self._conn.execute("DELETE FROM discovery_hosts").rowcount
+                    out["discovery_runs"] = self._conn.execute("DELETE FROM discovery_runs").rowcount
+                    out["events"] = self._conn.execute("DELETE FROM events WHERE category='outage'" + ev_until,
+                                                       ev_args).rowcount
+                else:
+                    since = float(since_ts)
+                    out["speedtests"] = self._conn.execute("DELETE FROM speedtests WHERE ts>=?", (since,)).rowcount
+                    runs = [int(r[0]) for r in self._conn.execute("SELECT id FROM discovery_runs WHERE ts>=?", (since,)).fetchall()]
+                    hosts = 0
+                    for i in range(0, len(runs), 500):          # well under SQLite's bound-parameter limit
+                        chunk = runs[i:i + 500]
+                        q = ",".join("?" * len(chunk))
+                        hosts += self._conn.execute(f"DELETE FROM discovery_hosts WHERE run_id IN ({q})", chunk).rowcount
+                        self._conn.execute(f"DELETE FROM discovery_runs WHERE id IN ({q})", chunk)
+                    out["discovery_hosts"] = hosts
+                    out["discovery_runs"] = len(runs)
+                    out["events"] = self._conn.execute("DELETE FROM events WHERE category='outage' AND ts>=?" + ev_until,
+                                                       (since,) + ev_args).rowcount
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+        return {k: int(v) for k, v in out.items()}
 
     def vacuum(self) -> None:
         with self._lock:

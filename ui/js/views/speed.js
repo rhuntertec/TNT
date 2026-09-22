@@ -125,6 +125,9 @@
       els.failed.textContent = 'Last test failed: ' + (last.error || 'unknown error');
       els.note.hidden = true;
     } else {
+      // no test at all (never run, or Clear history took every one): the numbers of an earlier test go too
+      els.down.textContent = '—'; els.up.textContent = '—'; els.lat.textContent = '—'; els.jit.textContent = '—';
+      lastTs = null;
       els.meta.innerHTML = '';
       els.meta.appendChild(h('span', { class: 'muted' }, 'No speed test yet'));
       els.failed.hidden = true;
@@ -310,7 +313,11 @@
       loadPatterns();
       unsubs.push(TNT.api.events.on('speedtest.start', () => setProgress(true, 'starting', 0)));
       unsubs.push(TNT.api.events.on('speedtest.progress', (d) => { if (d) setProgress(true, d.phase, d.pct || 0); }));
-      unsubs.push(TNT.api.events.on('speedtest.done', () => { setProgress(false, 'done', 1); setTimeout(() => { loadHistory(); loadPatterns(); }, 300); }));
+      // a test Clear history cancelled did not finish: the fuse goes back to idle rather than showing "Done"
+      unsubs.push(TNT.api.events.on('speedtest.done', (d) => {
+        setProgress(false, TNT.api.history.cancelledTest(d) ? 'idle' : 'done', TNT.api.history.cancelledTest(d) ? 0 : 1);
+        setTimeout(() => { loadHistory(); loadPatterns(); }, 300);
+      }));
       unsubs.push(TNT.api.events.on('hello', () => { loadHistory(); loadPatterns(); }));
       ticker = setInterval(() => { const st = TNT.state.status; if (st && st.speed) renderLatest(st.speed); }, 5000);
     },

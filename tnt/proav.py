@@ -105,6 +105,7 @@ from __future__ import annotations
 import importlib
 import ipaddress
 import logging
+import math
 import os
 import re
 import select
@@ -1435,6 +1436,33 @@ def _now_text(value: Any) -> Optional[str]:
     return _text(value, 120)
 
 
+_SINCE_TEXT = "since_ts must be a time in seconds, or None for everything"
+
+
+def _clear_since(value: Any) -> Optional[float]:
+    """*value* as the start of a history clear: None (everything) or a finite time in seconds, else ``ValueError``.
+    A NaN compares false with every time, so taken as it is a clear would silently keep everything."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(_SINCE_TEXT)
+    try:
+        since = float(value)
+    except OverflowError:
+        raise ValueError(_SINCE_TEXT) from None
+    if not math.isfinite(since):
+        raise ValueError(_SINCE_TEXT)
+    return since
+
+
+def _cleared_by(ts: Any, since_ts: Optional[float]) -> bool:
+    """Whether something recorded at *ts* falls in a history clear from *since_ts* on (None: everything goes).  A
+    time that cannot be read goes too: a result nobody can place is not one to keep."""
+    if since_ts is None or isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return True
+    return float(ts) >= float(since_ts)
+
+
 def _socket_reason(exc: BaseException) -> str:
     """A plain-language reason a listener could not open."""
     name = getattr(exc, "winerror", None) or getattr(exc, "errno", None)
@@ -1780,6 +1808,8 @@ class ProAvScanner:
 
     One scan runs at a time; a second :meth:`start` is refused with :data:`BUSY_TEXT`.  :meth:`cancel` ends the
     listen early and keeps what was heard (``RESULT["cancelled"]`` is True), which is what the Stop button does.
+    :meth:`clear_history` (Settings > Clear history) forgets the result, and stops a running listen and throws away
+    what it heard.
 
     Module-level seams that tests (and only tests) monkeypatch: ``_open_socket``, ``_adapter_list``, ``_arp_table``,
     ``_vendor_for_mac`` (in :mod:`tnt.ptp`) and ``_L2Listener``.  ``tnt.netinfo`` / ``tnt.arp`` / ``tnt.oui`` /
@@ -1793,6 +1823,8 @@ class ProAvScanner:
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._generation = 0
+        # the generation of a scan that was listening when the history was cleared: its result is thrown away
+        self._discard_generation: Optional[int] = None
         self._last: Optional[Dict[str, Any]] = None
         self._last_run_ts: Optional[float] = None
         self._job: Dict[str, Any] = self._idle_job()
@@ -1979,6 +2011,35 @@ class ProAvScanner:
         if thread is not None and thread.is_alive():
             thread.join(max(0.0, float(timeout)))
 
+    def clear_history(self, since_ts: Optional[float]) -> Dict[str, Any]:
+        """Settings > Clear history: ``{"cleared": int, "stopped": bool}``.
+
+        The kept result goes when it was recorded (``RESULT["ts"]``, when the scan ended) at or after *since_ts*, or
+        always when *since_ts* is None; a finished, failed or cancelled job that belongs to the cleared time goes back
+        to idle with it.  A scan that is listening is stopped (``stopped``) and what it heard is thrown away when its
+        worker finishes, by its generation, so it can never land after the clear; until then the job says it is still
+        scanning, which it is.  ``proav.state`` is published, so the page and the tile read the change.  A *since_ts*
+        that is neither None nor a finite time is refused with ``ValueError`` before anything changes."""
+        since = _clear_since(since_ts)
+        stop: Optional[threading.Event] = None
+        with self._lock:
+            state = self._job.get("state")
+            cleared = 0
+            if self._last is not None and _cleared_by(self._last.get("ts"), since):
+                self._last = None
+                self._last_run_ts = None
+                cleared = 1
+            if state == "scanning":
+                self._discard_generation = self._job.get("generation")
+                stop = self._stop
+            elif state != "idle" and (cleared or _cleared_by(self._job.get("started_ts"), since)):
+                self._job = self._idle_job()
+        if stop is not None:
+            stop.set()
+        log.info("Pro AV: history cleared (%d result(s)%s)", cleared, ", a running scan stopped" if stop else "")
+        self._publish()
+        return {"cleared": cleared, "stopped": stop is not None}
+
     # -- listeners ---------------------------------------------------------------------------------
     def _open_socket(self, port: int, groups: Iterable[str], local_ip: str) -> Any:
         """A UDP socket bound to ``port`` with every group joined on ``local_ip``.
@@ -2075,22 +2136,37 @@ class ProAvScanner:
         with self._lock:
             if self._job.get("generation") != generation:
                 return                  # a newer scan started while this one was finishing: its state wins
-            self._last = result
-            self._last_run_ts = result["ts"]
-            self._job.update({"state": "cancelled" if cancelled else "done", "phase": "done", "pct": 1.0,
-                              "elapsed_s": round(float(self._clock()) - started, 2),
-                              "counts": dict(result["counts"]), "listeners": list(result["listeners"]),
-                              "ts": float(self._clock())})
-        log.info("Pro AV scan finished: %d device(s), %d stream(s), %d finding(s)",
-                 len(result["devices"]), len(result["streams"]), len(result["findings"]))
+            discarded = self._discarded_locked(generation)
+            if not discarded:
+                self._last = result
+                self._last_run_ts = result["ts"]
+                self._job.update({"state": "cancelled" if cancelled else "done", "phase": "done", "pct": 1.0,
+                                  "elapsed_s": round(float(self._clock()) - started, 2),
+                                  "counts": dict(result["counts"]), "listeners": list(result["listeners"]),
+                                  "ts": float(self._clock())})
+        if discarded:
+            log.info("Pro AV scan stopped and thrown away: the history was cleared while it listened")
+        else:
+            log.info("Pro AV scan finished: %d device(s), %d stream(s), %d finding(s)",
+                     len(result["devices"]), len(result["streams"]), len(result["findings"]))
         self._publish()
+
+    def _discarded_locked(self, generation: int) -> bool:
+        """Whether the scan of *generation* was listening when the history was cleared; if so the job goes back to
+        idle and nothing it heard is kept (the caller holds the lock and has checked the generation is current)."""
+        if self._discard_generation != generation:
+            return False
+        self._discard_generation = None
+        self._job = self._idle_job()
+        return True
 
     def _finish_error(self, generation: int, message: str, listeners: List[Dict[str, Any]]) -> None:
         with self._lock:
             if self._job.get("generation") != generation:
                 return
-            self._job.update({"state": "error", "phase": "error", "error": _now_text(message),
-                              "listeners": listeners, "ts": float(self._clock())})
+            if not self._discarded_locked(generation):
+                self._job.update({"state": "error", "phase": "error", "error": _now_text(message),
+                                  "listeners": listeners, "ts": float(self._clock())})
         self._publish()
 
     def _listen(self, listeners: List["_Listener"], collector: "_MdnsCollector", tracker: Any,

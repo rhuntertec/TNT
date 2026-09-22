@@ -3,7 +3,7 @@
    index.html so the WiFi page has something to show outside the TNT window.
 
    It defines the survey half of the TNT window's pywebview bridge on window.pywebview.api
-   (wifi_survey, wifi_scan_now, wifi_clear, wifi_set_enabled, open_location_settings; any keys
+   (wifi_survey, wifi_scan_now, wifi_clear, wifi_clear_since, wifi_set_enabled, open_location_settings; any keys
    already there are kept) and simulates a lively, entirely invented radio environment: ~30
    access points on 2.4 / 5 / 6 GHz at 20-320 MHz (one 80+80), multi-AP networks, hidden networks,
    Open / OWE / WEP / WPA / WPA2 / WPA3 / Enterprise, one connected access point, signal random
@@ -280,6 +280,26 @@
       sim.aps.clear(); sim.history.clear(); sim.link = []; sim.visible = new Set();
       sim.startedTs = Date.now() / 1000; sim.nextRead = sim.startedTs; sim.lastRead = null;
       return later({ ok: true });
+    },
+    // Settings › Clear history (client/tray.py wifi_clear_since): the readings from `since` on go, an access point left with
+    // none is forgotten, and null is everything (wifi_clear); -> { ok, aps_dropped, points_dropped }
+    wifi_clear_since(since) {
+      let aps = 0, points = sim.link.length;
+      if (since == null) {
+        for (const pts of sim.history.values()) points += pts.length;
+        aps = sim.aps.size;
+        return methods.wifi_clear().then(() => ({ ok: true, aps_dropped: aps, points_dropped: points }));
+      }
+      for (const [bssid, pts] of Array.from(sim.history)) {
+        const keep = pts.filter((p) => p[0] < since);
+        points += pts.length - keep.length;
+        if (keep.length) sim.history.set(bssid, keep);
+        else { sim.history.delete(bssid); sim.aps.delete(bssid); sim.visible.delete(bssid); aps++; }
+      }
+      const link = sim.link.filter((p) => p[0] < since);
+      points -= link.length;
+      sim.link = link;
+      return later({ ok: true, aps_dropped: aps, points_dropped: points });
     },
     wifi_set_enabled(on) {
       sim.enabled = !!on;

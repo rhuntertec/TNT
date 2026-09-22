@@ -4,7 +4,7 @@
 
 ## [⬇ Download TNT for Windows](https://github.com/rhuntertec/TNT/releases/latest)
 
-**Latest release: 1.22.0** — [TNT-Setup-1.22.0.exe](https://github.com/rhuntertec/TNT/releases/download/v1.22.0/TNT-Setup-1.22.0.exe) · [release notes](https://github.com/rhuntertec/TNT/releases/latest) · [checksum](https://github.com/rhuntertec/TNT/releases/download/v1.22.0/TNT-Setup-1.22.0.exe.sha256)
+**Latest release: 1.23.0** — [TNT-Setup-1.23.0.exe](https://github.com/rhuntertec/TNT/releases/download/v1.23.0/TNT-Setup-1.23.0.exe) · [release notes](https://github.com/rhuntertec/TNT/releases/latest) · [checksum](https://github.com/rhuntertec/TNT/releases/download/v1.23.0/TNT-Setup-1.23.0.exe.sha256)
 
 Windows 10 or 11, 64-bit. The build is not code-signed, so SmartScreen will warn: choose
 **More info**, then **Run anyway**. Once installed, TNT updates itself from this page.

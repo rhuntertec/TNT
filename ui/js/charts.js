@@ -334,6 +334,23 @@
   }
 
   /* ------------------------------------------------------------ timeline */
+  /** Pure: the timeline's hatched spans for its data (GET /api/outages/timeline) -> [{start_ts, end_ts, title}], the
+   *  monitoring gaps ("Not monitoring") then the spans whose history was cleared ("History cleared"); a span without two
+   *  numbers is left out. */
+  function hatchedSpans(d) {
+    const out = [];
+    const add = (list, title) => {
+      for (const g of Array.isArray(list) ? list : []) {
+        if (g && typeof g.start_ts === 'number' && typeof g.end_ts === 'number' && g.end_ts >= g.start_ts) {
+          out.push({ start_ts: g.start_ts, end_ts: g.end_ts, title });
+        }
+      }
+    };
+    add(d && d.gaps, 'Not monitoring');
+    add(d && d.cleared, 'History cleared');
+    return out;
+  }
+
   /** 24 h outage timeline. */
   class Timeline extends Chart {
     constructor(canvas, opts) {
@@ -359,8 +376,9 @@
       ctx.fillStyle = c.green;
       ctx.fill();
 
-      // gaps: hatched grey, clipped to the bar
-      const gaps = (d && d.gaps) || [];
+      // gaps and cleared history: hatched grey, clipped to the bar. Time whose history was cleared is not known to have
+      // been fine, so it is drawn like a monitoring gap and never left green; the tooltip says which it is.
+      const gaps = hatchedSpans(d);
       if (gaps.length) {
         ctx.save();
         roundRect(ctx, x0, barY, x1 - x0, barH, r);
@@ -382,7 +400,7 @@
           ctx.beginPath(); ctx.moveTo(gx0 + 0.5, barY); ctx.lineTo(gx0 + 0.5, barY + barH); ctx.stroke();
           ctx.beginPath(); ctx.moveTo(gx1 - 0.5, barY); ctx.lineTo(gx1 - 0.5, barY + barH); ctx.stroke();
           this.hits.push({ x0: gx0, x1: gx1, y0: barY, y1: barY + barH, priority: 1,
-            tip: '<div class="t">Not monitoring</div>' + clockS(g.start_ts) + ' – ' + clockS(g.end_ts) +
+            tip: '<div class="t">' + esc(g.title) + '</div>' + clockS(g.start_ts) + ' – ' + clockS(g.end_ts) +
               '<div class="muted">' + durationText(g.end_ts - g.start_ts) + '</div>' });
         }
         ctx.restore();
@@ -989,7 +1007,7 @@
 
   TNT.charts = {
     Chart, Sparkline, Timeline, LineChart, BarChart, Throughput,
-    colors, roundRect, alpha, niceStep, niceCeil,
+    colors, roundRect, alpha, niceStep, niceCeil, hatchedSpans,
     rerenderAll() { for (const ch of Array.from(registry)) ch.render(); },
     count() { return registry.size; },
   };

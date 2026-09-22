@@ -57,6 +57,7 @@ from __future__ import annotations
 import copy
 import ipaddress
 import logging
+import math
 import threading
 import os
 import secrets
@@ -207,6 +208,33 @@ def parse_binding_response(data: bytes, transaction: bytes) -> Optional[Dict[str
 
 
 # --------------------------------------------------------------------------- the checks
+_SINCE_TEXT = "since_ts must be a time in seconds, or None for everything"
+
+
+def _clear_since(value: Any) -> Optional[float]:
+    """*value* as the start of a history clear: None (everything) or a finite time in seconds, else ``ValueError``.
+    A NaN compares false with every time, so taken as it is a clear would silently keep everything."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(_SINCE_TEXT)
+    try:
+        since = float(value)
+    except OverflowError:
+        raise ValueError(_SINCE_TEXT) from None
+    if not math.isfinite(since):
+        raise ValueError(_SINCE_TEXT)
+    return since
+
+
+def _cleared_by(ts: Any, since_ts: Optional[float]) -> bool:
+    """Whether a result taken at *ts* falls in a history clear from *since_ts* on (None: everything goes).  A time
+    that cannot be read goes too."""
+    if since_ts is None or isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return True
+    return float(ts) >= float(since_ts)
+
+
 def _finding(ident: str, level: str, title: str, detail: Optional[str] = None, advice: Optional[str] = None,
              evidence: Any = None) -> Dict[str, Any]:
     return {"id": ident, "level": level, "title": title, "detail": detail, "advice": advice, "evidence": evidence}
@@ -226,6 +254,7 @@ class StunChecker:
         self._lock = threading.Lock()
         self._running = False
         self._last: Optional[Dict[str, Any]] = None
+        self._cleared = 0                # bumped by clear_history: a check started before it is not kept
 
     # -- state, so a button can drive it ---------------------------------------------------------
     def last(self) -> Optional[Dict[str, Any]]:
@@ -242,6 +271,19 @@ class StunChecker:
         with self._lock:
             self._last = None
 
+    def clear_history(self, since_ts: Optional[float]) -> int:
+        """Settings > Clear history: forget the kept quick check when it was taken at or after *since_ts* (None:
+        always); the number of results removed (0 or 1).  A check running now still answers the button that started
+        it, but its result is not kept when it finishes (:meth:`running` beforehand says whether one was).  A
+        *since_ts* that is neither None nor a finite time is refused with ``ValueError``."""
+        since = _clear_since(since_ts)
+        with self._lock:
+            self._cleared += 1
+            if self._last is not None and _cleared_by(self._last.get("ts"), since):
+                self._last = None
+                return 1
+            return 0
+
     def check(self, servers: Optional[Sequence[Any]] = None, *, local_port: int = 0) -> Dict[str, Any]:
         """The quick check: both servers asked from one socket, and what the difference says.
 
@@ -251,13 +293,15 @@ class StunChecker:
             if self._running:
                 raise RuntimeError(BUSY_TEXT)
             self._running = True
+            cleared = self._cleared
         try:
             result = self._check(servers, local_port)
         finally:
             with self._lock:
                 self._running = False
         with self._lock:
-            self._last = copy.deepcopy(result)
+            if self._cleared == cleared:   # the history was not cleared while it ran
+                self._last = copy.deepcopy(result)
         return result
 
     def _check(self, servers: Optional[Sequence[Any]], local_port: int) -> Dict[str, Any]:

@@ -86,6 +86,15 @@ Scheduler behaviour
 * :meth:`cancel_current` cuts only the run in progress short and leaves the
   scheduler running (a cancelled Full Scan stops the test it started itself,
   ``tnt.reports``).
+* :meth:`clear_history` (Settings > "Clear history", :mod:`tnt.history`) cancels
+  the run in progress and voids it through a clear generation (no row, no
+  failure event, not adopted, even when it finished a moment before the cancel
+  landed); its ``speedtest.done`` adds ``"silent": true, "cancel_reason":
+  "history cleared"`` so the page skips the failure toast.  The last result
+  becomes the newest stored test before the cleared span, and
+  :meth:`reload_last` (called once the rows are deleted) makes it the newest
+  stored test again, so the tile never shows a deleted one.  Cooldowns, the
+  adaptive spacing and the schedule stay as they are.
 * ``clock`` is injectable; the loop polls the clock every ``poll_s`` (1 s by
   default) so a fake clock can drive tests. The cooldown registry keeps its
   own clock (``base.cooldown_clock``); tests patch both to the same fake.
@@ -115,6 +124,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
+from ..history import CANCEL_REASON
 from .base import (
     CANCELLED, RATE_LIMITED_PREFIX, ProgressFn, SpeedBackend, SpeedResult, clamp_retry_after, failed_result,
     get_cooldown, is_rate_limited, set_cooldown,
@@ -349,6 +359,10 @@ class SpeedScheduler:
         self._unsubscribe: Optional[Callable[[], None]] = None
         self._rate_limited_ts: List[float] = []   # recent rate-limited outcomes (adaptive spacing)
         self._backoff = 1                          # effective interval multiplier
+        # clear_history: a run keeps nothing when a clear came while it ran; _persist_lock orders its check and its row
+        # against the clear, so a row written a moment before the clear is in the database when the clear deletes
+        self._clear_gen = 0
+        self._persist_lock = threading.Lock()
 
     # -- lifecycle ------------------------------------------------------------
     def start(self) -> None:
@@ -655,6 +669,48 @@ class SpeedScheduler:
         log.info("speed test cancel requested")
         return True
 
+    def clear_history(self, since_ts: Optional[float]) -> Dict[str, Any]:
+        """Settings > "Clear history" (``Engine.clear_history``): ``{"stopped": bool}``.
+
+        A test running now is cancelled (``stopped``) and keeps nothing: no row, no failure event, not the last result,
+        and its ``speedtest.done`` carries ``"silent": true`` and ``"cancel_reason": "history cleared"`` so the page shows
+        no "Speed test failed" toast.  The same holds for a run that finishes a moment before the cancel lands: the clear
+        generation bumped here voids it.  The last result becomes the newest stored test started before *since_ts* (None:
+        none), read here, so it does not matter whether the database rows (``Database.clear_history``) go before or after
+        this call; the Engine calls it first, before those rows are deleted, so a test cannot write its row in between.
+        The whole call holds ``_persist_lock``: a test that starts after the bump (it is not voided) cannot store and adopt
+        its result until the last result is set here, so this never overwrites it.  Rate-limit cooldowns, the adaptive
+        spacing and the schedule are not touched."""
+        since = None if since_ts is None else float(since_ts)
+        with self._persist_lock:
+            with self._lock:
+                self._clear_gen += 1
+                cancel = self._cancel if self._running else None
+            if cancel is not None:
+                cancel.set()
+                log.info("speed test cancelled: the history was cleared")
+            last: Optional[Dict[str, Any]] = None
+            if since is not None:
+                try:
+                    rows = self._db.list_speedtests(0.0, since, limit=1, with_raw=True)
+                    last = self._row_to_result(rows[0]) if rows else None
+                except Exception:  # noqa: BLE001
+                    log.exception("cannot load the last speed test before the cleared span")
+            with self._lock:
+                self._last_result = last
+        return {"stopped": cancel is not None}
+
+    def reload_last(self) -> Optional[Dict[str, Any]]:
+        """The last result becomes the newest stored test (None when there is none) and is returned.  The Engine calls it
+        once ``Database.clear_history`` has deleted the cleared rows: a test that started after :meth:`clear_history` and
+        finished before that delete has lost its row, so the Speed tile must not keep showing it.  Under
+        ``_persist_lock``, so a test storing its row now is either read here or adopted after."""
+        with self._persist_lock:
+            last = self._load_last()
+            with self._lock:
+                self._last_result = last
+        return last
+
     def _on_progress(self, phase: str, frac: float) -> None:
         try:
             pct = max(0.0, min(1.0, float(frac)))
@@ -783,6 +839,7 @@ class SpeedScheduler:
         with self._lock:
             cancel = self._cancel if self._cancel is not None else threading.Event()
             self._cancel = cancel
+            gen = self._clear_gen           # a clear_history() after this voids the run (see _execute below)
         try:
             backend: Optional[SpeedBackend] = select_backend(self._config)
         except Exception:  # noqa: BLE001
@@ -835,16 +892,24 @@ class SpeedScheduler:
             d["quality"] = quality
             cancelled = cancel.is_set() and not d.get("ok") and d.get("error") == CANCELLED
             limited = bool(is_rate_limited(result)) and not cancelled
-            if cancelled:
-                # Cut short by stop(): not a measurement, so no history row, no failure event.
-                log.info("speed test cancelled (%s, %s)", trigger, d.get("backend"))
-            elif limited:
+            with self._persist_lock:
+                # the history was cleared while this ran: whatever it measured is part of what was cleared
+                discarded = gen != self._clear_gen
+                if cancelled or discarded:
+                    # Cut short by stop(), cancel_current() or clear_history(): not a measurement (or one the user
+                    # cleared), so no history row and no failure event.
+                    log.info("speed test %s (%s, %s)", "discarded: the history was cleared while it ran" if discarded
+                             else "cancelled", trigger, d.get("backend"))
+                elif limited:
+                    pass
+                else:
+                    try:
+                        d["id"] = self._db.add_speedtest(d if network_id is None else {**d, "network_id": network_id})
+                    except Exception:  # noqa: BLE001
+                        log.exception("failed to persist speed test result")
+            if limited:
+                # the server refused: its spacing stands whatever the history clear did (never reset by it)
                 self._rate_limited_outcome(trigger, ts, refused or [self._refusal(result)])
-            else:
-                try:
-                    d["id"] = self._db.add_speedtest(d if network_id is None else {**d, "network_id": network_id})
-                except Exception:  # noqa: BLE001
-                    log.exception("failed to persist speed test result")
             if d.get("ok"):
                 log.info("speed test done: down %.1f Mbps, up %s Mbps, latency %s ms (%s, %.1f s)%s",
                          d.get("download_mbps") or 0.0,
@@ -853,17 +918,23 @@ class SpeedScheduler:
                          d.get("server") or d.get("backend"), d.get("duration_s") or 0.0,
                          f" after {refused[0]['backend']} was rate limited" if refused else "")
                 self._successful_outcome(ts)
-            elif not cancelled and not limited:
+            elif not cancelled and not limited and not discarded:
                 log.warning("speed test failed (%s): %s", d.get("backend"), d.get("error"))
                 try:
                     self._db.add_event("warning", "speedtest", f"speed test failed ({d.get('backend')}): {d.get('error')}", ts=ts)
                 except Exception:  # noqa: BLE001
                     log.exception("failed to record speed test failure event")
             with self._lock:
-                if not cancelled and not limited:
+                # a clear since the row was written: clear_history() has (re)loaded the last result itself
+                voided = discarded or gen != self._clear_gen
+                if not cancelled and not limited and not voided:
                     self._last_result = d
                 self._progress = {"phase": "done", "pct": 1.0}
-            self._publish("speedtest.done", {"result": d, "trigger": trigger})
+            done: Dict[str, Any] = {"result": d, "trigger": trigger}
+            if voided:
+                # the UI resets its progress without a "Speed test failed" toast (tnt.history, ARCHITECTURE 3.6)
+                done.update(silent=True, cancel_reason=CANCEL_REASON)
+            self._publish("speedtest.done", done)
         except Exception:  # noqa: BLE001
             log.exception("speed test post-processing failed")
         finally:

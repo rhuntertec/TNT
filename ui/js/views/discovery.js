@@ -296,6 +296,14 @@
         if (!root) return;
         setRunning(false);
         stopPoll();
+        // a scan Clear history stopped, or one that finished while the clear ran and was voided (cancelled false, silent
+        // true): nothing of it was stored, so no "Done", and the list reloads without it
+        if (d && TNT.api.history && TNT.api.history.cancelledTest(d)) {
+          els.fuse.set(0, 'idle', '', '');
+          els.fuse.hidden = true;
+          await loadLast(); await loadRuns();
+          return;
+        }
         if (d && d.run_id != null) { await loadRun(d.run_id); await loadRuns(d.run_id); }
         else { await loadLast(); await loadRuns(currentRun && currentRun.id); }
         if (!root) return;

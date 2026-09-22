@@ -131,7 +131,7 @@ class FakeOutages:
     def timeline(self, hours: float = 24, now: Optional[float] = None) -> Dict[str, Any]:
         now = now or time.time()
         return {"start_ts": now - hours * 3600, "end_ts": now, "hours": hours,
-                "segments": [], "total_segments": [], "gaps": [], "targets": []}
+                "segments": [], "total_segments": [], "gaps": [], "targets": [], "cleared": []}
 
     def on_target_removed(self, target_id: int) -> None:
         pass
@@ -1106,6 +1106,7 @@ def test_outages_and_speedtest_routes(server, engine):
     assert status == 200 and data["outages"] == [] and data["status"]["count_24h"] == 0
     status, data = call_json(server, "GET", "/api/outages/timeline?hours=6")
     assert status == 200 and data["hours"] == 6 and "segments" in data and "total_segments" in data
+    assert data["cleared"] == []            # the cleared history spans (tnt.history), none here
 
     status, data = call_json(server, "GET", "/api/speedtests?limit=10")
     assert status == 200 and data["results"] == [] and data["status"]["backend"] == "cloudflare"

@@ -123,11 +123,22 @@ Contract gaps resolved here (documented deviations):
   finder, right after the LAN peers (idle, each returns at once and runs no pktmon command);
   ``_run_retention`` also applies the capture retention.  The speed scheduler gets the pinger for its latency-under-load
   probe (which makes a private one per run).
+* Settings > "Clear history" (:mod:`tnt.history`) is :meth:`Engine.clear_history`: one at a time (``_clear_lock``,
+  ``ClearConflict("clear_running")``), never while a Full Scan runs (``ClearConflict("full_scan_running")``), each
+  component cleared through its own ``clear_history`` in a fixed order and each step guarded (a part that is missing or
+  fails is named in ``skipped``; the rest still clears).  A Discovery scan running across a clear is cancelled and neither
+  stored nor adopted (``_disc_clear_gen``, checked under ``_disc_persist_lock`` before ``add_discovery_run``); its
+  ``discovery.done`` carries ``"silent": true, "cancel_reason": "history cleared"``.  The result is published as
+  ``history.cleared`` (the packet capture files it left alone counted there, named only in the answer to the
+  administrator who asked) and an ``info``/``history`` events row records what went.  A Full Scan start goes through
+  :meth:`Engine.outside_clear`, so none starts while a clear runs.
 """
 from __future__ import annotations
 
+import copy
 import datetime as _dt
 import logging
+import math
 import os
 import sys
 import threading
@@ -246,6 +257,18 @@ class Engine:
         self._disc_defaults_ts = 0.0
         self._disc_net_changed = False          # the network changed while the running scan ran
         self._disc_network_id: Optional[int] = None   # the network the running scan started on (tnt.networks)
+        # clear history: a scan running across a clear is neither stored nor adopted.  _disc_clear_gen is bumped by the
+        # clear, _disc_gen is its value when the running scan started; _disc_persist_lock orders the scan's check and its
+        # row against the clear's bump (a row stored a moment before the bump is in the database when the clear deletes).
+        self._disc_clear_gen = 0
+        self._disc_gen = 0
+        self._disc_persist_lock = threading.Lock()
+
+        # Settings > "Clear history": one clear at a time (clear_history).  _clear_gate orders the clear's "no Full Scan
+        # runs" check against a Full Scan start (outside_clear): whichever comes second is refused.
+        self._clear_lock = threading.Lock()
+        self._clear_gate = threading.Lock()
+        self._clearing = False
 
         # the adapter dhcp-restore put back on DHCP at start (its returning lease is TNT's own change)
         self._restored_nic: Optional[Dict[str, Any]] = None
@@ -1567,6 +1590,7 @@ class Engine:
             self._disc_progress = None
             self._disc_net_changed = False
             self._disc_network_id = self._network_id()      # the run is stored with the network it started on
+            self._disc_gen = self._disc_clear_gen
             t = threading.Thread(target=self._discovery_run, args=(disc, rt, ps, cancel), name="tnt-discovery", daemon=True)
             self._disc_thread = t
             # announce before the worker runs so discovery.start always precedes discovery.progress
@@ -1588,6 +1612,9 @@ class Engine:
     def _discovery_run(self, disc: Any, range_text: str, ports: List[int], cancel: threading.Event) -> None:
         result: Any = None
         run_id: Optional[int] = None
+        voided = False
+        with self._lock:
+            gen = self._disc_gen
         summary: Dict[str, Any] = {"run_id": None, "ok": False, "error": None, "cancelled": False,
                                    "found": 0, "cidr": range_text, "duration_s": None}
         try:
@@ -1608,8 +1635,11 @@ class Engine:
                     network_id = self._disc_network_id
                 if network_id is not None:
                     run["network_id"] = network_id
-                if self.db is not None:
-                    run_id = int(self.db.add_discovery_run(run, hosts))
+                with self._disc_persist_lock:
+                    with self._lock:
+                        voided = gen != self._disc_clear_gen    # the history was cleared while it ran (clear_history)
+                    if self.db is not None and not voided:
+                        run_id = int(self.db.add_discovery_run(run, hosts))
                 summary.update({
                     "run_id": run_id,
                     "ok": bool(run.get("ok", True)),
@@ -1622,22 +1652,35 @@ class Engine:
                     "scanned": run.get("scanned"),
                 })
                 with self._lock:
-                    self._last_discovery = {
-                        "id": run_id, "ts": run["ts"], "cidr": run["cidr"], "found": len(hosts),
-                        "duration_s": run.get("duration_s"), "ok": summary["ok"], "error": summary["error"],
-                    }
+                    voided = voided or gen != self._disc_clear_gen
+                    if not voided:
+                        self._last_discovery = {
+                            "id": run_id, "ts": run["ts"], "cidr": run["cidr"], "found": len(hosts),
+                            "duration_s": run.get("duration_s"), "ok": summary["ok"], "error": summary["error"],
+                        }
             except Exception:  # noqa: BLE001
                 log.exception("persisting the discovery run failed")
+        with self._lock:
+            # whatever the scan returned (a result, None, or it raised): a clear since it started voids it
+            voided = voided or gen != self._disc_clear_gen
+        if voided:
+            # neither stored nor the last run: the page resets without a "Scan cancelled" or failure toast
+            summary.update(run_id=None, cancelled=True, silent=True, cancel_reason="history cleared")
         with self._lock:
             self._disc_cancel = None
             # a scan that ran across a network change swept (part of) the network this PC left
             summary["network_changed"] = bool(self._disc_net_changed)
             self._disc_net_changed = False
         state = "cancelled" if summary["cancelled"] else ("finished" if summary["ok"] else "failed")
-        log.info("discovery scan %s: %s found=%s run_id=%s error=%s", state, summary["cidr"], summary["found"], run_id, summary["error"])
-        self._db_event("info" if summary["ok"] else "warning", "discovery",
-                       f"scan {state}: {summary['cidr']} found {summary['found']}" + (f" ({summary['error']})" if summary["error"] else "")
-                       + (" - the network changed during the scan" if summary["network_changed"] else ""))
+        log.info("discovery scan %s: %s found=%s run_id=%s error=%s%s", state, summary["cidr"], summary["found"], run_id,
+                 summary["error"], " (the history was cleared: not kept)" if voided else "")
+        if voided:
+            self._db_event("info", "discovery", f"scan stopped: {summary['cidr']} - the history was cleared while it ran, "
+                                                "so it was not kept")
+        else:
+            self._db_event("info" if summary["ok"] else "warning", "discovery",
+                           f"scan {state}: {summary['cidr']} found {summary['found']}" + (f" ({summary['error']})" if summary["error"] else "")
+                           + (" - the network changed during the scan" if summary["network_changed"] else ""))
         self._publish("discovery.done", summary)
 
     def discovery_running(self) -> bool:
@@ -1689,6 +1732,368 @@ class Engine:
         out["default_range"] = defaults.get("default_range")
         out["default_ports"] = default_ports
         return out
+
+    # ------------------------------------------------------------- clear history
+    def full_scan_running(self) -> bool:
+        """Whether a Full Scan runs now (it reads the history as it goes, so a clear waits for it)."""
+        mgr = getattr(self, "reports", None)
+        job_fn = getattr(mgr, "job", None)
+        if not callable(job_fn):
+            return False
+        try:
+            job = job_fn()
+        except Exception:  # noqa: BLE001
+            log.exception("reading the Full Scan job failed")
+            return False
+        return isinstance(job, dict) and job.get("status") == "running"
+
+    def clear_running(self) -> bool:
+        """Whether a history clear runs now."""
+        return self._clear_lock.locked()
+
+    def outside_clear(self, fn: Callable[[], Any]) -> Any:
+        """Run *fn* (a Full Scan start, ``POST /api/reports/scan``) unless a history clear runs:
+        ``tnt.history.ClearConflict("clear_running")`` then.  Under ``_clear_gate``, which the clear holds while it checks
+        that no Full Scan runs, so a scan that starts here is running when a clear looks, and a clear that looked first
+        keeps any scan from starting until it is done."""
+        from . import history
+
+        with self._clear_gate:
+            if self._clearing:
+                raise history.ClearConflict("clear_running", history.SCAN_DURING_CLEAR_MSG)
+            return fn()
+
+    def clear_history(self, range_key: str, captures_allowed: bool = True,
+                      captures_reason: Optional[str] = None) -> Dict[str, Any]:
+        """Settings > "Clear history": remove what was recorded in the last *range_key* (``tnt.history.RANGES``; ``all`` is
+        everything) and return the result, which is also published as ``history.cleared``.
+
+        ``ValueError`` for another key; ``tnt.history.ClearConflict`` (``clear_running``) while another clear runs and
+        (``full_scan_running``) while a Full Scan runs (checked under ``_clear_gate``, so no Full Scan starts until the
+        clear is done: :meth:`outside_clear`).  ``since_ts`` is ``now - seconds`` on this clock.  In this order: the
+        running jobs are stopped (the speed test through ``SpeedScheduler.clear_history``, which also reloads the last
+        result from the tests before the span, so it goes before the database rows it must not race; the Discovery
+        scanner's own ``clear_history`` first, so the scan running now cannot record its time, then the scan by bumping
+        its generation and cancelling it) -> ``PingManager.clear_history`` -> ``OutageTracker.clear_history`` ->
+        ``Database.clear_history(since, until_ts=now)`` (one transaction) -> ``SpeedScheduler.reload_last()`` (a test that
+        started after the cancel and ended before the delete lost its row) -> the last Discovery run re-derived ->
+        ``CaptureManager.clear_history`` (only when *captures_allowed*: the caller is a Windows administrator; else
+        captures are skipped with *captures_reason*) -> ``FaultWatcher.clear_history`` -> ``AlgChecker`` /
+        ``StunChecker`` / ``FlowReader.clear_history`` and ``SipQualifier.invalidate()`` -> ``ProAvScanner.clear_history``
+        -> the cleared span recorded (``tnt.history.record_span``, from the earliest start of an outage or minute bucket
+        it deleted when that is before ``since_ts``) -> ``ping.targets`` and ``history.cleared`` published.  Every step is
+        guarded: a component that is missing, lacks its method or fails is logged and named in ``skipped`` and the rest
+        still clears.  Components that keep nothing but memory (faults, SIP, Pro AV) and are not running have nothing to
+        clear.  The answer names each packet capture left alone (for the administrator who asked); the published
+        ``history.cleared``, which every window hears, only says how many and why.  Never deleted or changed: the
+        reports table, the exports folder, networks, targets, network_offline, dhcp_leases, settings, LAN peers,
+        speed-test cooldowns and events rows other than category ``outage`` (the clear adds one ``history`` row of its
+        own)."""
+        from . import history
+
+        if not history.valid_range(range_key):
+            raise ValueError(history.BAD_RANGE_MSG)
+        if not self._clear_lock.acquire(blocking=False):
+            raise history.ClearConflict("clear_running", history.CLEAR_RUNNING_MSG)
+        try:
+            with self._clear_gate:
+                if self.full_scan_running():
+                    raise history.ClearConflict("full_scan_running", history.FULL_SCAN_RUNNING_MSG)
+                self._clearing = True
+            try:
+                return self._clear_history_locked(range_key, captures_allowed, captures_reason)
+            finally:
+                with self._clear_gate:
+                    self._clearing = False
+        finally:
+            self._clear_lock.release()
+
+    def _clear_history_locked(self, range_key: str, captures_allowed: bool,
+                              captures_reason: Optional[str]) -> Dict[str, Any]:
+        from . import history
+
+        now = time.time()
+        since = history.since_for(range_key, now)
+        label = history.RANGE_LABELS[range_key]
+        log.warning("clearing history: %s (since %s)", label, "the beginning" if since is None else f"{since:.0f}")
+        job = _HistoryClear(since, now)
+        self._clear_stop_jobs(job)
+        self._clear_ping(job)
+        self._clear_outages(job)
+        self._clear_database(job)
+        self._clear_rederive_discovery(job)
+        self._clear_captures(job, captures_allowed, captures_reason)
+        self._clear_faults(job)
+        self._clear_sip(job)
+        self._clear_proav(job)
+        if self.db is not None:
+            # a record that straddled since_ts went whole: the cleared time on the timeline starts where it began
+            span_since = since if since is None else min([since] + job.earliest)
+            job.step("timeline", lambda: history.record_span(self.db, span_since, now, range_key),
+                     "the cleared time could not be marked on the Outages timeline")
+        result: Dict[str, Any] = {
+            "range": range_key, "label": label, "since_ts": since, "ts": now,
+            "cleared": job.cleared, "stopped": job.stopped, "skipped": job.skipped,
+        }
+        counts = ", ".join(f"{k} {v}" for k, v in job.cleared.items() if v)
+        self._db_event("info", "history", f"history cleared ({label}): {counts or 'nothing was recorded'}"
+                       + (f"; left alone: {', '.join(s['what'] for s in job.skipped)}" if job.skipped else ""))
+        pm = self.ping
+        if pm is not None and callable(getattr(pm, "publish_targets", None)):
+            job.step("ping", pm.publish_targets, "the ping tiles could not be refreshed")
+        # every window hears the event: the capture files left alone are counted there, never named
+        self._publish("history.cleared", dict(copy.deepcopy(result), skipped=job.public_skipped()))
+        log.warning("history cleared (%s): %s; stopped %s; skipped %s", label, job.cleared, job.stopped or "nothing",
+                    job.skipped or "nothing")
+        return result
+
+    def _clear_stop_jobs(self, job: "_HistoryClear") -> None:
+        """Stop what is running and would store history after the clear: the speed test and the Discovery scan."""
+        from . import history
+
+        sched = self.speed
+        if sched is not None:
+            res = job.method("speed", sched, "clear_history", (job.since,), "the running speed test could not be stopped "
+                             "and the Speed tile may show the last test until the next one")
+            if isinstance(res, dict) and res.get("stopped"):
+                job.stopped.append(history.STOPPED_SPEED)
+        disc = self.discovery
+        if disc is not None:
+            # before the scan is cancelled: a scan running now must not record its time as the last scan when it ends
+            job.method("discovery", disc, "clear_history", (job.since,), "the Discovery scanner kept its last scan time")
+        with self._disc_persist_lock:
+            with self._lock:
+                self._disc_clear_gen += 1
+                running = self._disc_thread is not None and self._disc_thread.is_alive()
+        if running:
+            job.step("discovery", self.discovery_cancel, "the running Discovery scan could not be stopped")
+            job.stopped.append(history.STOPPED_DISCOVERY)
+
+    def _clear_ping(self, job: "_HistoryClear") -> None:
+        pm = self.ping
+        if pm is not None:
+            n = job.method("ping", pm, "clear_history", (job.since,), "the ping history could not be cleared")
+            if n is not None:
+                job.cleared["ping"] = int(n)
+                info = getattr(pm, "last_clear_info", None) or {}
+                job.note_earliest(info.get("earliest_ts"))
+                failed = info.get("raw_log_failed") or []
+                if failed:
+                    job.skip("ping logs", "Some raw ping log files could not be changed: " + ", ".join(str(f) for f in failed))
+            return
+        # monitoring is not running: nothing is in memory, the stored history still goes
+        if self.db is None:
+            job.skip("ping", "The database is not available, so the ping history was left alone")
+        else:
+            info: Dict[str, Any] = {}
+            n = job.step("ping", lambda: self.db.delete_ping_minutes_since(job.since, info=info),
+                         "the ping history could not be cleared")
+            if n is not None:
+                job.cleared["ping"] = int(n)
+                job.note_earliest(info.get("earliest_ts"))
+        raw = self.raw_log
+        if raw is not None and callable(getattr(raw, "clear_since", None)):
+            job.step("ping logs", lambda: raw.clear_since(job.since, until_ts=job.now), "the raw ping logs could not be cleared")
+
+    def _clear_outages(self, job: "_HistoryClear") -> None:
+        tracker = self.outages
+        if tracker is not None:
+            n = job.method("outages", tracker, "clear_history", (job.since,), "the outage history could not be cleared")
+            if n is not None:
+                job.note_earliest((getattr(tracker, "last_clear_info", None) or {}).get("earliest_ts"))
+        elif self.db is not None:
+            info: Dict[str, Any] = {}
+            n = job.step("outages", lambda: self.db.delete_outages_since(job.since, info=info),
+                         "the outage history could not be cleared")
+            if n is not None:
+                job.note_earliest(info.get("earliest_ts"))
+        else:
+            job.skip("outages", "The database is not available, so the outages were left alone")
+            n = None
+        if n is not None:
+            job.cleared["outages"] = int(n)
+
+    def _clear_database(self, job: "_HistoryClear") -> None:
+        """Speed tests, Discovery scans (and ``outage`` events up to the clear's start) in one transaction: all of them or
+        none.  Then the speed scheduler re-reads its last result from what is left."""
+        if self.db is None:
+            job.skip("speed and discovery", "The database is not available, so the speed tests and Discovery scans were left alone")
+            return
+        res = job.step("speed and discovery", lambda: self.db.clear_history(job.since, until_ts=job.now),
+                       "the speed tests and Discovery scans could not be deleted, so none of them was")
+        if isinstance(res, dict):
+            job.cleared["speed"] = int(res.get("speedtests") or 0)
+            job.cleared["discovery"] = int(res.get("discovery_runs") or 0)
+        sched = self.speed
+        reload_last = getattr(sched, "reload_last", None) if sched is not None else None
+        if callable(reload_last):
+            # a test that started after the cancel and ended before the delete lost its row: the tile must not show it
+            job.step("speed", reload_last, "the Speed tile may show a deleted speed test until the next one")
+
+    def _clear_rederive_discovery(self, job: "_HistoryClear") -> None:
+        """The Discovery tile's last run: the newest run left (or none).  (The scanner's own last-run time was forgotten
+        when the jobs were stopped.)"""
+        if self.db is not None:
+            runs = job.step("discovery", lambda: self.db.list_discovery_runs(1),
+                            "the Discovery tile could not re-read its last scan")
+            if runs is not None:
+                with self._lock:
+                    self._last_discovery = self._run_summary(runs[0]) if runs else None
+        else:
+            with self._lock:
+                last = self._last_discovery
+                if last is not None and (job.since is None or float(last.get("ts") or 0.0) >= job.since):
+                    self._last_discovery = None
+
+    def _clear_captures(self, job: "_HistoryClear", allowed: bool, reason: Optional[str]) -> None:
+        if not allowed:
+            job.skip("captures", reason or "Packet captures need a Windows administrator account, so they were left alone")
+            return
+        cap = self.capture
+        if cap is None:
+            job.skip("captures", "Packet capture is not available, so its files were left alone")
+            return
+        res = job.method("captures", cap, "clear_history", (job.since,), "the packet captures could not be cleared")
+        if not isinstance(res, dict):
+            return
+        job.cleared["captures"] = int(res.get("deleted") or 0) + (1 if res.get("discarded_unsaved") else 0)
+        folder: Optional[Path] = None
+        try:
+            folder = paths.captures_dir()
+        except Exception:  # noqa: BLE001
+            log.exception("the captures folder could not be named")
+        if folder is not None:
+            job.deleted_paths = [str(folder / str(name)) for name in res.get("deleted_names") or [] if name]
+        for item in res.get("skipped") or []:
+            if isinstance(item, dict):
+                name, why = str(item.get("name") or "a capture"), str(item.get("reason") or "it could not be deleted")
+                job.skip_capture_file(name, why)
+        if res.get("recording"):
+            job.skip("captures", "A packet capture is recording, so it was left alone. "
+                                 "Stop it and clear the history again to remove it")
+
+    def _clear_faults(self, job: "_HistoryClear") -> None:
+        fw = self.faults
+        if fw is not None:
+            n = job.method("faults", fw, "clear_history", (job.since,), "the fault watch could not start over")
+            if n is not None:
+                job.cleared["faults"] = int(n)
+
+    def _clear_sip(self, job: "_HistoryClear") -> None:
+        from . import history
+
+        total, stopped = 0, False
+        for name, what in (("sipalg", "the SIP ALG check result"), ("sipnat", "the SIP NAT (STUN) result")):
+            comp = getattr(self, name, None)
+            if comp is None:
+                continue
+            running_fn = getattr(comp, "running", None)
+            try:
+                was_running = bool(running_fn()) if callable(running_fn) else False
+            except Exception:  # noqa: BLE001
+                was_running = False
+            n = job.method("sip", comp, "clear_history", (job.since,), f"{what} could not be cleared")
+            if n is not None:
+                total += int(n)
+                stopped = stopped or was_running
+        flow = getattr(self, "sipflow", None)
+        if flow is not None:
+            n = job.method("sip", flow, "clear_history", (job.since,), "the SIP call flows could not be closed",
+                           {"deleted_paths": tuple(job.deleted_paths)})
+            if n is not None:
+                total += int(n)
+        qual = getattr(self, "sipqual", None)
+        if qual is not None:
+            job.method("sip", qual, "invalidate", (), "the SIP tile may show its old verdict for up to a minute")
+        job.cleared["sip"] = total
+        if stopped:
+            job.stopped.append(history.STOPPED_SIP)
+
+    def _clear_proav(self, job: "_HistoryClear") -> None:
+        from . import history
+
+        scanner = getattr(self, "proav", None)
+        if scanner is None:
+            return
+        res = job.method("proav", scanner, "clear_history", (job.since,), "the Pro AV result could not be cleared")
+        if isinstance(res, dict):
+            job.cleared["proav"] = int(res.get("cleared") or 0)
+            if res.get("stopped"):
+                job.stopped.append(history.STOPPED_PROAV)
+
+
+class _HistoryClear:
+    """What one :meth:`Engine.clear_history` has done so far: ``cleared`` (every category, 0 until counted), ``stopped``,
+    ``skipped``, the capture files it deleted (for the SIP call-flow reader) and the earliest start of a record it deleted
+    (``earliest``: where the cleared span begins when that is before ``since``).  :meth:`step` and :meth:`method` run one
+    guarded step: a failure is logged and named in ``skipped``, and None comes back.  Every reason is one plain sentence
+    without its closing period (the page adds one)."""
+
+    def __init__(self, since: Optional[float], now: float) -> None:
+        from . import history
+
+        self.since = since
+        self.now = float(now)
+        self.cleared: Dict[str, int] = history.empty_counts()
+        self.stopped: List[str] = []
+        self.skipped: List[Dict[str, str]] = []
+        self.deleted_paths: List[str] = []
+        self.earliest: List[float] = []
+        self._capture_files: Dict[int, str] = {}       # id() of a skipped entry naming a capture file -> its reason
+
+    def skip(self, what: str, reason: str) -> None:
+        from . import history
+
+        self.skipped.append({"what": what, "reason": history.reason_text(reason)})
+
+    def skip_capture_file(self, name: str, why: str) -> None:
+        """One packet capture file left alone: named in the answer, only counted in the published event."""
+        from . import history
+
+        entry = {"what": "captures", "reason": history.capture_skip_reason(name, why)}
+        self.skipped.append(entry)
+        self._capture_files[id(entry)] = why
+
+    def public_skipped(self) -> List[Dict[str, str]]:
+        """``skipped`` for the ``history.cleared`` event: the capture files left alone become one "N packet captures were
+        left alone" entry per reason, where the first of them was, without their names."""
+        from . import history
+
+        out: List[Dict[str, str]] = []
+        summary_done = False
+        for entry in self.skipped:
+            if id(entry) in self._capture_files:
+                if not summary_done:
+                    out.extend(history.public_capture_skips(self._capture_files.values()))
+                    summary_done = True
+                continue
+            out.append(dict(entry))
+        return out
+
+    def note_earliest(self, ts: Any) -> None:
+        """A record deleted by the clear began at *ts* (None: none was)."""
+        if isinstance(ts, (int, float)) and not isinstance(ts, bool) and math.isfinite(float(ts)):
+            self.earliest.append(float(ts))
+
+    def step(self, what: str, fn: Callable[[], Any], reason: str) -> Any:
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001 - one part must never stop the rest of the clear
+            log.exception("clear history: %s failed", what)
+            detail = str(exc).strip() or type(exc).__name__
+            self.skip(what, f"{reason[:1].upper()}{reason[1:]} ({detail[:200]})")
+            return None
+
+    def method(self, what: str, component: Any, name: str, args: tuple, reason: str,
+               kwargs: Optional[Dict[str, Any]] = None) -> Any:
+        """``component.<name>(*args, **kwargs)`` when it has that method; a component without it (an older part) is
+        named in ``skipped``."""
+        fn = getattr(component, name, None)
+        if not callable(fn):
+            log.warning("clear history: %s has no %s()", type(component).__name__, name)
+            self.skip(what, f"{reason[:1].upper()}{reason[1:]}: this part of TNT cannot clear its history yet")
+            return None
+        return self.step(what, lambda: fn(*args, **(kwargs or {})), reason)
 
 
 __all__ = ["Engine", "HEARTBEAT_INTERVAL_S", "API_RETRY_INTERVAL_S", "STOP_BUDGET_S"]

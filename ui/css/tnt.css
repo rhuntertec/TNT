@@ -828,6 +828,9 @@ code.copy.stale { color: var(--ink-soft); border-style: dashed; }
 .setting-control { display: flex; justify-content: flex-end; align-items: center; min-width: 0; }
 .setting-control:empty { display: none; }
 .setting-control > .input, .setting-control > select.input { width: 100%; }
+/* a button in the control column (Check now, Clear history…) fills it like the toggles and selects above it, so their
+   left edges line up */
+.setting-control > .btn { width: 100%; }
 .setting-control .row.inline-unit { flex-wrap: nowrap; gap: 8px; width: 100%; }
 .setting-control .row.inline-unit .input { min-width: 0; flex: 1 1 auto; }
 /* the toggle's own two columns: a fixed label cell keeps the tracks in line with each other */
@@ -851,6 +854,11 @@ code.copy.stale { color: var(--ink-soft); border-style: dashed; }
 /* Settings › IP location: the live status line, Retry now and the DB-IP / licence links */
 .geo-status { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; font-size: 13px; font-weight: 700; color: var(--ink-soft); }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+/* Settings › History: the confirm dialog's list of what goes, and the one summary toast after a clear (a title, then a
+   line each for what went, what was stopped and what was left alone) */
+.history-confirm p { margin: 0; }
+.history-what { margin: 0; padding-left: 22px; display: flex; flex-direction: column; gap: 2px; font-weight: 700; }
+.toast .history-toast { display: flex; flex-direction: column; gap: 4px; min-width: 0; overflow-wrap: anywhere; }
 
 /* ---------- toasts ---------- */
 .toasts { position: fixed; right: 24px; bottom: 24px; z-index: 70; display: flex; flex-direction: column; gap: 10px; max-width: min(380px, calc(100vw - 48px)); pointer-events: none; will-change: transform; }

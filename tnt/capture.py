@@ -38,7 +38,9 @@ While it runs, a capture writes ``TNT-live-<YYYYmmdd-HHMMSS>.pcapng`` in the cap
 Administrators only; the start fails closed when that does not work).  :meth:`CaptureManager.save` renames it to
 ``TNT-capture-<YYYYmmdd-HHMMSS>.pcapng`` (:data:`FILE_RE`, the listed and downloadable name) and
 :meth:`CaptureManager.discard` deletes it.  A working file a crash left behind is cleaned up by
-:meth:`CaptureManager.recover`.
+:meth:`CaptureManager.recover`.  A saved capture - deleted from the page, by the retention, or by Settings > Clear
+history - is deleted on a handle opened on the file itself and checked to be the approved file, still in the captures
+folder (:meth:`CaptureManager._delete_verified`), never on a path that could have been swapped for a link since.
 
 Opening a capture that is already on disk
 -----------------------------------------
@@ -104,11 +106,13 @@ import copy
 import importlib
 import ipaddress
 import logging
+import math
 import os
 import queue
 import re
 import shutil
 import stat
+import sys
 import threading
 import time
 from typing import Any, BinaryIO, Callable, Dict, List, Optional, Sequence, Tuple
@@ -123,8 +127,10 @@ __all__ = [
     "DETAIL_KEYS", "PACKETS_KEYS", "TILE_KEYS", "SESSION_STATES", "CAPTURE_SECONDS", "CAPTURE_SIZES_MB", "DEFAULT_SECONDS", "DEFAULT_MB",
     "MAX_ROWS", "MAX_PACKETS", "MAX_FILES", "MAX_TOTAL_BYTES", "MAX_AGE_S", "FILE_RE", "WORK_RE", "TICK_S",
     "QUEUE_SIZE", "ADAPTER_CHECK_S", "EVENT", "SIP_EVENT", "THREAD_NAME", "ADAPTER_TEXT", "SECONDS_TEXT", "SIZE_TEXT", "DISK_TEXT",
-    "FILE_BUSY_TEXT", "FILE_MISSING_TEXT", "BUSY_TEXT", "NOTHING_TEXT", "FAILED_TEXT", "STOP_REASONS",
-    "PATH_TEXT", "PATH_BIG_TEXT", "MAX_OPEN_BYTES", "MAX_PATH_LEN",
+    "FILE_BUSY_TEXT", "FILE_READONLY_TEXT", "FILE_DENIED_TEXT", "FILE_MISSING_TEXT", "BUSY_TEXT", "NOTHING_TEXT",
+    "FAILED_TEXT", "STOP_REASONS", "PATH_TEXT", "PATH_BIG_TEXT", "MAX_OPEN_BYTES", "MAX_PATH_LEN",
+    "CLEAR_KEYS", "CLEAR_SKIP_KEYS", "CLEAR_BUSY_TEXT", "CLEAR_LINKED_TEXT", "CLEAR_READONLY_TEXT", "CLEAR_FAILED_TEXT",
+    "CLEAR_RECORDING_TEXT", "CLEAR_SINCE_TEXT",
 ]
 
 CAPTURE_STATUS_KEYS = ("available", "reason", "adapters", "session", "files", "limits")
@@ -177,6 +183,8 @@ SECONDS_TEXT = "max_seconds must be one of 60, 300, 900, 1800 or 3600"
 SIZE_TEXT = "max_mb must be one of 64, 128, 256, 512 or 1024"
 DISK_TEXT = "Not enough free disk space for this capture (needs {mb} MB)"
 FILE_BUSY_TEXT = "The file is being downloaded"
+FILE_READONLY_TEXT = "The file is marked read-only, so it was not deleted"
+FILE_DENIED_TEXT = "The file could not be deleted"
 FILE_MISSING_TEXT = "The capture file was not found"
 BUSY_TEXT = "A capture is already running: stop it first"
 NOTHING_TEXT = "No capture is open"
@@ -186,9 +194,25 @@ UNSAVED_TEXT = "The capture has not been saved yet"
 PATH_TEXT = "path must be the full path of a file on this PC"
 PATH_BIG_TEXT = "That file is larger than {mb} MB, which is more than TNT opens"
 
+#: What :meth:`CaptureManager.clear_history` answers (Settings > Clear history), and the shape of one ``skipped`` entry.
+CLEAR_KEYS = ("deleted", "deleted_names", "skipped", "recording", "discarded_unsaved")
+CLEAR_SKIP_KEYS = ("name", "reason")
+CLEAR_BUSY_TEXT = "It is being downloaded"
+CLEAR_LINKED_TEXT = "It has a second name somewhere else on this disk (a hard link)"
+CLEAR_READONLY_TEXT = "It is marked read-only"
+CLEAR_FAILED_TEXT = "It could not be deleted"
+#: A ``skipped`` reason says why that one file was left alone (the caller words it "<name> was left alone: <reason>").
+#: The recording capture is not a ``skipped`` entry (that list names saved files): the caller reports ``recording``
+#: with this text.
+CLEAR_RECORDING_TEXT = ("A packet capture is recording, so it was left alone. "
+                        "Stop it and clear the history again to remove it.")
+#: :meth:`CaptureManager.clear_history` refuses (ValueError) a *since_ts* that is neither None nor a finite time.
+CLEAR_SINCE_TEXT = "since_ts must be a time in seconds, or None for everything"
+
 
 class CaptureFileBusy(RuntimeError):
-    """The capture file is in use (a download holds it open): HTTP 409 conflict."""
+    """The capture file was not deleted - a download holds it open (:data:`FILE_BUSY_TEXT`), it is marked read-only
+    (:data:`FILE_READONLY_TEXT`) or Windows refused (:data:`FILE_DENIED_TEXT`): HTTP 409 conflict."""
 
 
 class CaptureFileMissing(LookupError):
@@ -203,6 +227,15 @@ class CaptureBusy(RuntimeError):
     """A capture is already running: HTTP 409 conflict."""
 
 
+#: A delete from the page that did not happen (:class:`_Kept` kind -> what delete_file raises), and the ``skipped``
+#: reason a clear gives for the same (``missing`` is not a skip: the file has gone already).
+_DELETE_ERRORS = {"missing": (CaptureFileMissing, FILE_MISSING_TEXT), "moved": (CaptureFileMissing, FILE_MISSING_TEXT),
+                  "busy": (CaptureFileBusy, FILE_BUSY_TEXT), "readonly": (CaptureFileBusy, FILE_READONLY_TEXT),
+                  "denied": (CaptureFileBusy, FILE_DENIED_TEXT)}
+_CLEAR_REASONS = {"busy": CLEAR_BUSY_TEXT, "linked": CLEAR_LINKED_TEXT, "readonly": CLEAR_READONLY_TEXT,
+                  "moved": CLEAR_FAILED_TEXT, "denied": CLEAR_FAILED_TEXT}
+
+
 # --- helpers -------------------------------------------------------------------------------------
 def _field(obj: Any, key: str) -> Any:
     return obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
@@ -214,6 +247,23 @@ def _is_capture_name(name: Any) -> bool:
 
 def _is_link(st: os.stat_result) -> bool:
     return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _clear_since(value: Any) -> Optional[float]:
+    """*value* as the start of a history clear: None (everything) or a finite time in seconds, else ``ValueError``
+    (:data:`CLEAR_SINCE_TEXT`).  A NaN compares false with every time, so taken as it is it would put every saved
+    capture "in the range" and turn a short clear into "all time"."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(CLEAR_SINCE_TEXT)
+    try:
+        since = float(value)
+    except OverflowError:
+        raise ValueError(CLEAR_SINCE_TEXT) from None
+    if not math.isfinite(since):
+        raise ValueError(CLEAR_SINCE_TEXT)
+    return since
 
 
 def _size(path: str) -> Optional[int]:
@@ -234,6 +284,114 @@ def _remove(path: str) -> None:
 
 def _disk_free(path: str) -> int:
     return shutil.disk_usage(path).free
+
+
+# --- deleting a saved capture by handle (Windows) ------------------------------------------------------
+# A saved capture is approved for deletion on its path (_resolve), and a path can change after that: the captures
+# folder renamed and a junction to another folder put where it was, or the file swapped for a link.  So the delete is
+# made on a handle opened on the file itself, and only once that handle has been checked to be the approved file, still
+# in the captures folder (CaptureManager._delete_verified).  Measured on Windows 11: a handle opened with
+# FILE_FLAG_OPEN_REPARSE_POINT on a link is the link (attribute 0x400), never its target; a download's open() refuses
+# the DELETE access with ERROR_SHARING_VIOLATION; a read-only file opens but refuses FileDispositionInfo with
+# ERROR_ACCESS_DENIED; and a file marked for deletion stays on disk until the handle closes.
+_DELETE = 0x00010000
+_FILE_READ_ATTRIBUTES = 0x0080
+_FILE_SHARE_ALL = 0x0007                   # read, write and delete: the check itself never blocks anyone
+_OPEN_EXISTING = 3
+_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000   # needed to open a folder
+_FILE_DISPOSITION_INFO = 4                 # FILE_INFO_BY_HANDLE_CLASS.FileDispositionInfo: gone when the handle closes
+_FILE_ATTRIBUTE_READONLY = 0x0001
+_GONE_ERRORS = (2, 3)                      # ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND
+_BUSY_ERRORS = (32, 33)                    # ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
+_kernel_lock = threading.Lock()
+_kernel32: Any = None
+
+
+class _Kept(Exception):
+    """Why one file was not deleted (:meth:`CaptureManager._delete_verified`): ``kind`` is ``missing`` (it has gone
+    already), ``moved`` (the handle is not the approved file in the captures folder), ``busy`` (a download holds it
+    open), ``readonly``, ``linked`` (a second hard link, where that is refused) or ``denied`` (anything else)."""
+
+    def __init__(self, kind: str) -> None:
+        super().__init__(kind)
+        self.kind = kind
+
+
+def _kernel() -> Any:
+    """``kernel32`` with the prototypes the verified delete uses, loaded on first use (import-safe off Windows)."""
+    global _kernel32
+    with _kernel_lock:
+        if _kernel32 is None:
+            import ctypes
+            from ctypes import c_int, c_ulong, c_void_p, c_wchar_p
+
+            k = ctypes.WinDLL("kernel32", use_last_error=True)
+            k.CreateFileW.argtypes = [c_wchar_p, c_ulong, c_ulong, c_void_p, c_ulong, c_ulong, c_void_p]
+            k.CreateFileW.restype = c_void_p
+            k.GetFinalPathNameByHandleW.argtypes = [c_void_p, c_wchar_p, c_ulong, c_ulong]
+            k.GetFinalPathNameByHandleW.restype = c_ulong
+            k.SetFileInformationByHandle.argtypes = [c_void_p, c_int, c_void_p, c_ulong]
+            k.SetFileInformationByHandle.restype = c_int
+            k.CloseHandle.argtypes = [c_void_p]
+            k.CloseHandle.restype = c_int
+            _kernel32 = k
+        return _kernel32
+
+
+def _open_handle(path: str, access: int, flags: int) -> Tuple[Optional[int], int]:
+    """``CreateFileW(path, access)`` sharing everything, for an existing file: ``(handle, 0)`` or ``(None, winerror)``."""
+    import ctypes
+
+    k = _kernel()
+    handle = k.CreateFileW(str(path), access, _FILE_SHARE_ALL, None, _OPEN_EXISTING, flags, None)
+    if handle is None or handle == ctypes.c_void_p(-1).value:
+        return None, int(ctypes.get_last_error() or 5)
+    return int(handle), 0
+
+
+def _open_for_delete(path: str) -> Tuple[Optional[int], int]:
+    """A handle on *path* itself - a link is opened as the link, never followed - with DELETE access:
+    ``(handle, 0)`` or ``(None, winerror)``.  The seam tests replace to refuse an open."""
+    return _open_handle(path, _DELETE | _FILE_READ_ATTRIBUTES, _FILE_FLAG_OPEN_REPARSE_POINT)
+
+
+def _mark_for_delete(handle: int) -> int:
+    """Mark the file open on *handle* for deletion (it goes when the handle closes): 0, or the winerror.  The seam
+    tests replace to refuse a delete."""
+    import ctypes
+
+    flag = ctypes.c_ubyte(1)                  # FILE_DISPOSITION_INFO.DeleteFile = TRUE
+    if _kernel().SetFileInformationByHandle(handle, _FILE_DISPOSITION_INFO, ctypes.byref(flag), 1):
+        return 0
+    return int(ctypes.get_last_error() or 5)
+
+
+def _adopt(handle: int) -> int:
+    """A C file descriptor that owns *handle* (``os.fstat`` reads it; ``os.close`` closes the handle).  The handle is
+    closed here when it cannot be adopted."""
+    import msvcrt
+
+    try:
+        return msvcrt.open_osfhandle(handle, os.O_RDONLY)
+    except OSError:
+        _kernel().CloseHandle(handle)
+        raise
+
+
+def _final_path(handle: int) -> str:
+    """Where the file or folder open on *handle* really is (links resolved), without the ``\\\\?\\`` prefix."""
+    import ctypes
+
+    size = 32768
+    buf = ctypes.create_unicode_buffer(size)
+    n = _kernel().GetFinalPathNameByHandleW(handle, buf, size, 0)     # FILE_NAME_NORMALIZED | VOLUME_NAME_DOS
+    if not n or n >= size:
+        raise ctypes.WinError(ctypes.get_last_error())
+    text = buf.value
+    if text.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + text[8:]
+    return text[4:] if text.startswith("\\\\?\\") else text
 
 
 def _norm_mac(text: Any) -> str:
@@ -1247,28 +1405,290 @@ class CaptureManager:
         return fh, opened.st_size
 
     def delete_file(self, name: Any) -> List[Dict[str, Any]]:
-        """Delete a saved capture and return the remaining FILE list."""
-        path, _st = self._resolve(name)
-        with self._lock:
-            open_now = self._read_path and os.path.normcase(self._read_path) == os.path.normcase(path)
-        if open_now:
-            self.discard()
+        """Delete a saved capture and return the remaining FILE list.
+
+        :class:`CaptureFileMissing` when it is not (or no longer) one of TNT's saved captures in the captures folder;
+        :class:`CaptureFileBusy` with :data:`FILE_BUSY_TEXT` while a download holds it open, :data:`FILE_READONLY_TEXT`
+        when it is marked read-only, :data:`FILE_DENIED_TEXT` when Windows refuses otherwise.  The packet list showing
+        it is closed only once the delete is certain (:meth:`_delete_verified`)."""
+        root = self._folder_root()                # before the check, as the clear does: a swap after it is caught
+        if root is None:
+            raise CaptureFileMissing(FILE_MISSING_TEXT)
+        path, st = self._resolve(name)
         try:
-            os.remove(path)
-        except PermissionError:
-            raise CaptureFileBusy(FILE_BUSY_TEXT) from None
-        except FileNotFoundError:
-            raise CaptureFileMissing(FILE_MISSING_TEXT) from None
-        self._forget(os.path.basename(path))
+            self._delete_verified(path, st, root, then=lambda final: self._close_if_reading(path, final))
+        except _Kept as kept:
+            error, text = _DELETE_ERRORS.get(kept.kind, (CaptureFileBusy, FILE_DENIED_TEXT))
+            raise error(text) from None
         log.info("packet capture file deleted")
         log.debug("deleted capture file %s", name)
         return self.files()
 
+    def _close_if_reading(self, *paths: str) -> bool:
+        """Discard the open session when the packet list is reading one of *paths* (spellings of a saved capture being
+        deleted), so the packet, detail and audio reads never point at a file that is gone.  The session of a saved
+        capture has nothing running and nothing unsaved, so this throws away only the in-memory list and its SIP
+        calls."""
+        targets = {os.path.normcase(p) for p in paths if p}
+        return self._discard_if(lambda session: bool(self._read_path)
+                                and os.path.normcase(self._read_path) in targets)
+
+    def _folder_root(self) -> Optional[str]:
+        """The captures folder's real path, read from a handle opened on the folder itself (case-folded): None when it
+        is missing, is a link, junction or other reparse point, or cannot be read.  Every delete compares the real
+        folder of the file it is about to delete with this (:meth:`_delete_verified`)."""
+        folder = self._folder()
+        if sys.platform != "win32":
+            try:
+                if winacl._is_reparse_point(folder) or not os.path.isdir(folder):
+                    return None
+                return os.path.normcase(os.path.realpath(folder))
+            except (OSError, ValueError):
+                return None
+        try:
+            handle, _error = _open_handle(folder, _FILE_READ_ATTRIBUTES,
+                                          _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT)
+            if handle is None:
+                return None
+            fd = _adopt(handle)
+        except (OSError, ValueError):
+            return None
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISDIR(st.st_mode) or _is_link(st):
+                return None
+            return os.path.normcase(_final_path(handle))
+        except (OSError, ValueError):
+            return None
+        finally:
+            os.close(fd)
+
+    def _delete_verified(self, path: str, st: os.stat_result, root: str, *, one_link: bool = False,
+                         then: Optional[Callable[[str], Any]] = None) -> None:
+        """Delete the file at *path* that was approved with the ``lstat`` *st* (:meth:`_resolve`, or
+        :meth:`_own_working_file` for an unsaved capture), in the captures folder whose real path is *root*
+        (:meth:`_folder_root`); :class:`_Kept` when it stays.
+
+        The approval was made on a path, and a path can change after it: the folder renamed and a junction to another
+        folder put where it was, or the file swapped for a link.  So the delete is made on a handle.  The file is opened
+        as itself (a link as the link, never its target) with DELETE access, and only when THAT handle is a regular
+        file, not a reparse point, the very file that was approved (``samestat``), whose real folder is still *root*, is
+        it marked for deletion - it leaves the disk when the handle closes.  Anything else leaves it where it is:
+        ``moved`` for a handle that is not the approved file in the folder, ``busy`` while a download holds it open,
+        ``readonly``, ``linked`` for a second hard link when *one_link*, ``denied`` for any other refusal, ``missing``
+        when it has gone already.
+
+        *then* is called with the file's real path once the delete is certain and before the file leaves the disk:
+        that is how the packet list showing it is closed first, and never for a file that stays."""
+        if sys.platform != "win32":
+            self._delete_by_path(path, st, root, one_link=one_link, then=then)
+            return
+        handle, error = _open_for_delete(path)
+        if handle is None:
+            raise _Kept("missing" if error in _GONE_ERRORS else "busy" if error in _BUSY_ERRORS else "denied")
+        try:
+            fd = _adopt(handle)
+        except OSError:
+            raise _Kept("denied") from None
+        try:
+            try:
+                now = os.fstat(fd)
+                final = _final_path(handle)
+            except (OSError, ValueError):
+                raise _Kept("denied") from None
+            if not stat.S_ISREG(now.st_mode) or _is_link(now) or not os.path.samestat(st, now) \
+                    or os.path.normcase(os.path.dirname(final)) != root:
+                raise _Kept("moved")
+            if one_link and now.st_nlink > 1:
+                raise _Kept("linked")
+            if getattr(now, "st_file_attributes", 0) & _FILE_ATTRIBUTE_READONLY:
+                raise _Kept("readonly")
+            error = _mark_for_delete(handle)
+            if error:
+                raise _Kept("busy" if error in _BUSY_ERRORS else "denied")
+            if then is not None:
+                try:
+                    then(final)
+                except Exception:  # noqa: BLE001 - the file goes either way; the page re-reads the session
+                    log.debug("closing the packet list before a delete failed", exc_info=True)
+        finally:
+            os.close(fd)
+        self._forget(os.path.basename(path))
+
+    def _delete_by_path(self, path: str, st: os.stat_result, root: str, *, one_link: bool,
+                        then: Optional[Callable[[str], Any]]) -> None:
+        """:meth:`_delete_verified` where there is no handle to delete by (off Windows, where TNT does not run as a
+        service): the same checks on a fresh ``lstat``, then ``os.remove``."""
+        try:
+            now = os.lstat(path)
+            final = os.path.realpath(path)
+        except FileNotFoundError:
+            raise _Kept("missing") from None
+        except (OSError, ValueError):
+            raise _Kept("denied") from None
+        if not stat.S_ISREG(now.st_mode) or _is_link(now) or not os.path.samestat(st, now) \
+                or os.path.normcase(os.path.dirname(final)) != root:
+            raise _Kept("moved")
+        if one_link and now.st_nlink > 1:
+            raise _Kept("linked")
+        if then is not None:
+            then(final)
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            raise _Kept("missing") from None
+        except OSError:
+            raise _Kept("denied") from None
+        self._forget(os.path.basename(path))
+
+    def _discard_if(self, wanted: Callable[[Dict[str, Any]], bool]) -> bool:
+        """:meth:`discard` for the open session, but only while *wanted* holds for it and nothing is running.
+
+        The check and the discard happen under one hold of the lock, so a capture the user starts in between (which
+        replaces the session under the same lock) is never the one thrown away, and a recording capture never
+        qualifies.  With nothing running there is no trace to stop and no worker to wait for; the only file this can
+        delete is an unsaved working file, as :meth:`discard` would."""
+        with self._lock:
+            session = self._session
+            if session is None or session.get("state") == "capturing" or self._trace is not None \
+                    or self._thread is not None or not wanted(session):
+                return False
+            self._teardown(discard=True)
+            self._session = None
+            self._ring.clear()
+            self._tracker = None
+            self._dropped = 0
+            self._read_path = None
+            self._work_path = None
+        self._publish()
+        return True
+
+    def _own_working_file(self, path: Optional[str]) -> Optional[os.stat_result]:
+        """The ``lstat`` of *path* when it is a ``TNT-live-...`` working file directly inside the captures folder, as
+        :meth:`start` makes them - a regular file, not a link or reparse point, whose real folder is the folder's real
+        path - else None."""
+        if not path or _WORK_PATTERN.fullmatch(os.path.basename(path)) is None:
+            return None
+        folder = self._folder()
+        try:
+            if winacl._is_reparse_point(folder):
+                return None
+            st = os.lstat(path)
+            root = os.path.normcase(os.path.realpath(folder))
+            real = os.path.normcase(os.path.realpath(path))
+        except (OSError, ValueError):
+            return None
+        if stat.S_ISREG(st.st_mode) and not _is_link(st) and os.path.dirname(real) == root:
+            return st
+        return None
+
+    def clear_history(self, since_ts: Optional[float]) -> Dict[str, Any]:
+        """Settings > Clear history: delete TNT's own saved captures from *since_ts* on (None: every one), and the
+        capture that was stopped and never saved when it started from then on.  Answers :data:`CLEAR_KEYS`::
+
+            {"deleted": int, "deleted_names": [name], "skipped": [{"name", "reason"}], "recording": bool,
+             "discarded_unsaved": bool}
+
+        What may be deleted is decided from :meth:`files` alone - the ``TNT-capture-...`` names (:data:`FILE_RE`) that
+        are regular files, not links or reparse points, in the captures folder - and each is deleted the way
+        :meth:`delete_file` deletes one: through :meth:`_resolve` again, then :meth:`_delete_verified`, which deletes
+        by a handle checked to be that very file, still in the captures folder, so a folder or a file swapped for a
+        link or junction after the check never takes a file somewhere else with it.  A file is in the range when its
+        modification time (``created_ts``, which is when the capture stopped) is at or after *since_ts*.  Nothing else
+        is ever deleted: no path is built from a pattern, from the open session, from a file opened by path
+        (:meth:`open_path`, wherever it is and whatever it is called), from a SIP call-flow slot or from the exports
+        folder, and the switch-port lookup's ``TNT-switchport-...`` files and ``TNT-pktmon-session.json`` never match
+        :data:`FILE_RE`.
+
+        Skipped and reported (``skipped``, one entry per file, :data:`CLEAR_SKIP_KEYS`): a file with a second hard
+        link (``st_nlink`` > 1: its data lives on under another name, possibly outside this folder), a file a
+        download holds open, one marked read-only, and one that could not be deleted (Windows refused, or it was no
+        longer the approved file in the folder).  The session showing a file is closed first - once its delete is
+        certain and before the file leaves the disk - and stays open when the file stays.  A capture that is RECORDING
+        is left alone with its working file, and ``recording`` says so (the caller reports it,
+        :data:`CLEAR_RECORDING_TEXT`).  A capture that stopped and was never saved is discarded - its ``TNT-live-...``
+        working file deleted (the same verified delete), the packet list and its SIP calls dropped - when it started at
+        or after *since_ts* (``discarded_unsaved``); when the captures folder itself cannot be verified (missing, or a
+        link or junction) that session is left alone too, since its working file is in that folder.  A file opened by
+        path from outside the captures folder stays open and stays on disk (one opened by path from inside it is one
+        of the saved captures, cleared like the others).  ``capture.state`` is published afterwards, so the page lists
+        the folder again.  Never raises for a file: one that fails is reported and the rest are still cleared.  A
+        *since_ts* that is neither None nor a finite time is refused with ``ValueError`` before anything is touched."""
+        since = _clear_since(since_ts)
+        root = self._folder_root()                # the folder's real path, from a handle on the folder itself
+        with self._lock:
+            session = dict(self._session) if self._session is not None else None
+        recording = session is not None and session.get("state") == "capturing"
+        discarded = False
+        if root is not None and session is not None and not recording and session.get("source") == "live" \
+                and not session.get("saved"):
+            doomed: Dict[str, Any] = {}
+
+            def unsaved_in_range(current: Dict[str, Any]) -> bool:
+                started = current.get("started_ts")
+                if current.get("id") != session["id"] or current.get("source") != "live" or current.get("saved"):
+                    return False              # saved, or replaced by another capture since it was looked at
+                if since is not None and isinstance(started, (int, float)) and float(started) < since:
+                    return False
+                # belt and braces: only a working file start() made in the captures folder is ever deleted, and by
+                # the verified delete below rather than by discard(), which is told there is nothing to delete
+                approved = self._own_working_file(self._work_path)
+                if approved is not None:
+                    doomed.update(path=self._work_path, st=approved)
+                self._work_path = None
+                return True
+
+            discarded = self._discard_if(unsaved_in_range)
+            if discarded and doomed:
+                try:
+                    self._delete_verified(doomed["path"], doomed["st"], root)
+                except _Kept as kept:
+                    if kept.kind != "missing":
+                        log.warning("clear history could not delete the unsaved capture's working file (%s); the "
+                                    "service deletes it when it next starts", kept.kind)
+
+        deleted: List[str] = []
+        skipped: List[Dict[str, Any]] = []
+        for row in self.files() if root is not None else []:
+            name = row["name"]
+            if since is not None and float(row["created_ts"]) < since:
+                continue
+            try:
+                path, st = self._resolve(name)            # the same check delete_file makes, again, right now
+            except CaptureFileMissing:
+                log.debug("clear history: %s is no longer a saved capture", name)
+                continue
+            if since is not None and st.st_mtime < since:
+                continue
+            try:
+                self._delete_verified(path, st, root, one_link=True,
+                                      then=lambda final, path=path: self._close_if_reading(path, final))
+            except _Kept as kept:
+                if kept.kind == "missing":
+                    continue
+                if kept.kind == "moved":
+                    log.warning("clear history left a packet capture alone: it was no longer the saved file in the "
+                                "captures folder when it was about to be deleted")
+                log.debug("clear history left %s alone (%s)", name, kept.kind)
+                skipped.append({"name": name, "reason": _CLEAR_REASONS.get(kept.kind, CLEAR_FAILED_TEXT)})
+                continue
+            deleted.append(name)
+        self._files_changed()
+        log.info("clear history: %d packet capture file(s) deleted, %d left alone%s%s", len(deleted), len(skipped),
+                 ", a recording capture left alone" if recording else "",
+                 ", an unsaved capture discarded" if discarded else "")
+        log.debug("clear history deleted %s", deleted)
+        self._publish()
+        return {"deleted": len(deleted), "deleted_names": deleted, "skipped": skipped, "recording": recording,
+                "discarded_unsaved": discarded}
+
     def enforce_retention(self, now: Optional[float]) -> int:
         """Delete saved captures past the retention limits; the number deleted. Never raises for a file it cannot
-        delete (it is tried again next time) or a missing folder. The capture that is open is never deleted."""
+        delete (it is tried again next time) or a missing folder. The capture that is open is never deleted.  Each
+        file goes through :meth:`_resolve` and :meth:`_delete_verified`, as a delete from the page does."""
         folder = self._folder()
-        if not os.path.isdir(folder):
+        root = self._folder_root()
+        if root is None:
             return 0
         reference = float(self._clock() if now is None else now)
         with self._lock:
@@ -1286,14 +1706,15 @@ class CaptureManager:
                 over = True
             if old or over:
                 try:
-                    os.remove(path)
-                except FileNotFoundError:
+                    resolved, st = self._resolve(row["name"])
+                    self._delete_verified(resolved, st, root)
+                except CaptureFileMissing:
                     continue
-                except OSError:
-                    log.debug("kept %s for now: it could not be deleted", row["name"], exc_info=True)
+                except _Kept as refused:
+                    if refused.kind != "missing":
+                        log.debug("kept %s for now: it could not be deleted (%s)", row["name"], refused.kind)
                     continue
                 deleted += 1
-                self._forget(row["name"])
                 continue
             kept += 1
             total += int(row["size"])

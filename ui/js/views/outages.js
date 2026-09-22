@@ -99,6 +99,7 @@
     if (ongoing) summaryEl.appendChild(h('span', { class: 'badge ' + (ongoingTotal ? 'red' : 'yellow') + ' pulse' }, 'ongoing'));
     if (longest) summaryEl.appendChild(h('span', { class: 'muted' }, 'longest ' + fmtDuration(longest)));
     if ((tl.gaps || []).length) summaryEl.appendChild(h('span', { class: 'muted' }, (tl.gaps.length === 1 ? '1 gap' : tl.gaps.length + ' gaps') + ' in monitoring'));
+    if ((tl.cleared || []).length) summaryEl.appendChild(h('span', { class: 'muted' }, 'history cleared for part of this range'));
   }
 
   async function load() {
@@ -142,7 +143,9 @@
         h('span', null, h('span', { class: 'sw', style: { background: 'var(--green)' } }), 'fine'),
         h('span', null, h('span', { class: 'sw', style: { background: 'var(--yellow)' } }), 'a target was down'),
         h('span', null, h('span', { class: 'sw', style: { background: 'var(--red)' } }), 'everything down'),
-        h('span', null, h('span', { class: 'sw', style: { background: 'repeating-linear-gradient(135deg, var(--paper-2) 0 3px, var(--ink-soft) 3px 5px)' } }), 'not monitoring'));
+        // cleared history is hatched like a gap: TNT no longer knows that time was fine, so it is never drawn green
+        h('span', { class: 'tl-hatched', title: 'Hatched: TNT was not monitoring, or that time’s history was cleared in Settings (the tooltip says which)' },
+          h('span', { class: 'sw', style: { background: 'repeating-linear-gradient(135deg, var(--paper-2) 0 3px, var(--ink-soft) 3px 5px)' } }), 'not monitoring or history cleared'));
       const tlCard = h('div', { class: 'card' },
         h('div', { class: 'card-title' }, tlTitle, h('span', { class: 'spacer' }), legend),
         summaryEl,
@@ -176,6 +179,7 @@
     },
     // exposed for tests and for the Ping tile's detail modal (its "last 5 outages" list)
     missedCells,
+    timelineHits: () => (timeline ? timeline.hits.map((x) => ({ x0: x.x0, x1: x.x1, tip: x.tip })) : []),
     outageTable,
     outageRow,
     kindCell,

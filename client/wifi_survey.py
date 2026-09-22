@@ -22,6 +22,8 @@ Scheduling (one daemon thread, ``wifi-survey``)
 * Session: starts on the first :meth:`WifiSurvey.window_shown` or on a :meth:`WifiSurvey.survey`
   call the caller allows to start it (the window is visible or the page is active), and only
   while enabled. It lives until TNT.exe quits; :meth:`WifiSurvey.clear` restarts it.
+  :meth:`WifiSurvey.clear_since` (Settings > Clear history) removes the readings from a time on
+  and keeps the session; ``None`` is :meth:`WifiSurvey.clear`.
 * Passive: ``WlanGetNetworkBssList`` (the cached list, no ``WlanScan``) every
   ``passive_interval_s`` (60 s).
 * Active, while the lease from ``survey({"active": true})`` / :meth:`WifiSurvey.scan_now` is valid
@@ -98,7 +100,7 @@ from client import wifi_ies
 log = logging.getLogger(__name__)
 
 __all__ = [
-    "WifiSurvey", "WlanSurveyApi", "blank_view", "read_bss_list", "layout_ok", "history_points",
+    "WifiSurvey", "WlanSurveyApi", "blank_view", "read_bss_list", "layout_ok", "history_points", "is_epoch_time",
     "SCAN_INTERVAL_S", "PASSIVE_INTERVAL_S", "LEASE_S", "MAX_APS", "MAX_POINTS", "STATES",
 ]
 
@@ -531,12 +533,14 @@ class _Series:
     """One series: a ring of (deciseconds since the session start, value) at most *cap* long -- a BSSID's dBm
     (``array('b')``, the default) or the link speed in kb/s (``array('I')``)."""
 
-    __slots__ = ("ts", "values", "head")
+    __slots__ = ("ts", "values", "head", "sealed")
 
     def __init__(self, typecode: str = "b") -> None:
         self.ts = array("I")
         self.values = array(typecode)
         self.head = 0
+        #: set by drop_from: the newest point is from before a clear, so the next one never coalesces into it
+        self.sealed = False
 
     def __len__(self) -> int:
         return len(self.ts)
@@ -547,9 +551,10 @@ class _Series:
             last = (self.head - 1) % n
             if t_ds < self.ts[last]:
                 return                          # out of order (clock stepped back): keep it monotonic
-            if t_ds // bucket_ds == self.ts[last] // bucket_ds:
+            if not self.sealed and t_ds // bucket_ds == self.ts[last] // bucket_ds:
                 self.ts[last], self.values[last] = t_ds, value
                 return
+        self.sealed = False
         if n < cap:
             self.ts.append(t_ds)
             self.values.append(value)
@@ -575,6 +580,27 @@ class _Series:
         """``[[epoch s, dBm], ...]`` oldest first, from *min_ds* on (None: all), unthinned."""
         ts, rssi = self.window(min_ds)
         return history_points(base_ts, ts, rssi)
+
+    def drop_from(self, min_ds: float) -> int:
+        """Remove every point stamped at or after *min_ds* (deciseconds since the session start) and return how many
+        went; what is left is kept oldest first as a plain run (``head`` 0), which ``add`` carries on from.  The next
+        point ``add`` gets starts a new one rather than coalescing into the newest kept point: that point is from
+        before the clear and must stay as it is, not be moved to after it."""
+        ts, values = self.window(None)
+        keep = bisect.bisect_left(ts, int(math.ceil(min_ds))) if min_ds > 0 else 0
+        dropped = len(ts) - keep
+        if dropped:
+            self.ts, self.values, self.head = ts[:keep], values[:keep], 0
+        self.sealed = True
+        return dropped
+
+    def last_point(self) -> Optional[Tuple[int, int]]:
+        """``(deciseconds, value)`` of the newest point, None when there is none."""
+        n = len(self.ts)
+        if not n:
+            return None
+        last = (self.head - 1) % n
+        return int(self.ts[last]), int(self.values[last])
 
 
 def history_points(base_ts: float, ts: Any, rssi: Any, full_from_ds: Optional[float] = None,
@@ -637,6 +663,17 @@ def _rate_mbps(kbps: Any) -> Optional[float]:
     return round(value / 1000.0, 1)
 
 
+def is_epoch_time(value: Any) -> bool:
+    """Whether *value* is a usable time in epoch seconds: a finite int or float, not a bool (JSON's true is not a
+    time) and not an int too large to be a float."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
 def _survey_options(options: Any) -> Tuple[bool, Optional[float]]:
     """``(active, history_s)`` from the bridge's options object; junk means passive / whole session."""
     if not isinstance(options, dict):
@@ -696,6 +733,9 @@ class WifiSurvey:
         self._aps: Dict[str, _Ap] = {}
         self._link = _Series("I")                 # this PC's link speed in kb/s (0: not associated), see the docstring
         self._clock_ref: Optional[Tuple[float, float]] = None   # (wall, monotonic) at the last clock check
+        # when history was last cleared (clear_since): no point is stamped earlier than this, so a beacon heard in
+        # the cleared time but read after the clear cannot put it back
+        self._history_floor: Optional[float] = None
         self._read_seq = 0
         self._parse_errors = 0
         self._last_read_ts: Optional[float] = None
@@ -836,6 +876,7 @@ class WifiSurvey:
             self._aps.clear()
             self._link = _Series("I")
             self._connected = set()
+            self._history_floor = None            # the new session's start is the floor now
             if self._enabled and not self._stopping:
                 self._session = False
                 self._start_session_locked()
@@ -843,6 +884,53 @@ class WifiSurvey:
                 self._started_ts = self._clock() if self._session else None
             log.info("Wi-Fi survey cleared")
             return {"ok": True}
+
+    def clear_since(self, since_ts: Optional[float]) -> Dict[str, int]:
+        """Settings > Clear history: forget what was heard from *since_ts* (epoch seconds) on; ``{"aps_dropped",
+        "points_dropped"}``.  *since_ts* None is everything, exactly :meth:`clear` (the session restarts).
+
+        Every signal point stamped at or after *since_ts* goes, from every access point, and the link speed's points
+        with them (``points_dropped`` counts both).  An access point left with no point at all goes too when it lost
+        points here or its last beacon was at or after *since_ts*; one that keeps older points reads as its newest
+        kept point (``rssi``, ``last_seen``) until it is heard again.  The session and its start stay, so the page
+        resets its own copy (as it does after a clear).  From now on no point is stamped earlier than this clear: a
+        beacon heard in the cleared time but read afterwards is recorded at the clear, not in the cleared time, and
+        the first point after the clear is a point of its own: it never coalesces into (and so never moves) the
+        newest point the clear kept.  ``ValueError`` for a *since_ts* that is not a number."""
+        with self._lock:
+            if since_ts is None:
+                aps = len(self._aps)
+                points = sum(len(ap.series) for ap in self._aps.values()) + len(self._link)
+                self.clear()
+                return {"aps_dropped": aps, "points_dropped": points}
+            if not is_epoch_time(since_ts):
+                raise ValueError("since_ts must be a time in epoch seconds, or None for everything")
+            since = float(since_ts)
+            now = float(self._clock())
+            self._history_floor = max(now, self._history_floor if self._history_floor is not None else now)
+            started = self._started_ts
+            aps_dropped = points = 0
+            if started is not None:
+                cut_ds = (since - started) * 10.0
+                for bssid in list(self._aps):
+                    ap = self._aps[bssid]
+                    dropped = ap.series.drop_from(cut_ds)
+                    points += dropped
+                    newest = ap.series.last_point()
+                    if newest is None:
+                        if dropped or ap.last_seen >= since:
+                            del self._aps[bssid]
+                            aps_dropped += 1
+                        continue
+                    if dropped or ap.last_seen >= since:
+                        # what the list shows is the newest reading the history still holds
+                        ap.last_seen = min(ap.last_seen, started + newest[0] / 10.0)
+                        ap.rssi = newest[1]
+                        ap.seen_count = max(len(ap.series), ap.seen_count - dropped)
+                points += self._link.drop_from(cut_ds)
+            log.info("Wi-Fi survey: history cleared from %.0f s ago (%d access point(s), %d point(s))",
+                     max(0.0, now - since), aps_dropped, points)
+            return {"aps_dropped": aps_dropped, "points_dropped": points}
 
     def set_enabled(self, on: bool) -> Dict[str, Any]:
         """Switch the survey on or off (persisted through *persist*). Off stops every WLAN call."""
@@ -1072,7 +1160,8 @@ class WifiSurvey:
         started = self._started_ts
         if started is None:
             return
-        at_ds = int(round((max(started, now) - started) * 10))
+        floor = started if self._history_floor is None else max(started, self._history_floor)
+        at_ds = int(round((max(floor, now) - started) * 10))
         self._link.add(at_ds, max(0, min(MAX_LINK_KBPS, int(kbps))), int(COALESCE_S * 10), self.max_points)
 
     def _apply_locked(self, res: Dict[str, Any], plan_m: float, now_m: float, now: float, req_seq: int) -> None:
@@ -1152,6 +1241,8 @@ class WifiSurvey:
             self._last_read_ts += step
         if self._last_scan_ts is not None:
             self._last_scan_ts += step
+        if self._history_floor is not None:
+            self._history_floor += step
         for ap in self._aps.values():
             ap.first_seen += step
             ap.last_seen += step
@@ -1171,6 +1262,8 @@ class WifiSurvey:
         # a history point is never stamped before the session start or the previous successful read
         # (see the module docstring: the page asks only for the readings since the last read it saw)
         floor = max(started, previous_read) if previous_read is not None else started
+        if self._history_floor is not None:
+            floor = max(floor, self._history_floor)       # nothing lands in time a clear_since removed
         bucket_ds = int(COALESCE_S * 10)
         errors = 0
         # one reading per BSSID per read: the copy Windows received last. The same AP heard through two
@@ -1211,6 +1304,8 @@ class WifiSurvey:
                 ap.fresh_key = key
                 if beacon >= started - HISTORY_GRACE_S:
                     at = max(started, min(max(beacon, floor), now))
+                    if self._history_floor is not None:
+                        at = max(at, self._history_floor)     # a pass that read Windows before the clear
                     ap.series.add(int(round((at - started) * 10)), rssi, bucket_ds, self.max_points)
             ap.read_seq = seq
         # drop access points not heard in the last 24 h so the list shows only recently found networks, not every AP ever seen

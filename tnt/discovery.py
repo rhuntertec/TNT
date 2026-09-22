@@ -58,6 +58,9 @@ Contract gaps / decisions taken here (the smallest sensible behaviour):
   they have exited (nothing blocks the scan's return or service shutdown).
 * ``scan()`` reports a non-string, non-``None`` range as ``ok=False`` rather than
   scanning the default network; user text in error messages is bounded to 80 chars.
+* ``clear_history(since_ts) -> int`` (Settings > "Clear history", :mod:`tnt.history`) forgets
+  ``last_run_ts`` when it lies in the cleared span, and a scan running across the clear does not
+  set it when it ends; the Engine cancels that scan and never stores it (ARCHITECTURE 3.11).
 * ``DiscoveryResult.to_dict()`` adds ``"found"`` (host count) next to the dataclass
   fields; the dict is directly usable with ``Database.add_discovery_run``.
 * Every host is categorised by :func:`classify_device` (``device_type``: Router / DW Server /
@@ -672,6 +675,7 @@ class DiscoveryScanner:
         self._running = False
         self._progress: Optional[Dict[str, Any]] = None
         self._last_run_ts: Optional[float] = None
+        self._clear_gen = 0                     # clear_history: a scan running across a clear does not set _last_run_ts
 
     # -- state for Engine / diagnostics ----------------------------------------
     @property
@@ -688,6 +692,18 @@ class DiscoveryScanner:
     def last_run_ts(self) -> Optional[float]:
         with self._lock:
             return self._last_run_ts
+
+    def clear_history(self, since_ts: Optional[float]) -> int:
+        """Settings > "Clear history": forget when the last scan ran when that was at or after *since_ts* (None: always), and
+        keep a scan running now from recording its time when it ends (the Engine cancels it and does not store it).
+        Diagnostics shows ``last_run_ts`` when the Engine has no last run.  Returns 1 when the time was forgotten, else 0."""
+        with self._lock:
+            self._clear_gen += 1
+            last = self._last_run_ts
+            if last is not None and (since_ts is None or last >= float(since_ts)):
+                self._last_run_ts = None
+                return 1
+            return 0
 
     def stop(self, timeout: float = 5.0) -> bool:
         """Abort the running scan (if any) and wait up to *timeout* s for it to end.
@@ -1208,6 +1224,7 @@ class DiscoveryScanner:
             self._progress = None
             self._stop.clear()
             self._idle.clear()
+            gen = self._clear_gen
         reporter = _ProgressReporter(progress, t0, state, sink)
         scan_gateways[0] = gateway_ips()
 
@@ -1276,5 +1293,6 @@ class DiscoveryScanner:
             with self._lock:
                 self._running = False
                 self._scan_thread = None
-                self._last_run_ts = ts
+                if gen == self._clear_gen:          # else the history was cleared while it ran: it is not a last run
+                    self._last_run_ts = ts
                 self._idle.set()

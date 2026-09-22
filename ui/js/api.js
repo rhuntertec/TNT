@@ -270,6 +270,10 @@
     networkCurrent: () => api.get('/networks/current'),
     // a network carried from site to site (a phone hotspot, a travel router): no site is suggested for it
     setNetworkPortable: (id, portable) => api.patch('/networks/' + encodeURIComponent(id), { portable: !!portable }),
+    // Settings › History: the eight ranges and the newest clear, and the clear itself (range: one of history.RANGES' keys).
+    // A clear stops running jobs and deletes files, so it gets a long timeout.
+    historyInfo: () => api.get('/history'),
+    historyClear: (range) => api.post('/history/clear', { range }, { timeout: 120000 }),
   };
 
   /* ------------------------------------------------------ network changes */
@@ -478,6 +482,183 @@
 
   api.quick = { outcome: quickOutcome, NAMES: QUICK_NAMES };
 
+  /* ------------------------------------------------------- clear history */
+  // Pure: Settings › History (app.js drives it; node tests load this file on its own). The eight ranges are the service's
+  // tnt.history.RANGES / RANGE_LABELS, kept here as a copy because the page must draw the select before any request lands
+  // (a test holds the two equal).
+  const HISTORY_RANGES = [
+    ['5m', 'Last 5 minutes'], ['30m', 'Last 30 minutes'], ['1h', 'Last hour'], ['6h', 'Last 6 hours'],
+    ['24h', 'Last 24 hours'], ['7d', 'Last 7 days'], ['30d', 'Last 30 days'], ['all', 'All time'],
+  ];
+  const HISTORY_DEFAULT = '1h';
+  //: what a clear takes, in the order the confirm dialog and the Settings text name them (Wi-Fi is this window's own survey)
+  const HISTORY_WHAT = ['Ping history', 'Outages', 'Speed tests', 'Previous discovery scans',
+    "Packet captures saved in TNT's own folder", 'Fault history (the fault watch starts again from now)',
+    'SIP results', 'Wi-Fi scans', 'Pro AV scans'];
+  //: each count of the service's `cleared`, singular and plural, in the order the summary lists them (faults is a flag, below)
+  const HISTORY_NOUNS = [
+    ['ping', 'minute of ping history', 'minutes of ping history'], ['outages', 'outage', 'outages'],
+    ['speed', 'speed test', 'speed tests'], ['discovery', 'discovery scan', 'discovery scans'],
+    ['captures', 'packet capture', 'packet captures'], ['sip', 'SIP result', 'SIP results'],
+    ['proav', 'Pro AV scan', 'Pro AV scans'],
+  ];
+  //: why Wi-Fi was left alone, for each way the page cannot reach the survey
+  const HISTORY_WIFI_TEXT = {
+    nobridge: 'Wi-Fi scans are kept by the TNT window, and this page is not it: clear them from the TNT window',
+    nosurvey: 'this TNT window has no Wi-Fi survey to clear',
+    nosince: 'the service did not say when the cleared time began, so the Wi-Fi survey was kept',
+    outdated: 'this TNT window is older than the service and can only clear its whole Wi-Fi survey: pick All time, or use Clear on the WiFi page',
+  };
+  //: a refusal the service may send without a message of its own (an older service answers 404: it has no clear at all)
+  const HISTORY_REFUSED = {
+    full_scan_running: 'A Full Scan is running and reads this history as it goes. Clear it once the scan has finished.',
+    clear_running: 'History is already being cleared. Try again in a moment.',
+    bad_range: 'That time range is not one TNT knows.',
+  };
+
+  function historyLabel(key) {
+    const r = HISTORY_RANGES.find((x) => x[0] === key);
+    return r ? r[1] : String(key == null ? '' : key);
+  }
+
+  /** "in the last hour" / "in the last 7 days" / "ever" for a range key: how the confirm dialog names the range. */
+  function historyPhrase(key) {
+    if (key === 'all') return 'ever';
+    return 'in the ' + historyLabel(key).toLowerCase();
+  }
+
+  /** The ApiError of POST /api/history/clear -> { kind, text }. A 409 (a Full Scan or another clear running) and a 400 are
+   *  refusals, shown as the service words them; nothing was cleared. */
+  function historyErrorOutcome(err) {
+    const status = (err && err.status) || 0;
+    const code = (err && err.code) || '';
+    const message = err && err.message ? String(err.message) : '';
+    if (status === 409 || status === 400 || status === 403) {
+      return { kind: 'warn', text: message || HISTORY_REFUSED[code] || 'The service refused to clear history' };
+    }
+    if (status === 404) return { kind: 'error', text: 'This TNT service cannot clear history (it is older than this page)' };
+    // no answer at all (a timeout, the link dropped): the service may well have cleared, so the page says it does not know
+    // and waits a while for the history.cleared event, which it then treats as its own answer
+    if (status === 0 && (code === 'timeout' || code === 'network')) {
+      return { kind: 'warn', unknown: true, text: 'No answer from the service (' + (message || 'no reply') + '), so TNT cannot tell '
+        + 'whether history was cleared. This window updates on its own if it was.' };
+    }
+    return { kind: 'error', text: 'Could not clear history: ' + (message || 'unknown error') };
+  }
+
+  /** What the page does about Wi-Fi for a clear answered with `res`, given the bridge methods it has ({ wifi_clear_since,
+   *  wifi_clear, wifi_survey }: truthy when the window offers them, or null for no bridge at all) -> { call, args } or
+   *  { skip: reason }. The survey lives in the TNT window's own process, so only the page can reach it. */
+  function historyWifiPlan(res, bridge) {
+    // Only 'all' clears the whole survey. Any other range needs a real start time: without one the page cannot tell what
+    // to drop, and it keeps the survey rather than guess in the direction that deletes readings.
+    const all = !!res && res.range === 'all';
+    const since = res && typeof res.since_ts === 'number' && isFinite(res.since_ts) ? res.since_ts : null;
+    if (!bridge) return { skip: HISTORY_WIFI_TEXT.nobridge };
+    if (!all && since == null) return { skip: HISTORY_WIFI_TEXT.nosince };
+    if (bridge.wifi_clear_since) return { call: 'wifi_clear_since', args: [all ? null : since] };
+    if (all && bridge.wifi_clear) return { call: 'wifi_clear', args: [] };
+    if (bridge.wifi_clear || bridge.wifi_survey) return { skip: HISTORY_WIFI_TEXT.outdated };
+    return { skip: HISTORY_WIFI_TEXT.nosurvey };
+  }
+
+  /** The bridge's answer -> the Wi-Fi outcome the summary reports: { state: 'cleared', points, aps } | { state: 'failed', reason }. */
+  function historyWifiResult(r) {
+    if (!r || typeof r !== 'object' || r.ok === false) {
+      return { state: 'failed', reason: r && r.error ? String(r.error) : 'the TNT window did not clear its Wi-Fi survey' };
+    }
+    const num = (v) => (typeof v === 'number' && isFinite(v) ? v : null);
+    return { state: 'cleared', points: num(r.points_dropped), aps: num(r.aps_dropped) };
+  }
+
+  const plural = (n, one, many) => n + ' ' + (n === 1 ? one : many);
+
+  /** The one toast after a clear: the service's answer `res` (the history.cleared dict) and the Wi-Fi outcome (from
+   *  historyWifiResult, or { state: 'skipped', reason }) -> { kind, title, lines }. Every string in it is text for
+   *  textContent: the label, the stopped jobs and the skipped reasons are the service's words. */
+  function historySummary(res, wifi) {
+    res = res && typeof res === 'object' ? res : {};
+    const cleared = res.cleared && typeof res.cleared === 'object' ? res.cleared : {};
+    const count = (k) => { const v = Number(cleared[k]); return isFinite(v) && v > 0 ? Math.round(v) : 0; };
+    const gone = [];
+    for (const [key, one, many] of HISTORY_NOUNS) if (count(key)) gone.push(plural(count(key), one, many));
+    if (wifi && wifi.state === 'cleared') {
+      if (wifi.points != null) {
+        let t = plural(wifi.points, 'Wi-Fi reading', 'Wi-Fi readings');
+        if (wifi.aps) t += ' (' + plural(wifi.aps, 'access point', 'access points') + ' gone)';
+        if (wifi.points || wifi.aps) gone.push(t);
+      } else gone.push('the Wi-Fi survey');
+    }
+    const lines = [];
+    // no `cleared` at all: this window lost the service's answer and learned of the clear later (GET /api/history's
+    // newest entry carries no counts), so it says what it knows rather than "nothing was recorded"
+    const counted = !!(res.cleared && typeof res.cleared === 'object');
+    if (!counted) lines.push('The clear finished while this window could not hear the service, so it cannot say what went.');
+    if (gone.length) lines.push('Removed ' + gone.join(', ') + '.');
+    else if (counted) lines.push('Nothing was recorded in that time.');
+    if (count('faults')) lines.push('The fault watch starts again from now.');
+    const stopped = (Array.isArray(res.stopped) ? res.stopped : []).map((s) => String(s == null ? '' : s)).filter(Boolean);
+    if (stopped.length) lines.push('Stopped: ' + stopped.join(', ') + '.');
+    const skipped = (Array.isArray(res.skipped) ? res.skipped : []).filter((s) => s && typeof s === 'object')
+      .map((s) => ({ what: String(s.what == null ? '' : s.what), reason: String(s.reason == null ? '' : s.reason) }));
+    if (wifi && (wifi.state === 'skipped' || wifi.state === 'failed')) skipped.push({ what: 'Wi-Fi', reason: String(wifi.reason || '') });
+    for (const s of skipped) lines.push('Left alone: ' + (s.what || 'something') + (s.reason ? ' - ' + s.reason : '') + '.');
+    const label = res.label ? String(res.label) : historyLabel(res.range);
+    // a Wi-Fi survey this page could not reach is expected in a browser tab: only the service's own skips, or a bridge that
+    // failed, make the toast a warning
+    const warn = (Array.isArray(res.skipped) && res.skipped.length > 0) || (wifi && wifi.state === 'failed');
+    return { kind: warn ? 'warn' : 'ok', title: 'History cleared: ' + label, lines };
+  }
+
+  /** Settings › History's status line for the newest clear (GET /api/history's `last`, or the history.cleared event read
+   *  the same way: { range, at }) at time `now`, with `rel` = TNT.util.relTime. */
+  function historyStatusText(last, now, rel) {
+    if (!last || typeof last !== 'object') return 'Nothing has been cleared yet.';
+    const at = typeof last.at === 'number' ? last.at : (typeof last.ts === 'number' ? last.ts : null);
+    const when = at != null && rel ? ' · ' + rel(at, now) : '';
+    return 'Last cleared: ' + historyLabel(last.range) + when + '.';
+  }
+
+  /** Whether GET /api/history's newest clear `last` ({since_ts, at, range}) is one this window never heard of, given
+   *  `known`: undefined before the first answer (that answer only sets the baseline), else the `at`/`ts` of the newest
+   *  clear it knows (null for none). A clear while the event stream was down, or in a tab polling /api/status, is caught
+   *  this way on the next 'hello' or poll. The service stores the clear's `at` as the answer's `ts` (the same number), so
+   *  only a millisecond of slack is allowed against `known`: two clears a second apart are still two clears. `seen`
+   *  (optional) is every clear this window did handle, as {ts, range}: an entry of the same range within a few seconds of
+   *  `at` is that clear, so a service that ever stamps `at` a little after the answer's `ts` cannot make every window
+   *  toast "History cleared elsewhere" and re-mount its page a second time. */
+  const HISTORY_SAME_CLEAR_S = 5;
+  function historyMissed(known, last, seen) {
+    if (known === undefined || !last || typeof last !== 'object') return false;
+    const at = typeof last.at === 'number' && isFinite(last.at) ? last.at : null;
+    if (at == null) return false;
+    if (!(known == null || at > known + 0.001)) return false;
+    for (const e of Array.isArray(seen) ? seen : []) {
+      if (e && e.range === last.range && typeof e.ts === 'number' && Math.abs(e.ts - at) <= HISTORY_SAME_CLEAR_S) return false;
+    }
+    return true;
+  }
+
+  /** Whether a speedtest.done or discovery.done event is a job the clear cancelled or voided (no "Speed test failed", no
+   *  "Scan finished" for it). The service marks the event itself: {"silent": true, "cancel_reason": "history cleared"}
+   *  next to `result` (a discovery.done may keep cancelled false: a scan that finished while the clear ran is voided).
+   *  Tolerant of where the mark is: a cancelled_by / cancel_reason naming history on the event or its result, or only
+   *  a failed result whose error says history was cleared. */
+  function historyCancelledTest(d) {
+    if (!d || typeof d !== 'object') return false;
+    const r = d.result && typeof d.result === 'object' ? d.result : {};
+    const by = (v) => typeof v === 'string' && v.toLowerCase().indexOf('history') >= 0;
+    if (by(d.cancelled_by) || by(r.cancelled_by) || by(r.cancel_reason) || by(d.cancel_reason)) return true;
+    return r.ok === false && /history cleared/i.test(String(r.error || ''));
+  }
+
+  api.history = {
+    RANGES: HISTORY_RANGES, DEFAULT: HISTORY_DEFAULT, WHAT: HISTORY_WHAT, WIFI_TEXT: HISTORY_WIFI_TEXT, REFUSED: HISTORY_REFUSED,
+    label: historyLabel, phrase: historyPhrase, errorOutcome: historyErrorOutcome, wifiPlan: historyWifiPlan,
+    wifiResult: historyWifiResult, summary: historySummary, statusText: historyStatusText, cancelledTest: historyCancelledTest,
+    missed: historyMissed,
+  };
+
   /* ------------------------------------------------------------------ SSE */
   const KNOWN_EVENTS = [
     'hello', 'ping.sample', 'ping.targets', 'outage.start', 'outage.end',
@@ -491,6 +672,7 @@
     'netcheck.switch',
     'tftp.state', 'tftp.transfer',
     'capture.state', 'capture.sip',
+    'history.cleared',
   ];
 
   /**

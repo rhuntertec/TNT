@@ -39,7 +39,8 @@ What it does
 * Wi-Fi survey (the WiFi tile, :mod:`client.wifi_survey`): runs here, as the signed-in user,
   because Windows 11 24H2 gives BSSID lists only to a user who granted location access, and
   reaches the UI only through the bridge: ``wifi_survey(options)``, ``wifi_scan_now()``,
-  ``wifi_clear()``, ``wifi_set_enabled(on)`` (``wifi_survey_enabled`` in client.json, default
+  ``wifi_clear()``, ``wifi_clear_since(since_ts)`` (Settings > Clear history),
+  ``wifi_set_enabled(on)`` (``wifi_survey_enabled`` in client.json, default
   off) and ``open_location_settings()``. They answer only while the window shows the TNT service
   origin (:meth:`ClientApp.showing_service_page`). The session starts the first time the window
   is actually shown (not while TNT.exe waits minimised in the tray), or on a ``wifi_survey``
@@ -146,6 +147,7 @@ LOCATION_SETTINGS_URI = "ms-settings:privacy-location"
 #: What the Wi-Fi bridge methods answer to any page that is not the TNT service's own.
 WIFI_BRIDGE_REFUSED = "The Wi-Fi survey only answers the TNT dashboard."
 WIFI_BRIDGE_FAILED = "The Wi-Fi survey failed; details are in the TNT client log."
+WIFI_SINCE_TEXT = "since_ts must be a time in seconds, or null for everything"
 
 # Process exit codes
 EXIT_OK = 0
@@ -1478,6 +1480,20 @@ class JsBridge:
             return self._app.wifi.clear()
         except Exception:  # noqa: BLE001
             log.exception("wifi_clear failed")
+            return {"ok": False, "error": WIFI_BRIDGE_FAILED}
+
+    def wifi_clear_since(self, since_ts: Any = None) -> Dict[str, Any]:
+        """Settings > Clear history: forget what the survey heard from ``since_ts`` (epoch seconds, the service's
+        cut-off) on; ``null`` is everything, as :meth:`wifi_clear`. ``{"ok": true, "aps_dropped", "points_dropped"}``,
+        or ``{"ok": false, "error"}`` - refused exactly as ``wifi_clear`` is, off the TNT dashboard."""
+        try:
+            if not self._wifi_on_service_page():
+                return {"ok": False, "error": WIFI_BRIDGE_REFUSED}
+            if since_ts is not None and not wifi_survey.is_epoch_time(since_ts):
+                return {"ok": False, "error": WIFI_SINCE_TEXT}
+            return {"ok": True, **self._app.wifi.clear_since(since_ts)}
+        except Exception:  # noqa: BLE001
+            log.exception("wifi_clear_since failed")
             return {"ok": False, "error": WIFI_BRIDGE_FAILED}
 
     def wifi_set_enabled(self, on: Any) -> Dict[str, Any]:

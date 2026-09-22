@@ -541,7 +541,7 @@ SELFCHECK_MODULES = (
     "tnt.api", "tnt.api.routes", "tnt.api.server", "tnt.api.sse",
     "tnt.arp", "tnt.capture", "tnt.config", "tnt.db", "tnt.dhcp", "tnt.diagnostics", "tnt.discovery",
     "tnt.dissect", "tnt.etw", "tnt.events", "tnt.export_pdf", "tnt.firewall", "tnt.geohints",
-    "tnt.geohints_data", "tnt.geoip", "tnt.icmp", "tnt.lanpeers", "tnt.linkmap", "tnt.lldp",
+    "tnt.geohints_data", "tnt.geoip", "tnt.history", "tnt.icmp", "tnt.lanpeers", "tnt.linkmap", "tnt.lldp",
     "tnt.logging_setup", "tnt.faults", "tnt.mdns", "tnt.mmdb", "tnt.natcheck", "tnt.netinfo", "tnt.nettools",
     "tnt.networks", "tnt.netwatch", "tnt.outages",
     "tnt.oui", "tnt.paths", "tnt.pcapng", "tnt.peer", "tnt.pinger", "tnt.pktmon", "tnt.portcheck",

@@ -524,6 +524,7 @@
     renderSettingsGateway();
     renderSettingsGeoip();
     renderSettingsUpdate();
+    renderSettingsHistory();
     // a newer network generation than this page has seen (the event was missed: stream down, PC asleep,
     // window hidden) or a restarted service: the same refresh as the event, the toast only for a change
     if (net.changed) {
@@ -1383,6 +1384,155 @@
       return true;
     } catch (err) { toast('Could not save: ' + err.message, 'error'); return false; }
   }
+  /* ---- Settings › History: clear what TNT recorded in a time range */
+  const HISTORY_DESC = 'Removes what TNT recorded in the chosen time: ping history, outages, speed tests, previous discovery '
+    + 'scans, packet captures saved in TNT’s own folder, fault history, SIP results, Wi-Fi scans and Pro AV scans. Fault '
+    + 'history always restarts from now. A capture that is still recording and capture files outside TNT’s own folder are '
+    + 'never touched. Saved site reports are never cleared: delete those by hand on the Reports page.';
+  let historyLast = null;            // the newest clear ({since_ts, at, range}) for the status line, null when none
+  let historyKnown;                  // the at/ts of the newest clear this window knows: undefined until GET /api/history answers
+  let historyPending = null;         // {range, untilMs}: this window's clear went unanswered, so a matching event is its answer
+  let historyHeard = null;           // a clear heard while this window's own request was still out (maybe its own)
+  let historyCheckMs = 0;            // when a status poll last asked GET /api/history (a tab without the event stream)
+  const HISTORY_GRACE_MS = 180000;   // how long an unanswered clear waits for its event
+  // the views that show recorded history: only these are mounted again by a clear (Tools, Reports and IP info show none,
+  // and mounting them again would drop a running traceroute, unsaved edits or the chosen report)
+  const HISTORY_VIEWS = new Set(['ping', 'outages', 'speed', 'discovery', 'capture', 'proav', 'sip', 'faults', 'wifi']);
+  let historyClearing = false;       // this window asked for a clear and has not had its answer yet
+  const historySeen = new Set();     // the `ts` of every clear this window has refreshed for (the event and the answer both come)
+  const historySeenList = [];        // the same clears as {ts, range}, newest last (at most 20), for api.history.missed
+  function renderSettingsHistory() {
+    const el = $('#settings-history');
+    if (!el) return;
+    const t = api.history.statusText(historyLast, state.now, relTime);
+    if (el.textContent !== t) el.textContent = t;
+  }
+  /** GET /api/history: the Settings status line, and a clear this window missed (its event stream was down, or it is a
+   *  tab polling /api/status) is handled now as if its event had come. The first answer only sets the baseline. */
+  function loadHistoryInfo() {
+    return api.historyInfo().then((r) => {
+      if (!r || !Object.prototype.hasOwnProperty.call(r, 'last')) return;
+      const last = r.last && typeof r.last === 'object' ? r.last : null;
+      const missed = api.history.missed(historyKnown, last, historySeenList);
+      if (historyKnown === undefined) historyKnown = last && typeof last.at === 'number' ? last.at : null;
+      if (missed) historyCleared(Object.assign({}, last, { ts: last.at }));
+      else {
+        // a clear this window already handled, stamped a little later than its answer's ts: now the baseline
+        if (last && typeof last.at === 'number' && (historyKnown == null || last.at > historyKnown)) historyKnown = last.at;
+        if (!historyLast || (last && typeof last.at === 'number' && last.at > (historyLast.at || 0))) historyLast = last;
+      }
+      renderSettingsHistory();
+    }, () => { /* an older service: the line keeps what it knows */ });
+  }
+  /** The clear's answer or the history.cleared event -> the {since_ts, at, range} entry the status line reads. */
+  function historyEntry(d) {
+    return { since_ts: d.since_ts == null ? null : d.since_ts, at: typeof d.ts === 'number' ? d.ts : nowS(), range: d.range };
+  }
+  /** Mount the open view again, keeping the scroll position: every view resets its caches on mount, which is how a clear
+   *  reaches the charts, lists and tiles a page already drew. showView returns early for an unchanged name, so the name
+   *  is forgotten first. */
+  function remountView() {
+    const name = current.name;
+    if (!name || name === 'diagnostics') return;
+    if (!HISTORY_VIEWS.has(name)) { notifyView(); return; }
+    const y = window.scrollY;
+    if (current.view && current.view.unmount) { try { current.view.unmount(); } catch (e) { console.error('unmount failed', e); } }
+    current = { name: null, view: null };
+    showView(name);
+    window.scrollTo({ top: y });
+  }
+  /** Every window, on history.cleared (from this window or another): the tiles, the open page, the Wi-Fi tile's cached
+   *  survey and the Settings status line. `force` re-runs it for a clear this window already refreshed for (the asking
+   *  window runs it again once its Wi-Fi survey is cleared too). */
+  function historyCleared(d, force) {
+    if (!d || typeof d !== 'object') return;
+    const key = String(d.ts);
+    if (historySeen.has(key) && !force) return;
+    const fresh = !historySeen.has(key);
+    historySeen.add(key);
+    if (fresh && typeof d.ts === 'number') { historySeenList.push({ ts: d.ts, range: d.range }); if (historySeenList.length > 20) historySeenList.shift(); }
+    historyLast = historyEntry(d);
+    if (typeof d.ts === 'number' && (historyKnown == null || d.ts > historyKnown)) historyKnown = d.ts;
+    if (TNT.wifiSurvey) TNT.wifiSurvey.last = null;
+    refreshStatus();
+    remountView();
+    renderSettingsHistory();
+    if (!fresh) return;
+    // heard while this window's own request is out: kept, in case that request's answer never comes
+    if (historyClearing) { historyHeard = d; return; }
+    // this window's own clear whose answer never came (a timeout, a dropped link): the event is its answer
+    const mine = historyPending && historyPending.range === d.range && Date.now() < historyPending.untilMs;
+    if (mine) { historyPending = null; adoptHistoryAnswer(d); return; }
+    // cleared from another window or tab: say so here too (the window that asked shows its own summary)
+    toast('History cleared elsewhere: ' + (d.label ? String(d.label) : api.history.label(d.range)), 'info', 5000);
+  }
+  /** A clear this window asked for, learned of from its event or GET /api/history rather than from its answer: the
+   *  Wi-Fi half and the summary toast, as if the answer had come. */
+  function adoptHistoryAnswer(d) {
+    historyClearing = true;
+    clearWifiHistory(d).then((wifi) => {
+      historyToast(api.history.summary(d, wifi));
+      if (wifi.state === 'cleared') historyCleared(d, true);
+    }).finally(() => { historyClearing = false; });
+  }
+  /** The Wi-Fi half of a clear: the survey lives in the TNT window's own process, so the page asks it through the bridge.
+   *  -> the outcome historySummary reports. */
+  async function clearWifiHistory(res) {
+    const pw = window.pywebview && window.pywebview.api;
+    const fn = (name) => !!pw && typeof pw[name] === 'function';
+    const bridge = pw ? { wifi_clear_since: fn('wifi_clear_since'), wifi_clear: fn('wifi_clear'), wifi_survey: fn('wifi_survey') } : null;
+    const plan = api.history.wifiPlan(res, bridge);
+    if (plan.skip) return { state: 'skipped', reason: plan.skip };
+    let r;
+    if (TNT.wifiSurvey && TNT.wifiSurvey.call) r = await TNT.wifiSurvey.call(plan.call, ...plan.args);
+    else { try { r = await pw[plan.call](...plan.args); } catch (e) { r = { ok: false, error: String((e && e.message) || e) }; } }
+    return api.history.wifiResult(r);
+  }
+  /** The summary toast: a title and one line each for what went, what was stopped and what was left alone, all as text. */
+  function historyToast(sum) {
+    const el = h('div', { class: 'history-toast' }, h('span', { class: 'strong' }, sum.title), sum.lines.map((l) => h('span', null, l)));
+    toast(el, sum.kind, 12000);
+  }
+  async function clearHistory(range, btn) {
+    if (historyClearing) return;
+    const what = h('ul', { class: 'history-what' }, api.history.WHAT.map((w) => h('li', null, w)));
+    const message = h('div', { class: 'stack history-confirm' },
+      h('p', null, range === 'all' ? 'This removes everything TNT has ever recorded:'
+        : 'This removes everything TNT recorded ' + api.history.phrase(range) + ':'),
+      what,
+      h('p', { class: 'strong' }, 'Saved site reports are never touched. Delete those by hand on the Reports page.'),
+      h('p', { class: 'muted small' }, 'A capture that is still recording, and capture files outside TNT’s own folder, are left alone. This cannot be undone.'));
+    const ok = await confirmDialog({ title: 'Clear history?', message, ok: 'Clear history', cancel: 'Cancel', danger: true });
+    if (!ok) return;
+    historyClearing = true;
+    historyHeard = null;
+    busy(btn, true, 'Clearing…');
+    let res = null;
+    try {
+      res = await api.historyClear(range);
+    } catch (err) {
+      const o = api.history.errorOutcome(err);
+      busy(btn, false);
+      historyClearing = false;
+      const heard = historyHeard;
+      historyHeard = null;
+      // no answer, but the clear was heard meanwhile: that was this window's clear, so it is finished here and now
+      if (o.unknown && heard && heard.range === range) { adoptHistoryAnswer(heard); return; }
+      if (o.unknown) historyPending = { range, untilMs: Date.now() + HISTORY_GRACE_MS };
+      toast(o.text, o.kind, 8000);
+      return;
+    }
+    busy(btn, false);
+    historyHeard = null;
+    try {
+      historyCleared(res);
+      const wifi = await clearWifiHistory(res);
+      historyToast(api.history.summary(res, wifi));
+      if (wifi.state === 'cleared') historyCleared(res, true);   // the WiFi page and tile drop what the survey just forgot
+    } finally {
+      historyClearing = false;
+    }
+  }
   async function openSettings() {
     if (!state.settings) await loadSettings();
     const s = state.settings || { ping: {}, speedtest: {}, targets: {}, ui: {} };
@@ -1456,8 +1606,24 @@
       settingRow('When an update is found', 'Ask (show the banner and wait for you) or install automatically at the next check.', upAutoT),
       settingRow('Check every', 'Hours between checks (1–168).', h('div', { class: 'row inline-unit' }, upEvery, h('span', { class: 'muted small' }, 'h'))),
       settingRow('Channel', 'Stable releases only, or include pre-releases for early builds.', upChannel),
-      h('div', { class: 'geo-status' }, h('span', { id: 'settings-update', role: 'status' }, updateSettingsText(updateState(), state.now)), upCheck),
+      // the same two columns as the rows above, so Check now fills the control column and lines up with the toggles
+      h('div', { class: 'setting' },
+        h('div', { class: 'desc' }, h('span', { class: 's', id: 'settings-update', role: 'status' }, updateSettingsText(updateState(), state.now))),
+        h('div', { class: 'setting-control' }, upCheck)),
     ]));
+
+    // History: clear what TNT recorded in a time range, directly under Check now. Saved site reports are never touched.
+    const histRange = h('select', { class: 'input', id: 'settings-history-range', 'aria-label': 'Time range to clear' },
+      api.history.RANGES.map(([v, l]) => h('option', { value: v, selected: v === api.history.DEFAULT }, l)));
+    const histBtn = h('button', { class: 'btn btn-danger', id: 'settings-history-clear', type: 'button' }, 'Clear history…');
+    histBtn.addEventListener('click', () => clearHistory(histRange.value, histBtn));
+    body.appendChild(group('History', [
+      settingRow('Clear history', HISTORY_DESC, histRange),
+      h('div', { class: 'setting' },
+        h('div', { class: 'desc' }, h('span', { class: 's', id: 'settings-history', role: 'status' }, api.history.statusText(historyLast, state.now, relTime))),
+        h('div', { class: 'setting-control' }, histBtn)),
+    ]));
+    loadHistoryInfo();
 
     /* ---- One section per tile, in the tile's own colour, for the settings that belong to that page. */
 
@@ -1853,8 +2019,13 @@
   function wireEvents() {
     const ev = api.events;
     ev.onState((s) => { state.live = s; renderHeader(); });
-    ev.on('hello', () => { refreshStatus(); loadSettings(); });
-    ev.on('status.poll', (st) => { if (st) applyStatus(st); else { state.apiOk = false; renderHeader(); } });
+    // a (re)connected stream may have missed a history.cleared: GET /api/history catches it up
+    ev.on('hello', () => { refreshStatus(); loadSettings(); loadHistoryInfo(); });
+    ev.on('status.poll', (st) => {
+      if (st) applyStatus(st); else { state.apiOk = false; renderHeader(); }
+      // a tab without the event stream never hears history.cleared: every 15 s it asks instead
+      if (st && Date.now() - historyCheckMs > 15000) { historyCheckMs = Date.now(); loadHistoryInfo(); }
+    });
     ev.on('ping.sample', (d) => {
       if (!d) return;
       const t = state.targets.find((x) => x.id === d.target_id);
@@ -1893,7 +2064,8 @@
     ev.on('speedtest.progress', (d) => { if (state.status && state.status.speed && d) { state.status.speed.running = true; state.status.speed.progress = d; renderTiles(); } });
     // a full scan's own speed test and Discovery scan are on its progress card: no toasts over it
     ev.on('speedtest.done', (d) => {
-      const r = d && d.result;
+      // a test Clear history cancelled did not fail, so it has no toast (the clear's own summary says it was stopped)
+      const r = d && d.result && !api.history.cancelledTest(d) ? d.result : null;
       // an ok test with a note (an upload nothing acknowledged, a stall) is a warning, not a green success
       const noted = r && r.ok && r.error;
       if (r && !fullScan.running()) toast(r.ok ? 'Speed test: ↓ ' + fmtMbps(r.download_mbps) + ' ↑ ' + fmtMbps(r.upload_mbps) + ' Mbps' + (noted ? ' · ' + r.error : '') : 'Speed test failed: ' + (r.error || 'unknown error'), r.ok && !noted ? 'ok' : 'warn');
@@ -1905,11 +2077,16 @@
     ev.on('discovery.done', (d) => {
       const moved = d && d.network_changed ? ' · this PC changed networks during the scan' : '';
       if (fullScan.running()) { /* on the full scan's progress card */ }
+      // Clear history stopped it, or voided a scan that finished while it ran (cancelled false, silent true): not stored,
+      // so no "Scan finished" for it; the clear's own summary says so
+      else if (d && api.history.cancelledTest(d)) { /* nothing to say */ }
       else if (d && !d.cancelled) toast('Scan finished' + (d.found != null ? ': ' + d.found + ' devices' : '') + moved, moved ? 'warn' : 'ok');
       else if (d) toast('Scan cancelled' + moved, 'warn');
       refreshStatus();
     });
     ev.on('settings.changed', () => { loadSettings(); refreshStatus(); });
+    // Clear history, from this window or any other: the tiles, the open page, the Wi-Fi tile's cache and Settings
+    ev.on('history.cleared', (d) => historyCleared(d));
     // DHCP server (Tools tile): dhcp.state carries the /status summary fields, leases bump the counts
     ev.on('dhcp.state', (d) => { if (state.status && d) { state.status.dhcp = Object.assign({}, state.status.dhcp || {}, d); renderTiles(); } });
     // TFTP server (Tools tile): tftp.state carries its summary (running, uploads, error), merged the same way
@@ -1993,6 +2170,7 @@
     refreshStatus();
     loadSettings();
     loadReportsInfo();
+    loadHistoryInfo();                 // the baseline a missed clear is measured against
     fullScan.refresh();
     route();
     // the WiFi tile's summary: a cheap bridge read every 15 s while the WiFi page is not open

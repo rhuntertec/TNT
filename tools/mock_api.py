@@ -10,6 +10,14 @@ evolving data:
   periodic "sluggish" phase so the yellow light and red sparkline ticks show up;
 * an outage timeline for the last 24 h with a yellow (target) span, a red
   (total internet) span and a grey monitoring gap;
+* Settings › History: ``POST /api/history/clear`` ``{"range": "5m" | ... | "all"}`` removes what the
+  fake service recorded in that window by the service's rules (ping minutes and samples, outages
+  and their events, speed tests, discovery runs, the listed captures for an administrator, the
+  fault watch, the SIP results and flow slots, the Pro AV result; running jobs stop and keep
+  nothing), answers the contract's dict and publishes it as ``history.cleared``; 400 ``bad_range``,
+  409 ``full_scan_running`` / ``clear_running``, 403 for a page of another origin.
+  ``GET /api/history`` names the eight ranges and the newest clear, and the timeline's ``cleared``
+  spans are painted like a monitoring gap;
 * 7 days of 15-minute speed tests with an evening slowdown and a few failures;
 * a discovery scan that progresses over ~4 s after ``POST /api/discovery/scan``;
 * a fake DHCP server (Tools view): ``POST /api/dhcp/start`` answers 409 with the
@@ -870,6 +878,21 @@ NETWORK_TOOL_ROUTES = ("/proav/scan", "/proav/cancel",
                        "/tftp/uploads", "/tftp/settings",
                        "/sip/alg", "/sip/stun", "/sip/stun/lifetime", "/sip/flow")
 CAPTURE_FILES_ROUTE = "/capture/files/"
+#: Settings › History (tnt.history): the eight ranges, key -> seconds (None: all time) and label, in the service's order
+HISTORY_RANGES = {"5m": 300, "30m": 1800, "1h": 3600, "6h": 21600, "24h": 86400, "7d": 604800, "30d": 2592000, "all": None}
+HISTORY_RANGE_LABELS = {"5m": "Last 5 minutes", "30m": "Last 30 minutes", "1h": "Last hour", "6h": "Last 6 hours",
+                        "24h": "Last 24 hours", "7d": "Last 7 days", "30d": "Last 30 days", "all": "All time"}
+#: the eight counts of a clear's `cleared`, always all of them
+HISTORY_CLEARED_KEYS = ("ping", "outages", "speed", "discovery", "captures", "faults", "sip", "proav")
+HISTORY_SPANS_KEEP = 50                    # cleared spans kept for the timeline, newest last
+HISTORY_SPAN_MAX_AGE_S = 30 * 86400        # ... and none older than this
+HISTORY_PING_HORIZON_S = 30 * 86400        # how far back the fake ping minutes go (the service's retention)
+HISTORY_BAD_RANGE_MSG = "range must be one of: " + ", ".join(HISTORY_RANGES)
+HISTORY_FULL_SCAN_MSG = "A Full Scan is running and reads this history as it goes. Clear it once the scan has finished."
+HISTORY_CLEAR_RUNNING_MSG = "History is already being cleared. Try again in a moment."
+HISTORY_CAPTURES_ADMIN_MSG = "TNT is not running as administrator, so its packet captures were left alone"
+HISTORY_CAPTURE_RECORDING_MSG = "a capture is recording: it was left alone (stop it, then clear again to remove it)"
+HISTORY_CANCEL_REASON = "history cleared"
 #: Tools: the TFTP server (tnt.tftp): keys, texts and limits
 TFTP_STATUS_KEYS = ("available", "running", "since_ts", "error", "warning", "adapter", "adapters", "listen", "root", "uploads", "firewall",
                     "conflict", "transfers", "history", "counts", "settings")
@@ -1184,6 +1207,8 @@ SIP_FLOWCALL_KEYS = ("id", "call_ids", "from_uri", "to_uri", "state", "status", 
 #: The fake site's phone system, on a documentation address like everything else here.
 #: tnt.sipqual.MAX_LEGS_PER_KIND: most targets of one kind that become legs
 SIP_MAX_LEGS_PER_KIND = 3
+#: tnt.sipqual.MIN_SAMPLES: fewer pings than this behind a leg and it is not graded
+SIP_MIN_SAMPLES = 30
 SIP_PBX_HOST = "pbx.example.net"
 SIP_PBX_IP = "198.51.100.25"
 SIP_PHONE_IP = "192.0.2.60"
@@ -1277,6 +1302,11 @@ def sip_build_qualifier(legs: List[Dict[str, Any]], window_h: float,
     }
     findings: List[Dict[str, Any]] = []
     for leg in legs:
+        if leg["grade"] == "unknown":
+            # tnt.sipqual: a leg with too little history says so rather than showing numbers it does not have
+            findings.append(sip_finding(ident_for[leg["kind"]], "info", f"{leg['label']}: not enough history to grade",
+                                        leg["reason"]))
+            continue
         numbers = (f"{leg['avg_ms']} ms average, {leg['jitter_ms']} ms jitter, {leg['loss_pct']} % loss over "
                    f"{leg['samples']} pings")
         findings.append(sip_finding(
@@ -4065,6 +4095,16 @@ class MockState:
         self.report_fast = False                             # tests: the speed test and Discovery take a few ms
         self.report_wifi_timeout_s = REPORT_WIFI_TIMEOUT_S
         self.report_wifi_grace_s = REPORT_WIFI_GRACE_S
+        # Settings › History (tnt.history): the cleared spans (meta history_cleared), the ping minutes each clear took (the fake
+        # minutes are made up on every read, so a read leaves out what a clear removed), the one clear at a time, and the jobs
+        # a clear stops
+        self.history_spans: List[Dict[str, Any]] = []
+        self.history_clearing = False
+        self.history_clear_delay_s = 0.0                     # tests: hold a clear open this long (409 clear_running meanwhile)
+        self.speed_gen = 0                                   # bumps on every test and every clear that stops one
+        self.disc_discard = False                            # the running scan was stopped by a clear: nothing of it is kept
+        self.sip_flow_loaded: Dict[str, float] = {}          # slot -> when its capture was loaded
+        self.sip_flow_files: Dict[str, str] = {}             # slot -> the file name it holds (a clear closes a deleted one)
         self.log_ring: List[Dict[str, Any]] = []
         self.events_db: List[Dict[str, Any]] = []
         self.rng = random.Random(7)
@@ -4298,13 +4338,20 @@ class MockState:
         buf = self.samples.get(t["id"], [])
         last = buf[-1] if buf else None
         w = self._stats(t["id"], self.settings["thresholds"]["window_s"])
-        # a plausible 24 h summary derived from the base RTT
-        sent = int(min(86400, time.time() - self.started_ts))
-        lost = int(sent * (0.0002 if t["kind"] == "local" else 0.004)) + (258 if t["id"] == 2 else 0)
-        day = {"sent": sent, "received": sent - lost, "lost": lost,
-               "loss_pct": round(100.0 * lost / sent, 2) if sent else 0.0,
-               "avg_ms": round(t["base"] * 1.03, 2), "min_ms": round(t["base"] * 0.7, 2),
-               "max_ms": round(t["base"] * 9.1 + 40, 2)}
+        # a plausible 24 h summary derived from the base RTT, less whatever Clear history removed of the day (the
+        # service re-reads its day summary from the rows left): nothing left reads like a target that never answered
+        now = time.time()
+        span = min(86400.0, now - self.started_ts)
+        frac = self._recorded_fraction_locked(now - span, now) if self.history_spans else 1.0
+        sent = int(span * frac)
+        lost = int(sent * (0.0002 if t["kind"] == "local" else 0.004)) + (int(258 * frac) if t["id"] == 2 else 0)
+        lost = min(lost, sent)
+        if sent:
+            day = {"sent": sent, "received": sent - lost, "lost": lost, "loss_pct": round(100.0 * lost / sent, 2),
+                   "avg_ms": round(t["base"] * 1.03, 2), "min_ms": round(t["base"] * 0.7, 2),
+                   "max_ms": round(t["base"] * 9.1 + 40, 2)}
+        else:
+            day = {"sent": 0, "received": 0, "lost": 0, "loss_pct": None, "avg_ms": None, "min_ms": None, "max_ms": None}
         return {"id": t["id"], "host": t["host"], "label": t["label"], "name": t.get("name"), "kind": t["kind"], "ip": t["ip"],
                 "enabled": t["enabled"], "resolved": t["resolved"], "resolve_error": t["resolve_error"],
                 "light": self._light(t), "in_outage": t["in_outage"],
@@ -4405,6 +4452,9 @@ class MockState:
             minutes = []
             m = int(start // 60 * 60)
             while m < end:
+                if self._ping_minute_cleared(m):
+                    m += 60
+                    continue
                 rec = 60 - (1 if self.rng.random() < 0.05 else 0)
                 minutes.append({"target_id": tid, "minute_ts": m, "sent": 60, "received": rec,
                                 "avg_ms": round(t["base"] * (1 + self.rng.gauss(0, 0.05)), 2),
@@ -4481,7 +4531,198 @@ class MockState:
                 else:
                     segs.append(s)
             return {"start_ts": start, "end_ts": now, "hours": hours, "segments": segs, "total_segments": totals,
-                    "gaps": gaps, "targets": [{"id": t["id"], "host": t["host"], "kind": t["kind"]} for t in self.targets]}
+                    "gaps": gaps, "cleared": self._cleared_spans_locked(start, now),
+                    "targets": [{"id": t["id"], "host": t["host"], "kind": t["kind"]} for t in self.targets]}
+
+    # -- Settings › History: clear what was recorded in a time range (tnt.history, Engine.clear_history) -------------
+    def _cleared_spans_locked(self, start: float, end: float) -> List[Dict[str, float]]:
+        """The timeline's ``cleared``: every recorded clear as [since_ts, at], clipped to [start, end] (since_ts None: from the
+        range start); a span wholly outside the range is left out."""
+        out = []
+        for span in self.history_spans:
+            lo = start if span["since_ts"] is None else max(start, float(span["since_ts"]))
+            hi = min(end, float(span["at"]))
+            if hi > lo:
+                out.append({"start_ts": lo, "end_ts": hi})
+        return out
+
+    def _recorded_fraction_locked(self, start: float, end: float) -> float:
+        """How much of [start, end] no clear has removed, 0..1: the invented day summaries and SIP legs shrink with it,
+        as the service's (re-read from what is left) do - after All time a Ping tile or SIP leg has nothing behind it."""
+        if end <= start:
+            return 1.0
+        cut: List[Tuple[float, float]] = []
+        for span in self.history_spans:
+            lo = start if span["since_ts"] is None else max(start, float(span["since_ts"]))
+            hi = min(end, float(span["at"]))
+            if hi > lo:
+                cut.append((lo, hi))
+        gone, reach = 0.0, start
+        for lo, hi in sorted(cut):
+            lo = max(lo, reach)
+            if hi > lo:
+                gone += hi - lo
+                reach = hi
+        return max(0.0, 1.0 - gone / (end - start))
+
+    def _ping_minute_cleared(self, minute_ts: float) -> bool:
+        """Whether a clear removed the ping minute starting at ``minute_ts``: the service deletes minute rows with
+        minute_ts > since - 60 (the minute the window starts in goes whole) up to the moment of the clear."""
+        for span in self.history_spans:
+            if minute_ts <= span["at"] and (span["since_ts"] is None or minute_ts > span["since_ts"] - 60):
+                return True
+        return False
+
+    def history_info(self) -> Dict[str, Any]:
+        """GET /api/history: the eight ranges for the select and the newest clear for Settings' status line."""
+        with self.lock:
+            return {"ranges": [{"key": k, "label": HISTORY_RANGE_LABELS[k]} for k in HISTORY_RANGES],
+                    "last": dict(self.history_spans[-1]) if self.history_spans else None}
+
+    def history_clear(self, range_key: Any, captures_allowed: bool = True) -> Dict[str, Any]:
+        """POST /api/history/clear: remove what was recorded in [since_ts, now] by the service's rules (the overlap rule:
+        anything recorded in or overlapping the window goes, whole) and publish ``history.cleared`` with the answer. 400
+        bad_range, 409 full_scan_running while a Full Scan runs, 409 clear_running while another clear runs. Saved reports,
+        their networks and every file outside the capture list are never touched."""
+        if not isinstance(range_key, str) or range_key not in HISTORY_RANGES:
+            raise ToolRefused(400, "bad_range", HISTORY_BAD_RANGE_MSG)
+        with self.lock:
+            if self.report_job and self.report_job.get("status") == "running":
+                raise ToolRefused(409, "full_scan_running", HISTORY_FULL_SCAN_MSG)
+            if self.history_clearing:
+                raise ToolRefused(409, "clear_running", HISTORY_CLEAR_RUNNING_MSG)
+            self.history_clearing = True
+            delay = self.history_clear_delay_s
+        try:
+            if delay > 0:
+                time.sleep(delay)
+            return self._history_clear(range_key, captures_allowed)
+        finally:
+            with self.lock:
+                self.history_clearing = False
+
+    def _history_clear(self, range_key: str, captures_allowed: bool) -> Dict[str, Any]:
+        now = time.time()
+        seconds = HISTORY_RANGES[range_key]
+        since = None if seconds is None else now - seconds
+        lo = float("-inf") if since is None else since
+        cleared = {k: 0 for k in HISTORY_CLEARED_KEYS}
+        stopped: List[str] = []
+        skipped: List[Dict[str, str]] = []
+        publish: List[Tuple[str, Dict[str, Any]]] = []
+        discard_capture = False
+        with self.lock:
+            # 1. running jobs: a speed test, a discovery scan and a Pro AV scan stop and keep nothing
+            if self.speed_running:
+                self.speed_gen += 1
+                self.speed_running = False
+                self.speed_progress = {"phase": "idle", "pct": 0.0}
+                stopped.append("speed test")
+                # the service's shape (tnt/speedtest/scheduler.py): the run ends "cancelled" and the event itself carries
+                # silent + cancel_reason, so no page shows "Speed test failed" for it
+                publish.append(("speedtest.done", {"result": {"ok": False, "ts": now, "error": "cancelled"}, "trigger": "manual",
+                                                   "silent": True, "cancel_reason": HISTORY_CANCEL_REASON}))
+            if self.disc_running:
+                self.disc_discard = True
+                self.disc_cancel.set()
+                stopped.append("discovery scan")
+            if self.proav_job.get("state") == "scanning":
+                self.proav_gen += 1
+                self.proav_stop_evt.set()
+                self.proav_job = self.proav_idle_job()
+                stopped.append("Pro AV scan")
+            # 2. ping: the minutes (counted as the service counts its rows) and the live samples
+            first = max(now - HISTORY_PING_HORIZON_S, lo - 60)
+            m = int(first // 60 * 60)
+            minutes = 0
+            while m <= now:
+                if m > lo - 60 and not self._ping_minute_cleared(m):
+                    minutes += 1
+                m += 60
+            cleared["ping"] = minutes * len(self.targets)
+            for tid in list(self.samples):
+                self.samples[tid] = [x for x in self.samples[tid] if x[0] < lo]
+            # 3. outages (every kind, gap included): open ones, and closed ones that end in the window; their events too
+            keep = [o for o in self.outages if o["end_ts"] is not None and o["end_ts"] < lo]
+            cleared["outages"] = len(self.outages) - len(keep)
+            self.outages = keep
+            # an open outage always goes, so no target is in one any more and its run of misses starts again (the
+            # service's OutageTracker reset and set_in_outage(tid, False)); one still down opens a new outage later
+            for t in self.targets:
+                if t["in_outage"]:
+                    t["in_outage"] = False
+                    t["consecutive_missed"] = 0
+            self.events_db = [e for e in self.events_db if not (e.get("category") == "outage" and e.get("ts", 0) >= lo)]
+            # 4. speed tests and discovery scans recorded in the window
+            n = len(self.speedtests)
+            self.speedtests = [r for r in self.speedtests if r["ts"] < lo]
+            cleared["speed"] = n - len(self.speedtests)
+            n = len(self.disc_runs)
+            self.disc_runs = [r for r in self.disc_runs if r["ts"] < lo]
+            cleared["discovery"] = n - len(self.disc_runs)
+            # 5. packet captures: the listed files only, and only for an administrator; a recording capture stays
+            session = self.capture_session
+            names: set = set()                       # the capture files this clear deletes (a SIP slot holding one closes)
+            if not captures_allowed:
+                skipped.append({"what": "captures", "reason": HISTORY_CAPTURES_ADMIN_MSG})
+            else:
+                names = {f["name"] for f in self.capture_files if f["created_ts"] >= lo}
+                self.capture_files = [f for f in self.capture_files if f["name"] not in names]
+                cleared["captures"] = len(names)
+                if session is not None:
+                    if session["state"] == "capturing":
+                        skipped.append({"what": "captures", "reason": HISTORY_CAPTURE_RECORDING_MSG})
+                    elif session["source"] == "file" and session.get("file") in names:
+                        discard_capture = True           # the file open in the packet list was one of them
+                    elif session["source"] == "live" and not session["saved"] and session["started_ts"] >= lo:
+                        discard_capture = True           # a stopped capture never saved, started in the window
+            # 6. faults: the counters are cumulative, so any range restarts the whole watch from now
+            self.faults_since = now
+            cleared["faults"] = 1
+            # 7. SIP: the ALG and STUN results of the window, the call-flow slots loaded in it and any slot whose file was a
+            #    capture this clear deleted (never the slot files themselves)
+            if self.sip_alg_last is not None and self.sip_alg_last.get("ts", 0) >= lo:
+                self.sip_alg_last = None
+                cleared["sip"] += 1
+            if self.sip_stun_last is not None and self.sip_stun_last.get("ts", 0) >= lo:
+                self.sip_stun_last = None
+                cleared["sip"] += 1
+            for slot in sorted(self.sip_flow_slots):
+                if self.sip_flow_loaded.get(slot, now) >= lo or self.sip_flow_files.get(slot) in names:
+                    self.sip_flow_slots.discard(slot)
+                    self.sip_flow_loaded.pop(slot, None)
+                    self.sip_flow_files.pop(slot, None)
+                    cleared["sip"] += 1
+            # 8. Pro AV: the last result when it was recorded in the window
+            if self.proav_result is not None and (self.proav_last_run_ts or now) >= lo:
+                self.proav_result = None
+                self.proav_last_run_ts = None
+                cleared["proav"] = 1
+            # 9. the cleared span, for the timeline and Settings' status line; "all" replaces the list
+            entry = {"since_ts": since, "at": now, "range": range_key}
+            if since is None:
+                self.history_spans = [entry]
+            else:
+                spans = [x for x in self.history_spans if x["at"] >= now - HISTORY_SPAN_MAX_AGE_S] + [entry]
+                self.history_spans = spans[-HISTORY_SPANS_KEEP:]
+            result = {"range": range_key, "label": HISTORY_RANGE_LABELS[range_key], "since_ts": since, "ts": now,
+                      "cleared": cleared, "stopped": stopped, "skipped": skipped}
+            job = self.proav_job_locked()
+            targets = [self.target_view(x) for x in self.targets]
+        if discard_capture:
+            self.capture_discard()
+        elif cleared["captures"]:
+            with self.lock:
+                snap = self._capture_session_locked()
+            self.hub.publish("capture.state", {"session": snap})
+        for kind, data in publish:
+            self.hub.publish(kind, data)
+        if "Pro AV scan" in stopped or cleared["proav"]:
+            self.hub.publish("proav.state", {"job": job})
+        self.hub.publish("faults.state", self.faults_tile())
+        self.hub.publish("ping.targets", {"targets": targets})
+        self.hub.publish("history.cleared", copy.deepcopy(result))
+        return result
 
     # -- speed -----------------------------------------------------------
     def speed_status(self) -> Dict[str, Any]:
@@ -4506,7 +4747,9 @@ class MockState:
                 return False
             self.speed_running = True
             self.speed_progress = {"phase": "baseline", "pct": 0.0}
-        threading.Thread(target=self._speed_worker, name="mock-speed", daemon=True).start()
+            self.speed_gen += 1
+            gen = self.speed_gen
+        threading.Thread(target=self._speed_worker, args=(gen,), name="mock-speed", daemon=True).start()
         return True
 
     def speed_tick(self) -> None:
@@ -4521,7 +4764,7 @@ class MockState:
                 return
         self.speed_run()
 
-    def _speed_worker(self) -> None:
+    def _speed_worker(self, gen: int = 0) -> None:
         self.hub.publish("speedtest.start", {"backend": "cloudflare"})
         try:
             for phase, dur in SPEED_PHASES:
@@ -4529,10 +4772,14 @@ class MockState:
                 while time.time() - t0 < dur:
                     pct = min(1.0, (time.time() - t0) / dur)
                     with self.lock:
+                        if gen and self.speed_gen != gen:
+                            return                      # Clear history stopped this test: no row, and it said so already
                         self.speed_progress = {"phase": phase, "pct": round(pct, 3)}
                     self.hub.publish("speedtest.progress", {"phase": phase, "pct": round(pct, 3)})
                     time.sleep(0.15)
             with self.lock:
+                if gen and self.speed_gen != gen:
+                    return
                 res = self._make_speed(time.time())
                 self.speedtests.append(res)
                 self.speed_running = False
@@ -4668,6 +4915,23 @@ class MockState:
                     time.sleep(0.1)
                 if cancelled:
                     break
+            with self.lock:
+                if self.disc_discard:
+                    # Clear history stopped this scan: nothing of it is kept, and the clear already said so
+                    self.disc_discard = False
+                    self.disc_running = False
+                    self.disc_net_changed = False
+                    self.disc_progress = {"phase": "done", "done": 0, "total": total, "found": 0,
+                                          "elapsed_s": round(time.time() - t0, 1)}
+                    discarded = True
+                else:
+                    discarded = False
+            if discarded:
+                self.hub.publish("discovery.progress", self.disc_progress)
+                # the service's shape (tnt/engine.py): not stored, run_id None, silent + cancel_reason on the event
+                self.hub.publish("discovery.done", {"run_id": None, "cancelled": True, "found": 0, "network_changed": False,
+                                                    "silent": True, "cancel_reason": HISTORY_CANCEL_REASON})
+                return
             with self.lock:
                 run = self._add_disc_run(time.time(), cidr, ports, round(time.time() - t0, 1),
                                          hosts=hosts[: (len(hosts) // 2 if cancelled else len(hosts))], cancelled=cancelled)
@@ -6468,6 +6732,13 @@ class MockState:
     # -- SIP (tnt.sipqual, tnt.sipalg, tnt.sipnat, tnt.sipflow) -----------------------------------
     def _sip_leg(self, kind: str, label: str, target: str, avg: float, jitter: float, loss: float,
                  samples: int, window_h: float) -> Dict[str, Any]:
+        if samples < SIP_MIN_SAMPLES:
+            # tnt.sipqual.grade_leg: too little history (a clear took it) is "unknown" with the reason, not a grade
+            return {"kind": kind, "label": label, "target": target, "grade": "unknown", "mos": None, "r": None,
+                    "call_label": None, "avg_ms": None, "jitter_ms": None, "loss_pct": None, "p95_ms": None,
+                    "samples": samples, "window_h": window_h,
+                    "reason": (f"only {samples} ping(s) of history on this network - "
+                               f"{SIP_MIN_SAMPLES} are needed before this is worth grading")}
         grade = sip_grade(avg, jitter, loss)
         r, mos = sip_call_quality(avg, jitter, loss)
         return {"kind": kind, "label": label, "target": target, "grade": grade, "mos": mos, "r": r,
@@ -6481,6 +6752,9 @@ class MockState:
             speed = self.speedtests[-1] if self.speedtests else None
             network_id = self.net_id
             profile = self.net_profile
+            now = time.time()
+            # the legs stand on the ping history of the window: what Clear history took of it is not behind them
+            kept = self._recorded_fraction_locked(now - window_h * 3600.0, now) if self.history_spans else 1.0
         bad = profile in ("hotel", "hotspot")                # the awkward networks a tech is sent to
         # built from the ping targets this fake site really has, capped like the service caps them
         # (tnt.sipqual.pick_targets): a site with twenty targets must not get twenty leg cards
@@ -6503,10 +6777,10 @@ class MockState:
                 (3.4 if lan else 21.0) if not bad else (26.0 if lan else 148.0),
                 (0.6 if lan else 3.1) if not bad else (9.0 if lan else 44.0),
                 (0.0 if lan else 0.05) if not bad else (0.4 if lan else 3.6),
-                1380 if lan else 1376, window_h))
+                int((1380 if lan else 1376) * kept), window_h))
         if host:
             legs.append(self._sip_leg("sip", f"The path to {host}", host, 28.0 if not bad else 190.0,
-                                      4.4 if not bad else 61.0, 0.1 if not bad else 5.2, 640, window_h))
+                                      4.4 if not bad else 61.0, 0.1 if not bad else 5.2, int(640 * kept), window_h))
         legs.sort(key=lambda leg: ("lan", "wan", "sip").index(leg["kind"]))
         bloat = (((speed or {}).get("quality") or {}).get("bufferbloat") or {}).get("grade")
         return sip_build_qualifier(legs, window_h=window_h, sip_host=host, network_id=network_id,
@@ -6598,14 +6872,20 @@ class MockState:
             raise ToolRefused(400, "bad_request", "that capture could not be opened (not a capture file)")
         with self.lock:
             self.sip_flow_slots.add(which)
+            self.sip_flow_loaded[which] = time.time()
+            self.sip_flow_files[which] = re.split(r"[\\/]", text)[-1]
         return self.sip_flow_view()
 
     def sip_flow_close(self, slot: Any = None) -> Dict[str, Any]:
         with self.lock:
             if slot:
                 self.sip_flow_slots.discard(str(slot))
+                self.sip_flow_loaded.pop(str(slot), None)
+                self.sip_flow_files.pop(str(slot), None)
             else:
                 self.sip_flow_slots.clear()
+                self.sip_flow_loaded.clear()
+                self.sip_flow_files.clear()
         return self.sip_flow_view()
 
     def sip_flow_call(self, call_id: Any) -> Dict[str, Any]:
@@ -8285,6 +8565,8 @@ class Handler(BaseHTTPRequestHandler):
                                    "status": STATE.outages_status()})
             if p == "/outages/timeline":
                 return self._json(STATE.timeline(qf("hours", 24)))
+            if p == "/history":
+                return self._json(STATE.history_info())
             if p == "/speedtests":
                 lim = int(qf("limit", 0)) or None
                 return self._json({"results": STATE.speed_history(qf("from", now - 86400), qf("to", now + 1), lim),
@@ -8391,6 +8673,21 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(404, "not_found", f"no route for GET {path}")
 
         if method == "POST":
+            if p == "/history/clear":
+                # like the service: a page of another origin is refused first (a clear deletes history and capture
+                # files); anything but a {"range": key} object is 400 bad_range; captures need an administrator, the
+                # rest clears without one
+                if cross_origin_browser_request(self.headers, STATE.port):
+                    return self._error(403, "forbidden", QUICK_TOOLS_CROSS_ORIGIN_MSG)
+                if getattr(self, "_raw_body", None) is None:
+                    self._consume_body()
+                try:
+                    body = json.loads((self._raw_body or b"").decode("utf-8") or "null")
+                except (ValueError, UnicodeDecodeError):
+                    body = None
+                if not isinstance(body, dict):
+                    return self._error(400, "bad_range", HISTORY_BAD_RANGE_MSG)
+                return self._json(STATE.history_clear(body.get("range"), captures_allowed=STATE.wifi_admin))
             if p == "/sip/alg":
                 self._need_tool("sip")
                 body = self._body()

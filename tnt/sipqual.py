@@ -312,6 +312,15 @@ class SipQualifier:
         self._tile: Optional[Dict[str, Any]] = None
         self._tile_key: Any = None
         self._tile_ts = 0.0
+        self._tile_gen = 0               # bumped by invalidate(): a tile built from reads before it is not kept
+
+    def invalidate(self) -> None:
+        """Drop the cached home tile (Settings > Clear history).  The rating is read from ping history and the last
+        speed test, which the clear has just removed, so the next tile is built from what is left rather than served
+        from a cache up to :data:`TILE_TTL_S` old; one being built right now is answered but not kept."""
+        with self._tile_lock:
+            self._tile, self._tile_key, self._tile_ts = None, None, 0.0
+            self._tile_gen += 1
 
     def rating(self, *, window_h: float = DEFAULT_WINDOW_H, network_id: Optional[int] = None,
                sip_host: Optional[str] = None, site: Optional[str] = None,
@@ -350,6 +359,7 @@ class SipQualifier:
         with self._tile_lock:
             if self._tile is not None and self._tile_key == key and now - self._tile_ts < ttl_s:
                 return dict(self._tile)
+            generation = self._tile_gen
         try:
             rating = self.rating(window_h=window_h, network_id=network_id, sip_host=sip_host, gateway=gateway)
         except Exception as exc:            # noqa: BLE001 - the tile is never worth an error on the home page
@@ -363,7 +373,8 @@ class SipQualifier:
                "wan": grades.get("wan"), "sip": grades.get("sip"), "mos": head["mos"], "avg_ms": head["avg_ms"],
                "jitter_ms": head["jitter_ms"], "sip_host": sip_host, "ts": rating["ts"]}
         with self._tile_lock:
-            self._tile, self._tile_key, self._tile_ts = dict(row), key, now
+            if self._tile_gen == generation:     # not invalidated while the rating was being read
+                self._tile, self._tile_key, self._tile_ts = dict(row), key, now
         return row
 
     # -- the database, every read survivable: a rating missing one leg beats no rating -------------
