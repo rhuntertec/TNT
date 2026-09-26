@@ -747,8 +747,8 @@ def test_proto_filters_name_only_protocols_the_contract_lists():
     for key, names in PROTO_FILTERS.items():
         assert key == key.lower() and names
         assert all(name in PROTOCOLS for name in names)
-    assert set(PROTO_FILTERS) >= {"icmp", "sip", "http", "https", "dns", "dhcp", "arp", "tcp", "udp", "rtp", "tls",
-                                  "rtsp"}
+    assert set(PROTO_FILTERS) >= {"icmp", "sip", "http", "https", "dns", "dhcp", "arp", "igmp", "tcp", "udp", "rtp",
+                                  "tls", "rtsp"}
 
 
 @pytest.mark.parametrize("key, expected", [
@@ -757,6 +757,20 @@ def test_proto_filters_name_only_protocols_the_contract_lists():
 ])
 def test_matches_proto(key, expected):
     assert matches_proto(summarize(HTTP_GET), key) is expected
+
+
+def test_the_igmp_filter_matches_every_igmp_message_and_nothing_else():
+    """The button a tech reaches for when a multicast stream is missing: a query, a v2 leave and a v3 report all
+    answer to it, and the ICMP button next to it does not pick them up."""
+    query = summarize(eth(ipv4(struct.pack(">BBH", 0x11, 100, 0) + bytes(4), protocol=2)))
+    leave = summarize(eth(ipv4(struct.pack(">BBH", 0x17, 0, 0) + bytes([239, 1, 1, 1]), protocol=2)))
+    report = summarize(eth(ipv4(struct.pack(">BBHHH", 0x22, 0, 0, 0, 1) + struct.pack(">BBH", 4, 0, 0)
+                                + bytes([239, 1, 1, 1]), protocol=2)))
+    for row in (query, leave, report):
+        assert matches_proto(row, "igmp") is True
+        assert matches_proto(row, "icmp") is False
+        assert matches_proto(row, "ipv4") is True
+    assert matches_proto(summarize(eth(ipv4(icmp_echo(), protocol=1))), "igmp") is False
 
 
 def test_matches_proto_groups_related_protocols():

@@ -146,6 +146,7 @@ MAX_DUMP_WIDTH = 64
 PROTO_FILTERS: Dict[str, Tuple[str, ...]] = {
     "icmp": ("ICMP", "ICMPv6"),
     "arp": ("ARP",),
+    "igmp": ("IGMP",),
     "dns": ("DNS", "MDNS", "LLMNR", "NBNS"),
     "dhcp": ("DHCP", "DHCPv6"),
     "http": ("HTTP",),
@@ -166,7 +167,6 @@ PROTO_FILTERS: Dict[str, Tuple[str, ...]] = {
     "quic": ("QUIC",),
     "ssdp": ("SSDP",),
     "syslog": ("SYSLOG",),
-    "igmp": ("IGMP",),
     "discovery": ("LLDP", "CDP"),
     "stp": ("STP",),
     "eapol": ("EAPOL",),

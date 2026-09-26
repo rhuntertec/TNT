@@ -968,7 +968,8 @@ CAPTURE_ADMIN_UNVERIFIED_MSG = "Packet capture needs a Windows administrator acc
 ADMIN_ONLY_EVENTS = frozenset({"capture.state", "capture.sip"})
 #: the protocol keys the page's filter buttons send -> the proto and layer names they match (tnt.dissect.PROTO_FILTERS)
 CAPTURE_PROTO_FILTERS = {
-    "icmp": ("ICMP", "ICMPv6"), "arp": ("ARP",), "dns": ("DNS", "MDNS", "LLMNR", "NBNS"), "dhcp": ("DHCP", "DHCPv6"),
+    "icmp": ("ICMP", "ICMPv6"), "arp": ("ARP",), "igmp": ("IGMP",), "dns": ("DNS", "MDNS", "LLMNR", "NBNS"),
+    "dhcp": ("DHCP", "DHCPv6"),
     "http": ("HTTP",), "https": ("TLS", "QUIC"), "tls": ("TLS",), "sip": ("SIP",), "rtp": ("RTP", "RTCP"),
     "rtsp": ("RTSP",), "tcp": ("TCP",), "udp": ("UDP",), "ipv4": ("IPv4",), "ipv6": ("IPv6",), "vlan": ("802.1Q",),
     "ntp": ("NTP",), "snmp": ("SNMP",), "smb": ("SMB",), "tftp": ("TFTP",), "quic": ("QUIC",),
@@ -1000,7 +1001,13 @@ CAPTURE_SERVERS = ({"name": "www.example.com", "ip": "203.0.113.10", "ip6": "200
 CAPTURE_RESOLVERS = ("192.0.2.1", "203.0.113.53")
 #: the background mix, (kind, weight): every protocol button of the page has something to find
 CAPTURE_MIX = (("https", 26), ("tcp", 13), ("dns", 10), ("http", 8), ("udp", 7), ("icmp", 6), ("arp", 4),
-               ("rtsp", 3), ("dhcp", 2))
+               ("rtsp", 3), ("igmp", 3), ("dhcp", 2))
+#: the multicast groups the invented LAN joins (admin-scoped, RFC 2365), and the addresses IGMP itself uses
+CAPTURE_IGMP_GROUPS = ("239.1.1.1", "239.255.255.250", "239.69.0.12")
+CAPTURE_IGMP_ALL_HOSTS = "224.0.0.1"
+CAPTURE_IGMP_V3_REPORTS = "224.0.0.22"
+#: the scripted membership traffic, seconds after the capture began (early, so even a short capture carries it)
+CAPTURE_IGMP_AT = {"query": 0.35, "report": 0.5}
 #: the scripted SIP call, seconds after the capture began; RTP rows a second per direction (a real 20 ms stream is 50
 #: a second: the mock samples it so the list stays readable), and the call's invented parties
 CAPTURE_SIP_AT = {"invite": 3.0, "ringing": 3.35, "answer": 5.6, "ack": 5.65, "bye": 13.6, "byeok": 13.7}
@@ -1722,6 +1729,13 @@ def capture_mac_for(ip: str) -> str:
     return CAPTURE_GATEWAY["mac"]
 
 
+def capture_multicast_mac(group: str) -> str:
+    """The Ethernet address an IPv4 multicast group is sent to: 01:00:5e plus the low 23 bits of the group
+    (RFC 1112 §6.4), which is what a switch's snooping table is keyed on."""
+    parts = [int(p) for p in group.split(".")]
+    return "01:00:5e:%02x:%02x:%02x" % (parts[1] & 0x7F, parts[2], parts[3])
+
+
 def _capture_pick(rng: random.Random, table: Tuple[Tuple[str, int], ...]) -> str:
     draw = rng.randrange(sum(weight for _kind, weight in table))
     for kind, weight in table:
@@ -1747,6 +1761,28 @@ def capture_invent(rng: random.Random) -> Dict[str, Any]:  # noqa: C901 - one br
                              length=60, layers=("ETH", "ARP"), info=f"{who['ip']} is at {who['mac']}",
                              fields=(("Opcode", "reply (2)"), ("Sender MAC address", who["mac"]),
                                      ("Sender IP address", who["ip"]), ("Target IP address", gw["ip"])))
+    if kind == "igmp":
+        # what multicast looks like from one port: a querier's general query every so often, and the joins and leaves
+        # the receivers answer with. The wording is tnt.dissect's, so the rows read like the service's own.
+        group = rng.choice(CAPTURE_IGMP_GROUPS)
+        if rng.random() < 0.35:
+            return capture_parts(src=gw["ip"], dst=CAPTURE_IGMP_ALL_HOSTS, src_mac=gw["mac"],
+                                 dst_mac=capture_multicast_mac(CAPTURE_IGMP_ALL_HOSTS), proto="IGMP", length=60,
+                                 layers=("ETH", "IPv4", "IGMP"), info="Membership query",
+                                 fields=(("Type", "Membership query (0x11)"), ("Max response time", "100"),
+                                         ("Checksum", "0xee9b"), ("Group address", "0.0.0.0")))
+        who = rng.choice((CAPTURE_CAMERA, CAPTURE_NVR, CAPTURE_PHONE))
+        if rng.random() < 0.25:
+            return capture_parts(src=who["ip"], dst="224.0.0.2", src_mac=who["mac"],
+                                 dst_mac=capture_multicast_mac("224.0.0.2"), proto="IGMP", length=60,
+                                 layers=("ETH", "IPv4", "IGMP"), info=f"Leave group for {group}",
+                                 fields=(("Type", "Leave group (0x17)"), ("Max response time", "0"),
+                                         ("Checksum", "0x02fd"), ("Group address", group)))
+        return capture_parts(src=who["ip"], dst=CAPTURE_IGMP_V3_REPORTS, src_mac=who["mac"],
+                             dst_mac=capture_multicast_mac(CAPTURE_IGMP_V3_REPORTS), proto="IGMP", length=60,
+                             layers=("ETH", "IPv4", "IGMP"), info=f"Membership report v3 for {group}",
+                             fields=(("Type", "Membership report v3 (0x22)"), ("Checksum", "0xf4fe"),
+                                     ("Group records", "1"), ("Multicast address", group)))
     if kind == "icmp":
         server = rng.choice(CAPTURE_SERVERS)
         ident, seq = 0x0001, rng.randrange(1, 4000)
@@ -1974,6 +2010,28 @@ def capture_sip_plan(rng: random.Random, call: Dict[str, Any]) -> List[Tuple[flo
         seq, stamp, when = seq + 1, stamp + int(8000 * step), when + step
     plan.sort(key=lambda entry: entry[0])
     return plan
+
+
+def capture_igmp_plan(rng: random.Random) -> List[Tuple[float, Dict[str, Any], Optional[str]]]:
+    """The scripted multicast membership, ``(seconds after the capture began, the packet, no call mark)``: the
+    querier's general query, then a receiver joining a group.  Scripted rather than left to the random mix so the
+    IGMP button always has something to find, the way the SIP call is always there."""
+    querier, who = CAPTURE_GATEWAY, CAPTURE_CAMERA
+    group = CAPTURE_IGMP_GROUPS[0]
+    return [
+        (CAPTURE_IGMP_AT["query"],
+         capture_parts(src=querier["ip"], dst=CAPTURE_IGMP_ALL_HOSTS, src_mac=querier["mac"],
+                       dst_mac=capture_multicast_mac(CAPTURE_IGMP_ALL_HOSTS), proto="IGMP", length=60,
+                       layers=("ETH", "IPv4", "IGMP"), info="Membership query",
+                       fields=(("Type", "Membership query (0x11)"), ("Max response time", "100"),
+                               ("Checksum", "0xee9b"), ("Group address", "0.0.0.0"))), None),
+        (CAPTURE_IGMP_AT["report"],
+         capture_parts(src=who["ip"], dst=CAPTURE_IGMP_V3_REPORTS, src_mac=who["mac"],
+                       dst_mac=capture_multicast_mac(CAPTURE_IGMP_V3_REPORTS), proto="IGMP", length=60,
+                       layers=("ETH", "IPv4", "IGMP"), info=f"Membership report v3 for {group}",
+                       fields=(("Type", "Membership report v3 (0x22)"), ("Checksum", "0xf4fe"),
+                               ("Group records", "1"), ("Multicast address", group))), None),
+    ]
 
 
 def capture_sip_mark(call: Dict[str, Any], parts: Dict[str, Any], mark: Optional[str], ts: float,
@@ -6421,7 +6479,7 @@ class MockState:
         try:
             rng = random.Random(seed)
             call = capture_sip_call(rng)
-            plan = capture_sip_plan(rng, call)
+            plan = sorted(capture_sip_plan(rng, call) + capture_igmp_plan(rng), key=lambda entry: entry[0])
             started = time.monotonic()
             next_tick, at, announced, reason = CAPTURE_TICK_S, 0, False, None
             while True:

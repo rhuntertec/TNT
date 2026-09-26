@@ -1097,12 +1097,22 @@ def test_mock_capture_finds_the_sip_call_and_rebuilds_its_audio(mock, monkeypatc
         assert [r["info"].split(":")[0] for r in sip_rows] == ["Request", "Status", "Status", "Request", "Request", "Status"]
         assert {r["src"] for r in rtp_rows} == {mod.CAPTURE_PHONE["ip"], mod.CAPTURE_PBX["ip"]}
         assert all(r["sport"] in mod.CAPTURE_SIP_RTP_PORTS for r in rtp_rows)
+        # the IGMP button: the multicast joins, leaves and queries, and only those
+        igmp_rows = _req(port, "GET", "/api/capture/packets?proto=igmp&limit=2000")[2]["rows"]
+        assert igmp_rows, "the background mix always carries some multicast membership traffic"
+        assert {r["proto"] for r in igmp_rows} == {"IGMP"}
+        assert all(r["info"].startswith(("Membership query", "Membership report v3 for ", "Leave group for "))
+                   for r in igmp_rows), sorted({r["info"] for r in igmp_rows})
+        assert all(r["dst_mac"].startswith("01:00:5e:") for r in igmp_rows), "sent to the group's own MAC"
         # every address it made up is a documentation one, every MAC locally administered
         for row in _req(port, "GET", "/api/capture/packets?limit=2000")[2]["rows"]:
             for value in (row["src"], row["dst"]):
                 assert value == "" or _documentation_address(value), value
             for value in (row["src_mac"], row["dst_mac"]):
-                assert value == mod.CAPTURE_BROADCAST_MAC or int(value.split(":")[0], 16) & 0x02, value
+                # locally administered, the broadcast address, or an IPv4 multicast MAC (01:00:5e..., RFC 1112),
+                # which is derived from the group rather than belonging to any device
+                assert (value == mod.CAPTURE_BROADCAST_MAC or int(value.split(":")[0], 16) & 0x02
+                        or value.startswith("01:00:5e:")), value
         assert _req(port, "POST", "/api/capture/discard", {})[2] == {"session": None}
         assert _req(port, "GET", "/api/capture/calls")[2] == {"calls": []}
     finally:
@@ -1113,13 +1123,19 @@ def test_mock_capture_finds_the_sip_call_and_rebuilds_its_audio(mock, monkeypatc
 
 
 def _documentation_address(value: str) -> bool:
-    """True for the addresses a mock may invent: RFC 5737 / RFC 3849 documentation ranges, and the unspecified and
-    broadcast addresses of a DHCP exchange - never a real public address."""
+    """True for the addresses a mock may invent: RFC 5737 / RFC 3849 documentation ranges, the unspecified and
+    broadcast addresses of a DHCP exchange, and multicast groups - never a real public address.
+
+    A multicast group is nobody's address: 224.0.0.1 and 224.0.0.22 are the fixed ones IGMP itself uses, and the
+    groups the invented LAN joins are admin-scoped (239.0.0.0/8, RFC 2365), which is where a site's own AV and
+    camera streams live."""
     import ipaddress
 
     if value in ("0.0.0.0", "255.255.255.255"):
         return True
     address = ipaddress.ip_address(value)
+    if address.is_multicast:
+        return True
     nets = ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24", "2001:db8::/32")
     return any(address in ipaddress.ip_network(net) for net in nets if address.version == ipaddress.ip_network(net).version)
 
@@ -1859,7 +1875,7 @@ def test_packet_capture_page_needs_an_administrator_then_captures_in_a_browser(b
     assert (f["sizes"], f["sizeValue"]) == ([f"{mb} MB" for mb in mod.CAPTURE_SIZES_MB], str(mod.CAPTURE_DEFAULT_MB))
     assert f["buttons"] == ["Start", "Open…"] and f["warningMatches"] is True and f["callsShown"] is False
     assert f["columns"] == ["No.", "Time", "Since start", "Source", "Destination", "Protocol", "Length", "Info"]
-    assert [label for label, _pressed in f["protos"]] == ["ICMP", "ARP", "DNS", "DHCP", "HTTP", "HTTPS", "TCP", "UDP", "RTSP", "RTP", "SIP calls"]
+    assert [label for label, _pressed in f["protos"]] == ["ICMP", "ARP", "IGMP", "DNS", "DHCP", "HTTP", "HTTPS", "TCP", "UDP", "RTSP", "RTP", "SIP calls"]
     assert {pressed for _label, pressed in f["protos"]} == {"false"} and f["rows"] == 0
     assert (f["status"], f["empty"]) == ("Not capturing", "Pick an adapter and hit Start, or open a capture you saved earlier.")
     started = res["started"]

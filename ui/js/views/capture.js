@@ -40,6 +40,7 @@
   const PROTO_BUTTONS = [
     { key: 'icmp', label: 'ICMP', title: 'Ping and the other ICMP messages, IPv4 and IPv6' },
     { key: 'arp', label: 'ARP', title: 'Address resolution on this LAN' },
+    { key: 'igmp', label: 'IGMP', title: 'Multicast joins, leaves and the queries a switch answers with snooping' },
     { key: 'dns', label: 'DNS', title: 'Name lookups (also mDNS and LLMNR)' },
     { key: 'dhcp', label: 'DHCP', title: 'Address leases, IPv4 and IPv6' },
     { key: 'http', label: 'HTTP', title: 'Unencrypted web traffic' },

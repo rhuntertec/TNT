@@ -3719,7 +3719,7 @@ def test_capture_page_mounts_in_a_browser_without_errors(browser_page):
     # the packet list: the filter fields, every protocol button off, the columns and the empty state
     assert 'aria-label="Filter by IP address"' in view and 'aria-label="Filter by MAC address"' in view
     protos = re.findall(r'<button class="cap-proto" type="button" title="[^"]*" aria-pressed="false">(?:<svg.*?</svg>)?([A-Z].*?)</button>', view, re.S)
-    assert protos == ["ICMP", "ARP", "DNS", "DHCP", "HTTP", "HTTPS", "TCP", "UDP", "RTSP", "RTP", "SIP calls"]
+    assert protos == ["ICMP", "ARP", "IGMP", "DNS", "DHCP", "HTTP", "HTTPS", "TCP", "UDP", "RTSP", "RTP", "SIP calls"]
     assert '<button class="btn btn-sm cap-calls-btn" type="button" hidden=""' in view and "No calls found yet</button>" in view
     assert re.findall(r"<th[^>]*>([^<]+)</th>", view) == ["No.", "Time", "Since start", "Source", "Destination", "Protocol", "Length", "Info"]
     assert '<table class="table cap-table" hidden="">' in view and "<tbody></tbody>" in view

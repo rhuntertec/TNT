@@ -725,7 +725,7 @@ CAPTURE_WARNING = ("Captures can contain passwords and private data. TNT keeps t
 CAPTURE_LEAVE_TITLE = "Save this capture?"
 CAPTURE_FILE = "TNT-capture-20260101-120000.pcapng"
 # the quick filter buttons, in the page's order; the keys are tnt.dissect.PROTO_FILTERS keys
-CAPTURE_PROTOS = ["icmp", "arp", "dns", "dhcp", "http", "https", "tcp", "udp", "rtsp", "rtp", "sip"]
+CAPTURE_PROTOS = ["icmp", "arp", "igmp", "dns", "dhcp", "http", "https", "tcp", "udp", "rtsp", "rtp", "sip"]
 CAPTURE_COLUMNS = ["no", "time", "rel", "src", "dst", "proto", "length", "info"]
 
 
@@ -896,7 +896,8 @@ def test_capture_page_helpers(tmp_path):
                     "playable": False, "note": "No audio was captured for this call"}
     c = out["constants"]
     assert c["protos"] == CAPTURE_PROTOS and c["calls"] == ["sip"]
-    assert c["labels"] == ["ICMP", "ARP", "DNS", "DHCP", "HTTP", "HTTPS", "TCP", "UDP", "RTSP", "RTP", "SIP calls"]
+    assert c["labels"] == ["ICMP", "ARP", "IGMP", "DNS", "DHCP", "HTTP", "HTTPS", "TCP", "UDP", "RTSP", "RTP",
+                           "SIP calls"]
     assert c["columns"] == CAPTURE_COLUMNS and c["tail"] == 700 and c["rows"] == 3000
     assert c["warning"] == CAPTURE_WARNING and c["admin"] == "Packet capture needs a Windows administrator account"
     assert c["leave"] == CAPTURE_LEAVE_TITLE
